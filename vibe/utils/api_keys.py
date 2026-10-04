@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 import os
+import re
 
 from vibe.utils.keyring import get_api_key_from_keyring
 
@@ -33,6 +34,13 @@ class ApiKeyOrigin:
         return "the keyring"
 
 
+def split_keys(raw: str | None) -> list[str]:
+    """Comma, semicolon or newline separated keys, blanks dropped, order kept."""
+    if not raw:
+        return []
+    return [item.strip() for item in re.split(r"[,;\n]", raw) if item.strip()]
+
+
 def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None:
     """The key for ``env_key`` and where it was read from, or ``None``.
 
@@ -46,6 +54,12 @@ def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None
         return token, ApiKeyOrigin(ApiKeySource.ENVIRONMENT, env_key)
     if token := get_api_key_from_keyring(env_key):
         return token, ApiKeyOrigin(ApiKeySource.KEYRING, env_key)
+    # Multi-account setups may only define the plural variable
+    # (``MISTRAL_API_KEYS``); its first key stands in for the single one so the
+    # rest of the CLI (account lookups, auth state) keeps working.
+    plural = f"{env_key}S"
+    if pooled := split_keys(os.environ.get(plural)):
+        return pooled[0], ApiKeyOrigin(ApiKeySource.ENVIRONMENT, plural)
     return None
 
 

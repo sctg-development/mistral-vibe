@@ -48,6 +48,7 @@ from vibe.core.config._defaults import (
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.backend.base import MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS
 from vibe.core.llm.exceptions import BackendErrorBuilder, ModelCall
+from vibe.core.llm.key_pool import KeyPool, KeyPoolTransport
 from vibe.core.types import (
     AvailableTool,
     Content,
@@ -292,6 +293,11 @@ class MistralBackend:
         resolved = resolve_api_key_with_origin(self._provider.api_key_env_var)
         self._api_key = resolved[0] if resolved else None
         self._api_key_origin = resolved[1] if resolved else None
+        # Several accounts (``<ENV_VAR>S``, comma separated) fail over to each
+        # other on rate limit, quota or revoked-key responses.
+        self._key_pool = KeyPool.from_environment(
+            self._provider.api_key_env_var, primary=self._api_key
+        )
 
         reasoning_field = getattr(provider, "reasoning_field_name", "reasoning_content")
         if reasoning_field != "reasoning_content":
@@ -412,11 +418,18 @@ class MistralBackend:
     async def aclose(self) -> None:
         await self.__aexit__(None, None, None)
 
+    def _wrap_transport(
+        self, inner: httpx.AsyncBaseTransport
+    ) -> httpx.AsyncBaseTransport:
+        assert self._key_pool is not None
+        return KeyPoolTransport(inner, self._key_pool)
+
     def _create_mistral_client(self) -> Mistral:
         self._loop = asyncio.get_running_loop()
         self._http_client = VibeAsyncHTTPClient(
             verify=build_ssl_context(),
             follow_redirects=True,
+            transport_wrapper=self._wrap_transport if self._key_pool else None,
             event_hooks={
                 "request": [self._bound_transport_timeouts],
                 "response": [self._on_response],

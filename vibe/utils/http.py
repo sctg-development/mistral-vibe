@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import functools
 import ipaddress
 import os
@@ -79,7 +80,15 @@ class _EnvProxyTransport(httpx.AsyncBaseTransport):
 class VibeAsyncHTTPClient(httpx.AsyncClient):
     """HTTPX client that works around HTTPX's CIDR NO_PROXY limitation."""
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        transport_wrapper: Callable[
+            [httpx.AsyncBaseTransport], httpx.AsyncBaseTransport
+        ]
+        | None = None,
+        **kwargs: Any,
+    ) -> None:
         kwargs["trust_env"] = False
         if (
             kwargs.get("transport") is None
@@ -107,6 +116,10 @@ class VibeAsyncHTTPClient(httpx.AsyncClient):
                     **transport_kwargs,
                 )
         super().__init__(**kwargs)
+        if transport_wrapper is not None:
+            # Wrap what the client built (default or env-proxy transport) so
+            # the wrapper sits under the client's event hooks.
+            self._transport = transport_wrapper(self._transport)
 
 
 def _normalize_proxy_url(value: str | None) -> str | None:
