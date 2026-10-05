@@ -48,7 +48,12 @@ from vibe.core.config._defaults import (
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.backend.base import MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS
 from vibe.core.llm.exceptions import BackendErrorBuilder, ModelCall
-from vibe.core.llm.key_pool import KeyPool, KeyPoolTransport
+from vibe.core.llm.key_pool import (
+    POOL_ENV_SUFFIX,
+    KeyPool,
+    KeyPoolTransport,
+    record_key_usage,
+)
 from vibe.core.types import (
     AvailableTool,
     Content,
@@ -418,6 +423,19 @@ class MistralBackend:
     async def aclose(self) -> None:
         await self.__aexit__(None, None, None)
 
+    def _record_pool_usage(
+        self, prompt_tokens: int | None, completion_tokens: int | None
+    ) -> None:
+        if self._key_pool is not None:
+            self._key_pool.record_usage(prompt_tokens or 0, completion_tokens or 0)
+        elif (
+            self._api_key
+            and self._api_key_origin is not None
+            and self._api_key_origin.env_var.endswith(POOL_ENV_SUFFIX)
+        ):
+            # A one-key MISTRAL_API_KEYS has no pool but is still reported.
+            record_key_usage(self._api_key, prompt_tokens or 0, completion_tokens or 0)
+
     def _wrap_transport(
         self, inner: httpx.AsyncBaseTransport
     ) -> httpx.AsyncBaseTransport:
@@ -509,6 +527,9 @@ class MistralBackend:
                 if message and message.content
                 else ParsedContent(content="", reasoning_content=None)
             )
+            self._record_pool_usage(
+                response.usage.prompt_tokens, response.usage.completion_tokens
+            )
             return LLMChunk(
                 message=LLMMessage(
                     role=Role.assistant,
@@ -598,6 +619,11 @@ class MistralBackend:
                         if delta and delta.content
                         else ParsedContent(content="", reasoning_content=None)
                     )
+                    if chunk.data.usage:
+                        self._record_pool_usage(
+                            chunk.data.usage.prompt_tokens,
+                            chunk.data.usage.completion_tokens,
+                        )
                     yield LLMChunk(
                         message=LLMMessage(
                             role=Role.assistant,

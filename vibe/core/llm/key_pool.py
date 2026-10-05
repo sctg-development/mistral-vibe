@@ -60,6 +60,46 @@ _MAX_BODY_BYTES = 8192
 _FAILOVER_STATUSES = frozenset({401, 402, 403, 429})
 
 
+# Tokens spent per key in this process, for the summary shown on exit.
+_SESSION_USAGE: dict[str, list[int]] = {}
+
+
+def mask_key(key: str) -> str:
+    if len(key) <= 6:
+        return "*" * len(key)
+    return f"{key[:3]}{'*' * (len(key) - 6)}{key[-3:]}"
+
+
+def record_key_usage(key: str, input_tokens: int, output_tokens: int) -> None:
+    if not (input_tokens or output_tokens):
+        return
+    counts = _SESSION_USAGE.setdefault(key, [0, 0])
+    counts[0] += input_tokens
+    counts[1] += output_tokens
+
+
+# Key the Unified harness resolved for its latest model call. That path does not
+# go through the pool's transport, so this stands in for the lease.
+_ACTIVE_KEY: str | None = None
+
+
+def note_active_key(key: str | None) -> None:
+    global _ACTIVE_KEY
+    _ACTIVE_KEY = key
+
+
+def record_active_key_usage(input_tokens: int, output_tokens: int) -> None:
+    if _ACTIVE_KEY:
+        record_key_usage(_ACTIVE_KEY, input_tokens, output_tokens)
+
+
+def session_key_usage() -> list[tuple[str, int, int]]:
+    """(masked key, input tokens, output tokens) for each pooled key used."""
+    return [
+        (mask_key(key), counts[0], counts[1]) for key, counts in _SESSION_USAGE.items()
+    ]
+
+
 def pool_env_var(api_key_env_var: str) -> str:
     return f"{api_key_env_var}{POOL_ENV_SUFFIX}" if api_key_env_var else ""
 
@@ -120,6 +160,7 @@ class KeyPool:
         self._clock = clock
         self._state_dir = state_dir
         self._last_index: int | None = None
+        self._active_index: int | None = None
 
     def __len__(self) -> int:
         return len(self._keys)
@@ -245,6 +286,17 @@ class KeyPool:
                 self._store(path, state)
         self._note_switch(lease.index)
 
+    def record_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Attribute tokens to the account that served the latest request."""
+        if self._active_index is None:
+            return
+        record_key_usage(self._keys[self._active_index], input_tokens, output_tokens)
+
+    def note_active(self, key: str) -> None:
+        """Remember which account the request now in flight is sent with."""
+        if key in self._keys:
+            self._active_index = self._keys.index(key)
+
     def report_failure(
         self, lease: KeyLease, status: int, *, retry_after: float | None, body: str
     ) -> float:
@@ -356,12 +408,15 @@ class KeyPoolTransport(httpx.AsyncBaseTransport):
             or not self._pool.contains(sent_key)
             or not _is_replayable(request)
         ):
+            if sent_key is not None:
+                self._pool.note_active(sent_key)
             return await self._inner.handle_async_request(request)
 
         tried: set[str] = set()
         lease = self._pool.acquire()
         while lease is not None:
             request.headers["authorization"] = f"Bearer {lease.key}"
+            self._pool.note_active(lease.key)
             response = await self._inner.handle_async_request(request)
             if response.status_code not in _FAILOVER_STATUSES:
                 if response.status_code < 400:

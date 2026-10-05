@@ -547,6 +547,7 @@ from vibe.core.config.admin_config import (
     AdminConfigOutcome,
 )
 from vibe.core.config.harness_files import HarnessFilesManager
+from vibe.core.llm.key_pool import record_active_key_usage
 from vibe.core.config.layers.growthbook import GrowthbookLayer
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator, ConfigPatchValidationError
@@ -8363,6 +8364,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         update["session_completion_tokens"] = usage.output_tokens
         # A snapshot that spent nothing is not a turn: hold the last call's
         # figures rather than blanking the last-turn line.
+        record_active_key_usage(added_prompt, added_completion)
         if added_prompt or added_completion:
             update["last_turn_prompt_tokens"] = added_prompt
             update["last_turn_completion_tokens"] = added_completion

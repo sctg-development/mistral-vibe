@@ -23,6 +23,8 @@ from mistralai_vibe_local_harness.vibe import (
     ProviderCredentialResult,
     ProviderCredentialSnapshot,
 )
+
+from vibe.core.llm.key_pool import note_active_key, pooled_keys
 from vibe.core.types import Backend
 from vibe.observability.logging import logger
 from vibe.utils.api_keys import resolve_api_key_with_origin
@@ -194,6 +196,10 @@ def _resolve_snapshot(provider: ProviderConfig) -> ProviderCredentialSnapshot | 
     if not resolved:
         return None
     token, origin = resolved
+    # A key from the keyring or ``<ENV_VAR>`` outranks the pooled list here, so
+    # whichever key was really used is the one the exit summary reports.
+    if pooled_keys(provider.api_key_env_var):
+        note_active_key(token)
     # Described here rather than sent as a pair: the Harness owns the sentence,
     # the Host owns what counts as a source.
     return _snapshot(

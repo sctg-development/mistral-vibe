@@ -48,3 +48,22 @@ def test_print_session_resume_message_prints_zero_usage_for_resumed_run_without_
         "To continue this session, run: vibe --continue\n"
         "Or: vibe --resume 12345678\n"
     )
+
+
+def test_session_usage_lists_each_pooled_key(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibe.core.llm import key_pool
+
+    monkeypatch.setattr(
+        key_pool,
+        "_SESSION_USAGE",
+        {"sk-abcdefghijklmnopqrstd01": [2_327, 14]},
+    )
+    from vibe.cli.session_exit import format_session_usage
+
+    lines = format_session_usage(
+        TokenUsage(input_tokens=2_327, output_tokens=14, total_tokens=2_341)
+    ).splitlines()
+
+    assert lines[1] == "key sk-********************d01 : input=2,327 output=14 (total=2,341)"
