@@ -31,7 +31,7 @@ from typing import Any
 
 import httpx
 
-from vibe.utils.api_keys import split_keys
+from vibe.utils.api_keys import pooled_keys
 
 try:  # POSIX only; without it the state file is still written atomically.
     import fcntl
@@ -40,7 +40,6 @@ except ImportError:  # pragma: no cover - Windows
 
 logger = logging.getLogger("vibe")
 
-POOL_ENV_SUFFIX = "S"
 _STATE_FILE_NAME = "key_pool_state.json"
 _STATE_LOCK_NAME = "key_pool_state.lock"
 
@@ -64,10 +63,14 @@ _FAILOVER_STATUSES = frozenset({401, 402, 403, 429})
 _SESSION_USAGE: dict[str, list[int]] = {}
 
 
+_MASK_EDGE = 3
+
+
 def mask_key(key: str) -> str:
-    if len(key) <= 6:
+    if len(key) <= 2 * _MASK_EDGE:
         return "*" * len(key)
-    return f"{key[:3]}{'*' * (len(key) - 6)}{key[-3:]}"
+    hidden = "*" * (len(key) - 2 * _MASK_EDGE)
+    return f"{key[:_MASK_EDGE]}{hidden}{key[-_MASK_EDGE:]}"
 
 
 def record_key_usage(key: str, input_tokens: int, output_tokens: int) -> None:
@@ -98,17 +101,6 @@ def session_key_usage() -> list[tuple[str, int, int]]:
     return [
         (mask_key(key), counts[0], counts[1]) for key, counts in _SESSION_USAGE.items()
     ]
-
-
-def pool_env_var(api_key_env_var: str) -> str:
-    return f"{api_key_env_var}{POOL_ENV_SUFFIX}" if api_key_env_var else ""
-
-
-def pooled_keys(
-    api_key_env_var: str, environ: Mapping[str, str] | None = None
-) -> list[str]:
-    environ = os.environ if environ is None else environ
-    return split_keys(environ.get(pool_env_var(api_key_env_var)))
 
 
 def _fingerprint(key: str) -> str:
@@ -252,7 +244,9 @@ class KeyPool:
         start = (
             self._fingerprints.index(current) if current in self._fingerprints else 0
         )
-        order = [(start + offset) % len(self._keys) for offset in range(len(self._keys))]
+        order = [
+            (start + offset) % len(self._keys) for offset in range(len(self._keys))
+        ]
 
         soonest: tuple[float, int] | None = None
         for index in order:
@@ -367,7 +361,7 @@ class _StateLock:
             return self
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle = open(self._path, "a+")  # noqa: SIM115
+            self._handle = open(self._path, "a+")
             fcntl.flock(self._handle, fcntl.LOCK_EX)
         except OSError:
             self._handle = None

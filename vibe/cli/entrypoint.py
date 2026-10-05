@@ -148,6 +148,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--setup", action="store_true", help="Setup API key and exit")
     parser.add_argument(
+        "--list-keys",
+        action="store_true",
+        help="Print the pooled Mistral API keys in clear text with the account each belongs to (duplicates are flagged), then exit",
+    )
+    parser.add_argument(
         "--check-upgrade",
         action="store_true",
         help="Check for a Vibe update now, prompt to install it, and exit",

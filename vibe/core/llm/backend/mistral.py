@@ -48,12 +48,7 @@ from vibe.core.config._defaults import (
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.backend.base import MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS
 from vibe.core.llm.exceptions import BackendErrorBuilder, ModelCall
-from vibe.core.llm.key_pool import (
-    POOL_ENV_SUFFIX,
-    KeyPool,
-    KeyPoolTransport,
-    record_key_usage,
-)
+from vibe.core.llm.key_pool import KeyPool, KeyPoolTransport, record_key_usage
 from vibe.core.types import (
     AvailableTool,
     Content,
@@ -67,7 +62,7 @@ from vibe.core.types import (
     ToolCall,
 )
 from vibe.core.utils import RetryObserver, RetryReason
-from vibe.utils.api_keys import resolve_api_key_with_origin
+from vibe.utils.api_keys import POOL_ENV_SUFFIX, resolve_api_key_with_origin
 from vibe.utils.http import (
     VibeAsyncHTTPClient,
     build_ssl_context,

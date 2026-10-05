@@ -24,10 +24,10 @@ from mistralai_vibe_local_harness.vibe import (
     ProviderCredentialSnapshot,
 )
 
-from vibe.core.llm.key_pool import note_active_key, pooled_keys
+from vibe.core.llm.key_pool import note_active_key
 from vibe.core.types import Backend
 from vibe.observability.logging import logger
-from vibe.utils.api_keys import resolve_api_key_with_origin
+from vibe.utils.api_keys import pooled_keys, resolve_api_key_with_origin
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping

@@ -16,6 +16,7 @@ from vibe.core.telemetry.types import LaunchContext
 from vibe.core.types import Backend
 from vibe.core.utils.concurrency import run_sync
 from vibe.observability.logging import logger
+from vibe.utils.api_keys import add_pooled_key
 from vibe.utils.keyring import delete_api_key_from_keyring, set_api_key_in_keyring
 from vibe.utils.platform import is_windows
 
@@ -245,6 +246,9 @@ def persist_api_key(
                 "Failed to remove stale plaintext API key from env file", exc_info=err
             )
     if provider.backend == Backend.MISTRAL:
+        # Every sign-in is one more account for the key pool, so signing in
+        # several times builds the set Vibe rotates through.
+        add_pooled_key(env_key, api_key)
         try:
             config_orchestrator = orchestrator or run_sync(build_default_orchestrator())
             telemetry = TelemetryClient(

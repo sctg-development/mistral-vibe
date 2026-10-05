@@ -547,7 +547,6 @@ from vibe.core.config.admin_config import (
     AdminConfigOutcome,
 )
 from vibe.core.config.harness_files import HarnessFilesManager
-from vibe.core.llm.key_pool import record_active_key_usage
 from vibe.core.config.layers.growthbook import GrowthbookLayer
 from vibe.core.config.layers.overrides import OverridesLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator, ConfigPatchValidationError
@@ -560,6 +559,7 @@ from vibe.core.experiments.session import (
 from vibe.core.git.worktree import PreparedWorktree
 from vibe.core.hooks.config import load_hooks_from_fs
 from vibe.core.identity_cache import IdentityCache
+from vibe.core.llm.key_pool import record_active_key_usage
 from vibe.core.log_reader import LogReader
 from vibe.core.loop import LoopError
 from vibe.core.proxy_setup import (

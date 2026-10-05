@@ -467,6 +467,21 @@ def run_cli(args: argparse.Namespace) -> None:
     load_dotenv_values()
     bootstrap_vibe_home()
 
+    if getattr(args, "list_keys", False):
+        from vibe.core.config._defaults import DEFAULT_MISTRAL_API_ENV_KEY
+        from vibe.utils.api_keys import pooled_keys, resolve_api_key
+
+        keys = pooled_keys(DEFAULT_MISTRAL_API_ENV_KEY)
+        if (primary := resolve_api_key(DEFAULT_MISTRAL_API_ENV_KEY)) and (
+            primary not in keys
+        ):
+            keys.insert(0, primary)
+        from vibe.cli.list_keys import format_key_accounts
+
+        for line in asyncio.run(format_key_accounts(keys)):
+            print(line)
+        sys.exit(0 if keys else 1)
+
     if args.setup:
         from vibe.setup.onboarding import run_onboarding
 

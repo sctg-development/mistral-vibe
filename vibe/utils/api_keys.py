@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 import os
 import re
 
-from vibe.utils.keyring import get_api_key_from_keyring
+from keyring.errors import KeyringError
+
+from vibe.utils.keyring import get_api_key_from_keyring, set_api_key_in_keyring
+
+POOL_ENV_SUFFIX = "S"
 
 
 class ApiKeySource(StrEnum):
@@ -41,6 +46,48 @@ def split_keys(raw: str | None) -> list[str]:
     return [item.strip() for item in re.split(r"[,;\n]", raw) if item.strip()]
 
 
+def pool_env_var(api_key_env_var: str) -> str:
+    return f"{api_key_env_var}{POOL_ENV_SUFFIX}" if api_key_env_var else ""
+
+
+def stored_pool_keys(api_key_env_var: str) -> list[str]:
+    """Accounts saved by earlier sign-ins (one keyring entry, comma separated)."""
+    name = pool_env_var(api_key_env_var)
+    if not name:
+        return []
+    return split_keys(get_api_key_from_keyring(name, search_legacy_services=False))
+
+
+def pooled_keys(
+    api_key_env_var: str, environ: Mapping[str, str] | None = None
+) -> list[str]:
+    """Every account, in order: the plural variable first, then saved sign-ins.
+
+    The keyring is read only for the real process environment, so callers that
+    pass their own mapping stay hermetic.
+    """
+    name = pool_env_var(api_key_env_var)
+    if not name:
+        return []
+    keys = split_keys((os.environ if environ is None else environ).get(name))
+    if environ is None:
+        keys += stored_pool_keys(api_key_env_var)
+    return list(dict.fromkeys(keys))
+
+
+def add_pooled_key(api_key_env_var: str, api_key: str) -> bool:
+    """Remember ``api_key`` as one more account. False when it cannot be saved."""
+    name = pool_env_var(api_key_env_var)
+    if not name or not api_key:
+        return False
+    keys = list(dict.fromkeys([*stored_pool_keys(api_key_env_var), api_key]))
+    try:
+        set_api_key_in_keyring(name, ",".join(keys))
+    except KeyringError:
+        return False
+    return True
+
+
 def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None:
     """The key for ``env_key`` and where it was read from, or ``None``.
 
@@ -57,9 +104,11 @@ def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None
     # Multi-account setups may only define the plural variable
     # (``MISTRAL_API_KEYS``); its first key stands in for the single one so the
     # rest of the CLI (account lookups, auth state) keeps working.
-    plural = f"{env_key}S"
+    plural = pool_env_var(env_key)
     if pooled := split_keys(os.environ.get(plural)):
         return pooled[0], ApiKeyOrigin(ApiKeySource.ENVIRONMENT, plural)
+    if stored := stored_pool_keys(env_key):
+        return stored[0], ApiKeyOrigin(ApiKeySource.KEYRING, plural)
     return None
 
 

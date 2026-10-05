@@ -658,3 +658,14 @@ def build_test_vibe_app(
         voice_manager=voice_manager,
         **kwargs,
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_key_usage_registry() -> Generator[None, None, None]:
+    from vibe.core.llm import key_pool
+
+    key_pool._SESSION_USAGE.clear()
+    key_pool.note_active_key(None)
+    yield
+    key_pool._SESSION_USAGE.clear()
+    key_pool.note_active_key(None)

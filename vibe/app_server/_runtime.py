@@ -84,6 +84,7 @@ from vibe.core.config import (
     build_default_orchestrator,
     resolve_api_key,
 )
+from vibe.core.config._defaults import DEFAULT_MISTRAL_API_ENV_KEY
 from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.config.layers.growthbook import GrowthbookLayer
 from vibe.core.config.layers.overrides import OverridesLayer
@@ -128,6 +129,7 @@ from vibe.core.utils import get_windows_bash_path, is_windows
 from vibe.core.utils.matching import name_matches
 from vibe.observability.logging import logger, set_config_log_level
 from vibe.utils import AgentEntrypoint
+from vibe.utils.api_keys import pooled_keys
 from vibe.utils.cache_store import FileSystemCacheStore
 from vibe.utils.http import get_server_url_from_api_base
 from vibe.utils.paths import is_dangerous_directory
@@ -1188,7 +1190,10 @@ class HarnessProcess:
         from vibe._experimental_harness import resolve_harness_selection
 
         selection = resolve_harness_selection(
-            experimental_harness=experimental_harness, legacy_harness=legacy_harness
+            experimental_harness=experimental_harness,
+            legacy_harness=legacy_harness,
+            cached_eval=cached_eval,
+            key_pool_active=len(pooled_keys(DEFAULT_MISTRAL_API_ENV_KEY)) > 1,
         )
         self.harness_selection_source = selection.source
 
