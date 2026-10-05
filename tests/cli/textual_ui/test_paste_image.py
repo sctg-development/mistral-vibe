@@ -46,7 +46,7 @@ def _build_vision_app(*, supports_images: bool = True) -> VibeApp:
             ProviderConfig(
                 name="mistral",
                 api_base="https://api.mistral.ai/v1",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
                 backend=Backend.MISTRAL,
             )
         ],

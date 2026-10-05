@@ -31,8 +31,8 @@ async def _wait_for_whats_new(pilot: Pilot) -> None:
 
 class SnapshotTestAppWithWhatsNew(BaseSnapshotTestApp):
     def __init__(self, gateway: FakeAccountGateway | None = None):
-        self._previous_api_key = os.environ.get("MISTRAL_API_KEY")
-        os.environ["MISTRAL_API_KEY"] = "snapshot-api-key"
+        self._previous_api_key = os.environ.get("VIBE_API_KEY")
+        os.environ["VIBE_API_KEY"] = "snapshot-api-key"
 
         config = default_config()
         update_notifier = FakeUpdateGateway(update=None)
@@ -53,9 +53,9 @@ class SnapshotTestAppWithWhatsNew(BaseSnapshotTestApp):
 
     def on_unmount(self) -> None:
         if self._previous_api_key is None:
-            os.environ.pop("MISTRAL_API_KEY", None)
+            os.environ.pop("VIBE_API_KEY", None)
         else:
-            os.environ["MISTRAL_API_KEY"] = self._previous_api_key
+            os.environ["VIBE_API_KEY"] = self._previous_api_key
         return None
 
 

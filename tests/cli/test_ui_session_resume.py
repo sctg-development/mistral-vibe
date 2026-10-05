@@ -214,7 +214,7 @@ async def test_ui_rebuilds_history_when_whats_new_is_shown(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # we have to define an api key to make sure we display the Plan Offer message
-    monkeypatch.setenv("MISTRAL_API_KEY", "api-key")
+    monkeypatch.setenv("VIBE_API_KEY", "api-key")
     config = build_test_vibe_config(enable_update_checks=True)
     agent_loop = build_test_agent_loop(config=config)
     agent_loop.messages.extend([

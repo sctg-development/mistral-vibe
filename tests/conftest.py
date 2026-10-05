@@ -168,7 +168,7 @@ def get_base_config() -> dict[str, Any]:
             {
                 "name": "mistral",
                 "api_base": "https://api.mistral.ai/v1",
-                "api_key_env_var": "MISTRAL_API_KEY",
+                "api_key_env_var": "VIBE_API_KEY",
                 "browser_auth_base_url": "https://console.mistral.ai",
                 "browser_auth_api_base_url": "https://console.mistral.ai/api",
                 "backend": "mistral",
@@ -269,7 +269,7 @@ def _scratchpad_dir(
 
 @pytest.fixture(autouse=True)
 def _mock_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "mock")
+    monkeypatch.setenv("VIBE_API_KEY", "mock")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "mock")
     monkeypatch.setenv("OPENAI_API_KEY", "mock")
     monkeypatch.setenv("VERTEX_API_KEY", "mock")
@@ -487,7 +487,7 @@ def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     # default so tests don't pay for it. Connector tests pass enable_connectors=True.
     kwargs.setdefault("enable_connectors", False)
     # Telemetry gates the remote experiment fetch (experiments.mistral.services);
-    # off by default so a leaked MISTRAL_API_KEY never triggers an unmocked call.
+    # off by default so a leaked VIBE_API_KEY never triggers an unmocked call.
     kwargs.setdefault("enable_telemetry", False)
     # Use the lightweight test system prompt unless a test asks for a real one.
     kwargs.setdefault("system_prompt_id", "tests")

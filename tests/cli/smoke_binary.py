@@ -37,8 +37,8 @@ def _isolated_env(vibe_home: Path) -> dict[str, str]:
     env["VIBE_HOME"] = str(vibe_home)
     env["VIBE_TEST_DISABLE_KEYRING"] = "1"
     env["TERM"] = env.get("TERM") or "xterm-256color"
-    env.pop("MISTRAL_API_KEY", None)
-    env.pop("VIBE_MISTRAL_API_KEY", None)
+    env.pop("VIBE_API_KEY", None)
+    env.pop("VIBE_VIBE_API_KEY", None)
     return env
 
 
@@ -68,7 +68,7 @@ def test_interactive_launch_loads_bundled_assets(binary: Path) -> None:
         workdir.mkdir()
         master_fd, slave_fd = pty.openpty()
         env = _isolated_env(tmp_path / "home")
-        env["MISTRAL_API_KEY"] = "smoke-test-mock-key"
+        env["VIBE_API_KEY"] = "smoke-test-mock-key"
         env["GIT_PYTHON_GIT_EXECUTABLE"] = str(tmp_path / "missing-git")
         env["GIT_PYTHON_REFRESH"] = "raise"
         proc = subprocess.Popen(

@@ -346,7 +346,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Quit confirmation no longer leaks after leaving a subagent transcript
 - Clearing or resuming no longer races subagent transcript refreshes
 - Resumed sessions and tool approvals no longer stall when notifications arrive
-- Providers configured without an API key environment variable — local or self-hosted model servers — run again on the Unified Harness instead of failing every turn with a missing MISTRAL_API_KEY error.
+- Providers configured without an API key environment variable — local or self-hosted model servers — run again on the Unified Harness instead of failing every turn with a missing VIBE_API_KEY error.
 - A provider error on the Unified Harness shows the provider's own explanation again, such as "model is overloaded" or "context length exceeded", instead of only the HTTP status line and the request URL.
 - Queueing a message on a Unified session no longer risks killing the app server when the queue change arrives on a session state update.
 - Opening a session and loading the session list are much faster on machines with many linked checkouts: reads no longer resolve plugins, MCP servers and connectors they never use, and Desktop asks for a project's sessions in one request instead of one per checkout.
@@ -417,7 +417,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The invalid API key error now names where the key came from (`env var MISTRAL_API_KEY`, `the keyring`), so a shell-exported key shadowing the one saved at setup is visible.
+- The invalid API key error now names where the key came from (`env var VIBE_API_KEY`, `the keyring`), so a shell-exported key shadowing the one saved at setup is visible.
 - Optimized resource usage when running the full test suite.
 - The `vibe` and `skill-creator` skills now reach a session as skills of the shipped `vibe` plugin, so they are offered once, as `/vibe:vibe` and `/vibe:skill-creator`.
 - Bump harness to v0.4.3

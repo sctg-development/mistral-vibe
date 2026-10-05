@@ -12,7 +12,7 @@ from vibe.core.config.vibe_schema import VibeConfigSchema
 @pytest.mark.asyncio
 async def test_reads_env_vars() -> None:
     env = {
-        "MISTRAL_API_KEY": "test-key",
+        "VIBE_API_KEY": "test-key",
         "VIBE_ACTIVE_MODEL": "mistral-large",
         "VIBE_DISABLE_WELCOME_BANNER_ANIMATION": "true",
         "VIBE_ENABLE_TELEMETRY": "0",

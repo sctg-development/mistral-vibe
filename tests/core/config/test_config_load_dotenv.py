@@ -25,7 +25,7 @@ def test_adds_missing_values_without_overriding_existing(tmp_path: Path) -> None
     _write_env_file(
         env_path,
         "\n".join([
-            "MISTRAL_API_KEY=new-key",
+            "VIBE_API_KEY=new-key",
             "HTTPS_PROXY=https://local-proxy:8080",
             "OTHER=from-env",
             "NEW_KEY=added",
@@ -34,7 +34,7 @@ def test_adds_missing_values_without_overriding_existing(tmp_path: Path) -> None
         + "\n",
     )
     environ = {
-        "MISTRAL_API_KEY": "old-key",
+        "VIBE_API_KEY": "old-key",
         "HTTPS_PROXY": "old-https",
         "OTHER": "keep",
         "FOO": "keep",
@@ -43,7 +43,7 @@ def test_adds_missing_values_without_overriding_existing(tmp_path: Path) -> None
     load_dotenv_values(env_path=env_path, environ=environ)
 
     # An explicit process/shell value wins over the .env file.
-    assert environ["MISTRAL_API_KEY"] == "old-key"
+    assert environ["VIBE_API_KEY"] == "old-key"
     assert environ["HTTPS_PROXY"] == "old-https"
     assert environ["OTHER"] == "keep"
     assert environ["FOO"] == "keep"
@@ -53,25 +53,25 @@ def test_adds_missing_values_without_overriding_existing(tmp_path: Path) -> None
 
 def test_adds_dotenv_value_when_process_env_is_empty(tmp_path: Path) -> None:
     env_path = tmp_path / ".env"
-    _write_env_file(env_path, "MISTRAL_API_KEY=file-key\n")
-    environ = {"MISTRAL_API_KEY": ""}
+    _write_env_file(env_path, "VIBE_API_KEY=file-key\n")
+    environ = {"VIBE_API_KEY": ""}
 
     load_dotenv_values(env_path=env_path, environ=environ)
 
-    assert environ["MISTRAL_API_KEY"] == "file-key"
+    assert environ["VIBE_API_KEY"] == "file-key"
 
 
 def test_ignores_empty_values(tmp_path: Path) -> None:
     env_path = tmp_path / ".env"
     _write_env_file(
-        env_path, "\n".join(["EMPTY=", "MISTRAL_API_KEY=", "NO_VALUE"]) + "\n"
+        env_path, "\n".join(["EMPTY=", "VIBE_API_KEY=", "NO_VALUE"]) + "\n"
     )
     environ: dict[str, str] = {}
 
     load_dotenv_values(env_path=env_path, environ=environ)
 
     assert "EMPTY" not in environ
-    assert "MISTRAL_API_KEY" not in environ
+    assert "VIBE_API_KEY" not in environ
     assert "NO_VALUE" not in environ
 
 

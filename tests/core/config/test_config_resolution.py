@@ -295,7 +295,7 @@ class TestSystemTrustStoreConfig:
         ],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
         config_file = config_dir / "config.toml"
         with config_file.open("rb") as f:
             data = tomllib.load(f)
@@ -1230,7 +1230,7 @@ class TestMistralBrowserAuthConfig:
                         {
                             "name": "mistral",
                             "api_base": "https://api.mistral.ai/v1",
-                            "api_key_env_var": "MISTRAL_API_KEY",
+                            "api_key_env_var": "VIBE_API_KEY",
                             "reasoning_field_name": "thoughts",
                         }
                     ],
@@ -1269,7 +1269,7 @@ class TestMistralBrowserAuthConfig:
         provider = ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
             browser_auth_base_url="https://custom-console.example",
         )
 
@@ -1287,7 +1287,7 @@ class TestMistralBrowserAuthConfig:
         provider = ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
         )
 
         reloaded_provider = ProviderConfig.model_validate(
@@ -1302,7 +1302,7 @@ class TestMistralBrowserAuthConfig:
         provider = ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
             backend=Backend.GENERIC,
         )
 
@@ -1704,12 +1704,12 @@ class TestCompactionModel:
             ProviderConfig(
                 name="mistral",
                 api_base="https://api.mistral.ai/v1",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
             ),
             ProviderConfig(
                 name="other",
                 api_base="https://other.ai/v1",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
             ),
         ]
         cfg = make_config(compaction_model=compaction, providers=providers)
@@ -1791,7 +1791,7 @@ class TestGetMistralProvider:
         mistral_provider = ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
             backend=Backend.MISTRAL,
         )
         llamacpp_provider = ProviderConfig(
@@ -1830,7 +1830,7 @@ class TestGetMistralProvider:
         mistral_provider = ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
             backend=Backend.MISTRAL,
         )
         llamacpp_model = ModelConfig(
@@ -1880,7 +1880,7 @@ class TestIsActiveModelMistral:
                 ProviderConfig(
                     name="mistral",
                     api_base="https://api.mistral.ai/v1",
-                    api_key_env_var="MISTRAL_API_KEY",
+                    api_key_env_var="VIBE_API_KEY",
                     backend=Backend.MISTRAL,
                 )
             ],

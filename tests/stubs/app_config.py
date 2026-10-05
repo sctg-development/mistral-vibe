@@ -64,7 +64,7 @@ def build_test_app_config(
             ),
             provider=AudioProviderView(
                 api_base="wss://api.mistral.ai",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
                 client="mistral",
             ),
         ),
@@ -74,7 +74,7 @@ def build_test_app_config(
             ),
             provider=AudioProviderView(
                 api_base="https://api.mistral.ai",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
                 client="mistral",
             ),
         ),

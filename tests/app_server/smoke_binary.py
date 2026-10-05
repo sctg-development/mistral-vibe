@@ -60,7 +60,7 @@ async def smoke_binary(binary: Path, *, experimental_harness: bool) -> None:
         env = os.environ.copy()
         env["VIBE_HOME"] = str(Path(tmp) / ".vibe")
         env["VIBE_TEST_DISABLE_KEYRING"] = "1"
-        env["MISTRAL_API_KEY"] = "smoke-test"
+        env["VIBE_API_KEY"] = "smoke-test"
         arguments = ["--experimental-harness"] if experimental_harness else []
         proc = await asyncio.create_subprocess_exec(
             str(binary),

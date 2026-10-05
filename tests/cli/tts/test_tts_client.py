@@ -12,7 +12,7 @@ from vibe.cli.tts import MistralTTSClient, TTSResult
 def _make_provider() -> AudioProviderView:
     return AudioProviderView(
         api_base="https://api.mistral.ai",
-        api_key_env_var="MISTRAL_API_KEY",
+        api_key_env_var="VIBE_API_KEY",
         client="mistral",
     )
 
@@ -25,14 +25,14 @@ def _make_model() -> TTSModelConfigView:
 
 class TestMistralTTSClientInit:
     def test_lazy_client_creation(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.setenv("VIBE_API_KEY", "test-key")
         client = MistralTTSClient(_make_provider(), _make_model())
         assert client._client is None
 
     def test_get_client_creates_mistral_instance(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.setenv("VIBE_API_KEY", "test-key")
         client = MistralTTSClient(_make_provider(), _make_model())
         sdk_client = client._get_client()
         assert sdk_client is not None
@@ -45,7 +45,7 @@ class TestMistralTTSClient:
     async def test_speak_returns_decoded_audio(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
         raw_audio = b"fake-audio-data-for-testing"
         encoded_audio = base64.b64encode(raw_audio).decode()
@@ -92,7 +92,7 @@ class TestMistralTTSClient:
     async def test_speak_raises_on_sdk_error(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.setenv("VIBE_API_KEY", "test-key")
         import httpx
         from mistralai.client.errors import SDKError
 
@@ -118,7 +118,7 @@ class TestMistralTTSClient:
 
     @pytest.mark.asyncio
     async def test_close_resets_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        monkeypatch.setenv("VIBE_API_KEY", "test-key")
         client = MistralTTSClient(_make_provider(), _make_model())
         client._get_client()
         assert client._client is not None

@@ -241,7 +241,7 @@ otel_redaction = "default"
 [[providers]]
 name = "mistral"
 api_base = "https://api.mistral.ai/v1"
-api_key_env_var = "MISTRAL_API_KEY"
+api_key_env_var = "VIBE_API_KEY"
 backend = "mistral"
 
 [[providers]]
@@ -418,7 +418,7 @@ Remote MCP servers can be added non-interactively from the shell:
 vibe mcp add mistralai \\
   --url https://api.mistral.ai/mcp \\
   --transport streamable-http \\
-  --api-key-env MISTRAL_API_KEY
+  --api-key-env VIBE_API_KEY
 
 vibe mcp add linear \\
   --url https://mcp.linear.app/mcp
@@ -1258,7 +1258,7 @@ offered inline, and no popup is shown.
 - `GIT_PYTHON_GIT_EXECUTABLE` - Absolute path to a trusted custom or portable
   Git executable. Automatic Git discovery ignores relative PATH entries and
   executables inside the current project.
-- `MISTRAL_API_KEY` - API key for Mistral provider
+- `VIBE_API_KEY` - API key for Mistral provider
 - `VIBE_ACTIVE_MODEL` - Override active model
 - `VIBE_CLI` - Selects the CLI implementation: `rust` starts the experimental
   Rust TUI; any other value (or unset) runs the legacy Python (Textual) TUI.
@@ -1279,7 +1279,7 @@ offered inline, and no popup is shown.
 The `.env` file in VIBE_HOME stores API keys in dotenv format:
 
 ```
-MISTRAL_API_KEY=your-key-here
+VIBE_API_KEY=your-key-here
 ```
 
 This file is loaded on startup and its values are injected into the environment.

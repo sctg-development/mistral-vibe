@@ -98,7 +98,7 @@ class ProviderCredentialService:
 
         snapshot = await asyncio.to_thread(_resolve_snapshot, provider)
         if snapshot is None:
-            env_var = provider.api_key_env_var or "MISTRAL_API_KEY"
+            env_var = provider.api_key_env_var or "VIBE_API_KEY"
             return ProviderAuthRequired(
                 reason="missing",
                 provider=provider.name,

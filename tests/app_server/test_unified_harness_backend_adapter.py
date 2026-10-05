@@ -942,7 +942,7 @@ async def test_unified_title_generation_gated_on_entrypoint(
     config["session_logging"] = {"generate_titles": True}
     config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
         context = await process.build_unified_session_context(
@@ -969,7 +969,7 @@ async def test_unified_title_model_uses_active_model_on_unprobed_custom_endpoint
     config["session_logging"] = {"generate_titles": True}
     config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
         context = await process.build_unified_session_context(
@@ -1044,7 +1044,7 @@ async def test_unified_runtime_enables_large_output_offloading(
     from mistralai_vibe_local_harness.protocol import RustFilesystemLargeOutputPolicy
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
         context = await process.build_unified_session_context(
@@ -1081,7 +1081,7 @@ async def test_unified_runtime_declares_the_vibe_tool_group(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
         context = await process.build_unified_session_context(
@@ -2505,7 +2505,7 @@ async def test_unified_runtime_config_gates_editing_tools(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), auto_approve=auto_approve)
@@ -2553,7 +2553,7 @@ async def test_smart_approve_mode_sets_gated_tools_to_classify(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), auto_approve=False, agent="smart-approve")
@@ -2645,7 +2645,7 @@ async def test_switching_mode_re_derives_tool_modes_and_active_agent(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), agent="accept-edits")
@@ -2674,7 +2674,7 @@ async def test_switching_into_smart_approve_flips_gated_tools_to_classify(
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), agent="ask")
@@ -2723,7 +2723,7 @@ async def test_mid_turn_switch_out_of_smart_approve_regates_provided_tools(
     from vibe.app_server.protocol import AgentSwitchParams
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), agent="ask")
@@ -2769,7 +2769,7 @@ async def test_mid_turn_switch_into_smart_approve_gates_provided_tools(
     from vibe.app_server.protocol import AgentSwitchParams
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), agent="ask")
@@ -2898,7 +2898,7 @@ async def test_uninstalling_the_active_agent_unwinds_when_the_pin_fails(
     from vibe.app_server.protocol import AgentInstallParams
     from vibe.core.agents.install import writable_installed_agents
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     context, adapter = await _adapter_on_the_lean_agent(tmp_path, session)
 
@@ -2926,7 +2926,7 @@ async def test_uninstalling_the_active_agent_restores_a_failed_switch(
     from vibe.app_server.protocol import AgentInstallParams
     from vibe.core.agents.install import writable_installed_agents
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     context, adapter = await _adapter_on_the_lean_agent(tmp_path, session)
     applied_before = len(session.applied)
@@ -2968,7 +2968,7 @@ async def test_approval_policy_graft_covers_every_field_a_mode_switch_changes(
     )
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = runtime_module.HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), agent="ask")
@@ -3229,7 +3229,7 @@ async def test_unified_snapshot_reports_a_bypass_the_cli_flag_forces_past_a_swit
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(
         tmp_path, session, auto_approve=True
@@ -3258,7 +3258,7 @@ async def test_unified_snapshot_reports_the_bypass_the_active_profile_brings(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
 
@@ -3287,7 +3287,7 @@ async def test_unified_runtime_derives_complete_compaction_configuration(
     from vibe.core.config.layers.overrides import OverridesLayer
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3415,7 +3415,7 @@ async def test_unified_runtime_disables_automatic_compaction_at_zero(
     from vibe.core.config.layers.overrides import OverridesLayer
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3456,7 +3456,7 @@ async def test_unified_config_write_updates_live_compaction_configuration(
     from vibe.app_server.protocol import ConfigWriteOpWire, ConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3525,7 +3525,7 @@ async def test_unified_config_write_mid_turn_defers_until_the_next_turn(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3585,7 +3585,7 @@ async def test_unified_model_pick_says_whether_the_session_is_running_it(
     from vibe.app_server.protocol import ModelConfigWriteParams, RuntimeMutationStatus
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3642,7 +3642,7 @@ async def test_unified_picking_the_default_leaves_the_session_unpinned(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3691,7 +3691,7 @@ async def test_unified_a_thinking_pick_is_pinned_to_the_session(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3734,7 +3734,7 @@ async def test_unified_a_model_pick_moves_the_pinned_thinking_to_that_model(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3795,7 +3795,7 @@ async def test_unified_moving_to_a_profile_owned_model_clears_the_pinned_thinkin
     from vibe.core.agents.registry import apply_profile_overrides
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3858,7 +3858,7 @@ async def test_unified_queueing_a_turn_leaves_the_running_one_on_its_model(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3919,7 +3919,7 @@ async def test_unified_a_model_pick_waits_for_a_teleport(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -3966,7 +3966,7 @@ async def test_unified_settled_pick_announces_the_runtime_it_landed(
     from vibe.app_server.protocol import ModelConfigWriteParams, RuntimeUpdatedParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -4026,7 +4026,7 @@ async def test_unified_a_failed_announcement_still_lets_the_turn_open(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -4083,7 +4083,7 @@ async def test_unified_model_pick_pins_the_session_before_the_next_turn(
     from vibe.app_server.protocol import ModelConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -4143,7 +4143,7 @@ async def test_unified_parked_pick_survives_a_turn_that_wins_the_flush_race(
             self._active_turn_id = value
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -4190,7 +4190,7 @@ async def test_unified_config_write_mid_turn_conflicts_beyond_the_model(
     from vibe.app_server.protocol import ConfigWriteOpWire, ConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -4238,7 +4238,7 @@ async def test_unified_config_write_rejects_invalid_core_settings_before_persist
     from vibe.app_server.protocol import ConfigWriteOpWire, ConfigWriteParams
 
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -4279,7 +4279,7 @@ async def test_unified_runtime_denies_a_tool_disabled_by_a_live_config_patch(
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), auto_approve=True)
@@ -4338,7 +4338,7 @@ async def test_unified_runtime_config_carries_a_workspace_skill_to_both_sides_of
     from vibe.app_server._runtime import HarnessProcess
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     skill_path = _write_workspace_skill(tmp_path, "code-review", "Read the diff twice.")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
@@ -4369,7 +4369,7 @@ async def test_unified_explicit_only_skill_stays_available_to_slash_invocation(
         UnifiedSessionSettings,
     )
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     _write_workspace_skill(
         tmp_path,
         "manual-review",
@@ -4418,7 +4418,7 @@ async def test_unified_runtime_config_picks_up_a_skill_added_after_the_session_s
     from vibe.app_server._runtime import HarnessProcess
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), trust_workspace=True)
@@ -4453,7 +4453,7 @@ async def test_unified_reload_pushes_the_new_catalogue_into_the_live_session(
     )
     from vibe.app_server.protocol import ConfigReloadParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), trust_workspace=True)
@@ -4497,7 +4497,7 @@ async def test_unified_reload_keeps_what_the_session_is_connected_to(
     )
     from vibe.app_server.protocol import ConfigReloadParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), trust_workspace=True)
@@ -4563,7 +4563,7 @@ async def _unified_trust_adapter(
     )
 
     (tmp_path / "AGENTS.md").write_text("Trusted instructions", encoding="utf-8")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path))
@@ -4772,7 +4772,7 @@ async def test_unified_connector_projection_keeps_server_error_on_name_collision
         UnifiedSessionSettings,
     )
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), trust_workspace=True)
@@ -4880,7 +4880,7 @@ async def test_unified_start_turn_appends_the_body_of_an_invoked_skill(
     has to travel as content or the slash command does nothing at all.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
     display = UserDisplayContent(
@@ -5046,7 +5046,7 @@ async def test_unified_read_keeps_bounded_skill_history_pairs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, history_limit: int
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
 
@@ -5079,7 +5079,7 @@ async def test_unified_history_projects_skill_before_scratchpad(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     storage_root = tmp_path / "sessions"
     adapter = await _skill_adapter(tmp_path, session, storage_root=storage_root)
@@ -5125,7 +5125,7 @@ async def test_unified_history_projects_a_pre_marker_skill_invocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_loaded: bool
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
     payload = (
@@ -5161,7 +5161,7 @@ async def test_unified_history_hides_mixed_case_already_loaded_skill_note(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
     session.sent.append(
@@ -5193,7 +5193,7 @@ async def test_unified_history_projects_a_skill_body_containing_skill_markup(
 ) -> None:
     """Nested marker text in a skill cannot make its outer payload public."""
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     nested = (
         '<skill_content name="code-review">\n'
         "# Skill: code-review\n\nexample\n"
@@ -5247,7 +5247,7 @@ async def test_unified_enqueue_turn_appends_skill_body_after_mentioned_files(
     """
     # Prepare
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     (tmp_path / "notes.md").write_text("user file", encoding="utf-8")
     (tmp_path / "secret.md").write_text("skill file", encoding="utf-8")
     _write_workspace_skill(tmp_path, "mention-doc", "Use @secret.md as an example.")
@@ -5307,7 +5307,7 @@ async def test_unified_replace_queued_turn_appends_the_body_of_an_invoked_skill(
     """
     # Prepare
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
 
@@ -5344,7 +5344,7 @@ async def test_unified_queued_steer_forwards_only_stored_queue_identity(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     if getattr(harness_session_protocol, "TurnQueueSteerParams", None) is None:
         pytest.skip("installed Unified Harness does not support queued steering")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
     flushed = False
@@ -5382,7 +5382,7 @@ async def test_unified_queued_steer_rejects_an_older_harness(
     """An installed Harness without queued steering fails as unsupported."""
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     monkeypatch.delattr(harness_session_protocol, "TurnQueueSteerParams", raising=False)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
 
@@ -5413,7 +5413,7 @@ async def test_unified_start_turn_points_at_a_skill_the_conversation_already_hol
     context that already holds a verbatim copy of it.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
 
@@ -5442,7 +5442,7 @@ async def test_unified_turns_carry_the_scratchpad_until_the_model_holds_it(
     so nothing else catches the adapter silently not asking for it.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     storage_root = tmp_path / "sessions"
     adapter = await _skill_adapter(tmp_path, session, storage_root=storage_root)
@@ -5484,7 +5484,7 @@ async def test_unified_start_turn_leaves_an_unknown_slash_command_alone(
     than silently picking up some other skill's instructions.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
 
@@ -5511,7 +5511,7 @@ async def test_unified_steer_and_inject_honour_the_invoked_skill_flag(
     a replay that re-expands its own slash command duplicates the skill.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter = await _skill_adapter(tmp_path, session)
 
@@ -5549,7 +5549,7 @@ async def test_unified_start_turn_does_not_expand_mentions_inside_a_skill_body(
     would fail the turn outright.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     (tmp_path / "notes.md").write_text("user file", encoding="utf-8")
     (tmp_path / "secret.md").write_text("skill file", encoding="utf-8")
     _write_workspace_skill(tmp_path, "mention-doc", "Write @secret.md to name a file.")
@@ -5586,7 +5586,7 @@ async def test_unified_inject_context_does_not_expand_mentions_inside_a_skill_bo
     replaying a slash command through it must not inherit the skill's mentions.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     (tmp_path / "notes.md").write_text("caller file", encoding="utf-8")
     (tmp_path / "secret.md").write_text("skill file", encoding="utf-8")
     _write_workspace_skill(tmp_path, "mention-doc", "Write @secret.md to name a file.")
@@ -5624,7 +5624,7 @@ async def test_unified_session_keeps_the_cwd_among_its_workspace_roots(
     file tools unable to read the project the session was started in.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     from vibe.app_server._runtime import HarnessProcess
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
@@ -5657,7 +5657,7 @@ async def test_unified_start_turn_inlines_a_mention_from_an_added_dir(
     holds two contradictory definitions of its own workspace.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     downloads = tmp_path / "downloads"
@@ -5700,7 +5700,7 @@ async def test_unified_start_turn_keeps_an_unreachable_mention_as_plain_text(
     one path they typed themselves.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "notes.md").write_text("user file", encoding="utf-8")
@@ -5742,7 +5742,7 @@ async def test_unified_runtime_reports_a_skill_it_could_not_parse(
     from vibe.app_server._runtime import HarnessProcess
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     broken = tmp_path / ".vibe" / "skills" / "half-written" / "SKILL.md"
     broken.parent.mkdir(parents=True, exist_ok=True)
     broken.write_text("---\nname: half-written\n---\n\nBody.\n", encoding="utf-8")
@@ -5775,7 +5775,7 @@ async def test_unified_runtime_config_withholds_skills_when_the_skill_tool_is_of
     from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
     from vibe.core.config.patch import AddOperationPatch
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     _write_workspace_skill(tmp_path, "code-review", "Read the diff twice.")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
@@ -5920,7 +5920,7 @@ async def test_switching_to_an_agent_before_the_first_turn_carries_its_prompt(
     # A project prompt resolves against the process working directory, which for
     # a real session is the directory Vibe was launched in.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
 
@@ -5947,7 +5947,7 @@ async def test_unified_agent_switch_to_auto_approve_bypasses_tool_approval(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, derivation = await _unified_adapter_with_real_context(tmp_path, session)
 
@@ -5975,7 +5975,7 @@ async def test_unified_agent_switch_away_from_auto_approve_restores_approval(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
 
@@ -6006,7 +6006,7 @@ async def test_unified_agent_switch_applies_while_a_turn_is_running(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     session.active_turn_id = "turn-1"
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
@@ -6035,7 +6035,7 @@ async def test_unified_agent_switch_mid_turn_defers_only_the_core_half(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams, TurnStartParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     session.active_turn_id = "turn-1"
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
@@ -6084,7 +6084,7 @@ async def test_unified_agent_switch_mid_turn_holds_the_model_for_the_running_tur
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams, TurnStartParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     # ``lean`` is the built-in profile that repoints ``active_model``, and it
     # only becomes switchable once installed.
     config_file = config_dir / "config.toml"
@@ -6121,7 +6121,7 @@ async def test_unified_agent_switch_rejects_an_unknown_agent(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
 
@@ -6149,7 +6149,7 @@ async def test_unified_agent_switch_to_plan_denies_editing(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
 
@@ -6187,7 +6187,7 @@ async def test_unified_agent_switch_keeps_the_mcp_and_connector_projection(
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
     adapter.update_mcp_projection(
@@ -6230,7 +6230,7 @@ async def test_unified_agent_switch_restores_the_profile_when_deriving_fails(
 
     from vibe.app_server.protocol import AgentSwitchParams
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session = _RecordingSession()
     adapter, _ = await _unified_adapter_with_real_context(tmp_path, session)
     working = adapter._context.derive
@@ -6790,7 +6790,7 @@ async def test_a_project_subagent_reaches_the_core_configuration(
         encoding="utf-8",
     )
     trusted_folders_manager.trust_for_session(tmp_path)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     # Do
     context = await HarnessProcess(
@@ -7516,7 +7516,7 @@ async def test_unified_adapter_preserves_canonical_queue_entries(
     """
     # Prepare
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     from mistralai_vibe_local_harness.session_protocol import (
         Event as HarnessEvent,
         IdleSessionStatus,
@@ -10430,7 +10430,7 @@ async def test_unified_turn_survives_a_schedule_flush_failure_after_promotion(
 
     # Prepare
     session = cast(Any, _RecordingSession())
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     session.ephemeral = True
     notices: list[tuple[str, str]] = []
     session.publish_notice = lambda message, level="warning": notices.append((
@@ -11089,7 +11089,7 @@ async def test_unified_runtime_counts_the_hooks_the_session_compiled(
         '[[hooks]]\nname = "guard"\ntype = "pre_tool"\ncommand = "true"\n'
         '[[hooks]]\nname = "audit"\ntype = "post_tool"\ncommand = "true"\n'
     )
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
 
     context = await process.build_unified_session_context(
@@ -14155,7 +14155,7 @@ async def test_unified_config_write_applies_a_partially_failed_patch(
     from vibe.app_server.protocol import ConfigWriteOpWire, ConfigWriteParams
     from vibe.core.config.patch import PatchOp
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     process = HarnessProcess(experimental_harness=True)
     context = await process.build_unified_session_context(
         SessionOptions(cwd=str(tmp_path), auto_approve=True)
@@ -17526,7 +17526,7 @@ async def test_missing_deferred_turn_capability_waits_for_setup(
     *Assert*: Unified configuration lands and the turn waits for setup.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     # Prepare
     session = _RecordingSession()
@@ -17649,7 +17649,7 @@ async def test_first_turn_after_enqueue_skips_deferred_start(
     *Assert*: The promoted session uses the normal start path.
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     class _PromotedSession(_RecordingSession):
         def __init__(self) -> None:
@@ -17779,7 +17779,7 @@ async def test_pending_derivation_flushes_across_a_reserved_turn(
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     # Prepare
     session = _RecordingSession()
@@ -17814,7 +17814,7 @@ async def test_a_pick_settled_for_a_reserved_turn_is_announced(
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     # Prepare
     session = _RecordingSession()
@@ -17847,7 +17847,7 @@ async def test_a_reserved_turn_settle_waits_for_an_apply_in_flight(
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     # Prepare
     session = _RecordingSession()
@@ -17894,7 +17894,7 @@ async def test_a_parked_writes_projection_waits_for_the_configuration_lock(
     """
     pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     # Prepare
     session = _RecordingSession()
@@ -18163,7 +18163,7 @@ async def test_disabled_session_logging_keeps_the_context_off_the_save_dir(
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
     config["session_logging"] = {"enabled": False, "save_dir": str(save_dir)}
     config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
@@ -18199,7 +18199,7 @@ async def test_enabled_session_logging_still_uses_the_configured_save_dir(
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
     config["session_logging"] = {"enabled": True, "save_dir": str(save_dir)}
     config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
@@ -18283,7 +18283,7 @@ async def test_disabled_session_logging_store_is_removed_when_the_session_closes
     config = tomllib.loads(config_file.read_text(encoding="utf-8"))
     config["session_logging"] = {"enabled": False, "save_dir": str(save_dir)}
     config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     process = runtime_module.HarnessProcess(experimental_harness=True)
     client_transport, server_transport = memory_transport_pair()
@@ -18341,7 +18341,7 @@ async def test_disabled_session_logging_builds_a_fresh_store_after_the_last_rele
 
     save_dir = tmp_path / "sessions"
     _write_disabled_session_logging(config_dir, save_dir)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
@@ -18399,7 +18399,7 @@ async def test_disabled_session_logging_keeps_the_store_while_a_session_still_ho
 
     save_dir = tmp_path / "sessions"
     _write_disabled_session_logging(config_dir, save_dir)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     process = runtime_module.HarnessProcess(experimental_harness=True)
     try:
@@ -18694,7 +18694,7 @@ def _enforce_admin_toml(
 
     monkeypatch.setattr(_admin_config, "resolve_api_key", lambda _env: "api-key")
     monkeypatch.setattr(_admin_config, "fetch_managed_config", fake_fetch)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
 
 @pytest.mark.asyncio
@@ -18816,7 +18816,7 @@ async def test_opening_a_unified_session_notifies_invalid_managed_config(
 
     monkeypatch.setattr(_admin_config, "resolve_api_key", lambda _env: "api-key")
     monkeypatch.setattr(_admin_config, "fetch_managed_config", fake_fetch)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     services = FakeSessionBackendServices()
     process = runtime_module.HarnessProcess(experimental_harness=True)
@@ -18945,7 +18945,7 @@ async def test_a_detached_fork_does_not_fetch_the_admin_config(
 
     monkeypatch.setattr(_admin_config, "resolve_api_key", lambda _env: "api-key")
     monkeypatch.setattr(_admin_config, "fetch_managed_config", counting_fetch)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     services = FakeSessionBackendServices()
     process = runtime_module.HarnessProcess(experimental_harness=True)
@@ -18985,7 +18985,7 @@ async def test_unreachable_admin_endpoint_never_fails_a_unified_session_open(
 
     monkeypatch.setattr(_admin_config, "resolve_api_key", lambda _env: "api-key")
     monkeypatch.setattr(_admin_config, "fetch_managed_config", unreachable)
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     services = FakeSessionBackendServices()
     process = runtime_module.HarnessProcess(experimental_harness=True)

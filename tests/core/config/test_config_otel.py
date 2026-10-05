@@ -18,7 +18,7 @@ class TestOtelSpanExporterConfig:
     def test_derives_endpoint_from_mistral_provider(
         self, vibe_config: VibeConfigSchema, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "sk-test")
+        monkeypatch.setenv("VIBE_API_KEY", "sk-test")
         config = vibe_config.model_copy(
             update={
                 "providers": [
@@ -71,7 +71,7 @@ class TestOtelSpanExporterConfig:
     def test_falls_back_to_default_when_no_mistral_provider(
         self, vibe_config: VibeConfigSchema, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "sk-fallback")
+        monkeypatch.setenv("VIBE_API_KEY", "sk-fallback")
         config = vibe_config.model_copy(
             update={
                 "providers": [
@@ -89,7 +89,7 @@ class TestOtelSpanExporterConfig:
     def test_default_providers(
         self, vibe_config: VibeConfigSchema, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("MISTRAL_API_KEY", "sk-default")
+        monkeypatch.setenv("VIBE_API_KEY", "sk-default")
         result = _exporter_config(vibe_config)
         assert result is not None
         assert result.endpoint == "https://api.mistral.ai/telemetry/v1/traces"
@@ -98,7 +98,7 @@ class TestOtelSpanExporterConfig:
         self, vibe_config: VibeConfigSchema, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Key stored only in the OS keyring (no env var) must still authenticate OTEL.
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
         monkeypatch.setattr(
             "keyring.get_password", lambda service, username: "sk-keyring"
         )
@@ -112,15 +112,15 @@ class TestOtelSpanExporterConfig:
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
         with caplog.at_level("WARNING"):
             assert _exporter_config(vibe_config) is None
-        assert "OTEL tracing enabled but MISTRAL_API_KEY is not set" in caplog.text
+        assert "OTEL tracing enabled but VIBE_API_KEY is not set" in caplog.text
 
     def test_custom_api_key_env_var(
         self, vibe_config: VibeConfigSchema, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
         monkeypatch.setenv("MY_CUSTOM_KEY", "sk-custom")
         config = vibe_config.model_copy(
             update={

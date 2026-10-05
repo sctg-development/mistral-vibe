@@ -54,7 +54,7 @@ def _two_model_vibe_config(
         ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
             backend=Backend.MISTRAL,
         )
     ]
@@ -187,7 +187,7 @@ async def test_streaming_without_finish_reason_allowed_when_provider_opts_out(
             ProviderConfig(
                 name="mistral",
                 api_base="https://api.mistral.ai/v1",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
                 backend=Backend.GENERIC,
                 emits_finish_reason=False,
             )
@@ -396,7 +396,7 @@ def _generic_provider_vibe_config(build_config: ConfigBuilder) -> VibeConfigSche
         ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
             backend=Backend.GENERIC,
         )
     ]
@@ -438,7 +438,7 @@ async def test_mistral_metadata_header_call_type_per_turn(
             ProviderConfig(
                 name="mistral",
                 api_base="https://api.mistral.ai/v1",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
                 backend=Backend.MISTRAL,
             )
         ],
@@ -475,7 +475,7 @@ async def test_auto_compact_emits_summary_and_next_turn_metadata(
             ProviderConfig(
                 name="mistral",
                 api_base="https://api.mistral.ai/v1",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
                 backend=Backend.MISTRAL,
             )
         ],

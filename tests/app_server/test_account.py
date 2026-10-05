@@ -112,7 +112,7 @@ async def test_account_controller_projects_plan_semantics(
     rate_limit_upgrade: bool,
     teleport_eligible: bool,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     gateway = FakeAccountGateway(WhoAmIResult(plan_type=plan_type, plan_name=plan_name))
 
@@ -145,7 +145,7 @@ async def test_account_controller_projects_plan_semantics(
 async def test_account_controller_allows_teleport_without_switching_key(
     monkeypatch: pytest.MonkeyPatch, plan_type: AccountPlanKind, plan_name: str
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     gateway = FakeAccountGateway(
         WhoAmIResult(
@@ -172,7 +172,7 @@ async def test_account_controller_does_not_call_gateway_without_key(
     gateway = FakeAccountGateway(
         WhoAmIResult(plan_type=AccountPlanKind.CHAT, plan_name="INDIVIDUAL")
     )
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
 
     try:
         account = await AccountController(agent_loop, gateway).read()
@@ -192,7 +192,7 @@ async def test_account_controller_no_plan_data_when_no_mistral_provider(
     # our user. No whoami call, no account UI, and the NO_PLAN_DATA sentinel
     # (not the stale value, not null) so telemetry tells this apart from a
     # failed fetch.
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     base_config = build_test_vibe_config()
     provider = base_config.get_active_provider().model_copy(
         update={"backend": Backend.GENERIC}
@@ -223,7 +223,7 @@ async def test_account_controller_fetches_plan_for_non_mistral_active_with_mistr
     # Mistral provider with a key is still configured. We MUST call whoami and
     # capture the real plan for telemetry / GrowthBook — while suppressing the
     # account UI (no plan shown) because the active model is not Mistral.
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     base_config = build_test_vibe_config()
     active = base_config.get_active_provider()
     generic = active.model_copy(update={"backend": Backend.GENERIC})
@@ -253,7 +253,7 @@ async def test_account_controller_fetches_plan_for_non_mistral_active_with_mistr
 async def test_account_reconcile_keeps_request_provider_when_active_model_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     base_config = build_test_vibe_config()
     mistral_provider = base_config.get_active_provider().model_copy(
         update={"api_base": "https://old.mistral.example/v1"}
@@ -331,7 +331,7 @@ async def test_account_read_warms_cross_session_whoami_cache(
     # A successful live account fetch writes through to the user-scoped on-disk
     # cache so the next session's experiments path can read it without another
     # round-trip.
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     result = WhoAmIResult(plan_type=AccountPlanKind.CHAT, plan_name="INDIVIDUAL")
     gateway = FakeAccountGateway(result)
@@ -352,7 +352,7 @@ async def test_account_read_reconciles_manager_attributes(
     # disk-cache hit (plan=FREE). The account controller's live fetch must
     # reconcile the whoami-derived fields (plan/customer/org-kind) AND user_plan
     # so they never diverge — while preserving identity-derived fields.
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     agent_loop.experiment_manager.set_attributes(
         ExperimentAttributes(
@@ -447,7 +447,7 @@ async def test_account_read_unauthorized_clears_stale_plan(
     # A rejected credential (401/403) must drop any cached plan: user_plan -> None,
     # manager plan fields -> None, and the disk cache entry removed — otherwise a
     # stale plan keeps flowing for the TTL, contradicting null=lookup-failed.
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     agent_loop.experiment_manager.set_attributes(
         ExperimentAttributes(
@@ -499,7 +499,7 @@ async def test_account_controller_handles_gateway_failures(
     status: AccountStatus,
     has_rate_limit_action: bool,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
 
     try:
@@ -561,7 +561,7 @@ async def test_account_read_uses_latest_server_config_and_key(
 async def test_account_resource_round_trips_without_exposing_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     gateway = FakeAccountGateway(
         WhoAmIResult(plan_type=AccountPlanKind.CHAT, plan_name="INDIVIDUAL")

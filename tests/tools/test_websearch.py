@@ -45,7 +45,7 @@ def _ctx_with_config(config: VibeConfigSchema) -> InvokeContext:
 
 
 def _mistral_provider(
-    api_key_env_var: str = "MISTRAL_API_KEY",
+    api_key_env_var: str = "VIBE_API_KEY",
     api_base: str = "https://on-prem.example.com/v1",
 ) -> ProviderConfig:
     return ProviderConfig(
@@ -78,7 +78,7 @@ def _make_response(
 
 @pytest.fixture
 def websearch(monkeypatch):
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     config = WebSearchConfig()
     return WebSearch(config_getter=lambda: config, state=BaseToolState())
 
@@ -153,16 +153,16 @@ def test_parse_skips_non_message_entries(websearch):
 
 @pytest.mark.asyncio
 async def test_run_missing_api_key(monkeypatch):
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     config = WebSearchConfig()
     ws = WebSearch(config_getter=lambda: config, state=BaseToolState())
-    with pytest.raises(ToolError, match="MISTRAL_API_KEY"):
+    with pytest.raises(ToolError, match="VIBE_API_KEY"):
         await collect_result(ws.run(WebSearchArgs(query="test")))
 
 
 @pytest.mark.asyncio
 async def test_run_uses_mistral_provider_api_key_env_var(monkeypatch):
-    monkeypatch.setenv("MISTRAL_API_KEY", "wrong-key")
+    monkeypatch.setenv("VIBE_API_KEY", "wrong-key")
     monkeypatch.setenv("TEST_API_KEY", "provider-key")
     config = WebSearchConfig()
     ws = WebSearch(config_getter=lambda: config, state=BaseToolState())
@@ -189,7 +189,7 @@ async def test_run_uses_mistral_provider_api_key_env_var(monkeypatch):
 async def test_run_falls_back_to_default_api_key_env_var_when_provider_env_var_empty(
     monkeypatch,
 ):
-    monkeypatch.setenv("MISTRAL_API_KEY", "fallback-key")
+    monkeypatch.setenv("VIBE_API_KEY", "fallback-key")
     config = WebSearchConfig()
     ws = WebSearch(config_getter=lambda: config, state=BaseToolState())
     ctx = _ctx_with_config(build_test_vibe_config(providers=[_mistral_provider("")]))
@@ -209,7 +209,7 @@ async def test_run_falls_back_to_default_api_key_env_var_when_provider_env_var_e
 
 @pytest.mark.asyncio
 async def test_run_reports_configured_api_key_env_var_when_missing(monkeypatch):
-    monkeypatch.setenv("MISTRAL_API_KEY", "fallback-key")
+    monkeypatch.setenv("VIBE_API_KEY", "fallback-key")
     monkeypatch.setenv("TEST_API_KEY", "provider-key")
     ctx = _ctx_with_config(
         build_test_vibe_config(providers=[_mistral_provider("TEST_API_KEY")])
@@ -300,17 +300,17 @@ def test_resolve_server_url_no_mistral_provider(websearch):
 
 
 def test_is_available_with_key(monkeypatch):
-    monkeypatch.setenv("MISTRAL_API_KEY", "key")
+    monkeypatch.setenv("VIBE_API_KEY", "key")
     assert WebSearch.is_available() is True
 
 
 def test_is_available_without_key(monkeypatch):
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     assert WebSearch.is_available() is False
 
 
 def test_is_available_uses_mistral_provider_api_key_env_var(monkeypatch):
-    monkeypatch.setenv("MISTRAL_API_KEY", "fallback-key")
+    monkeypatch.setenv("VIBE_API_KEY", "fallback-key")
     monkeypatch.setenv("TEST_API_KEY", "provider-key")
     config = build_test_vibe_config(providers=[_mistral_provider("TEST_API_KEY")])
     monkeypatch.delenv("TEST_API_KEY", raising=False)
@@ -338,14 +338,14 @@ def test_is_available_uses_non_active_mistral_provider(monkeypatch):
 def test_is_available_falls_back_to_default_api_key_env_var_without_mistral_provider(
     monkeypatch,
 ):
-    monkeypatch.setenv("MISTRAL_API_KEY", "fallback-key")
+    monkeypatch.setenv("VIBE_API_KEY", "fallback-key")
     config = build_test_vibe_config(
         active_model="local", providers=[_llamacpp_provider()]
     )
 
     assert WebSearch.is_available(config) is True
 
-    monkeypatch.delenv("MISTRAL_API_KEY")
+    monkeypatch.delenv("VIBE_API_KEY")
 
     assert WebSearch.is_available(config) is False
 
@@ -353,18 +353,18 @@ def test_is_available_falls_back_to_default_api_key_env_var_without_mistral_prov
 def test_is_available_falls_back_to_default_api_key_env_var_when_provider_env_var_empty(
     monkeypatch,
 ):
-    monkeypatch.setenv("MISTRAL_API_KEY", "fallback-key")
+    monkeypatch.setenv("VIBE_API_KEY", "fallback-key")
     config = build_test_vibe_config(providers=[_mistral_provider("")])
 
     assert WebSearch.is_available(config) is True
 
-    monkeypatch.delenv("MISTRAL_API_KEY")
+    monkeypatch.delenv("VIBE_API_KEY")
 
     assert WebSearch.is_available(config) is False
 
 
 def test_tool_manager_websearch_availability_uses_provider_api_key_env_var(monkeypatch):
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setenv("TEST_API_KEY", "provider-key")
     config = build_test_vibe_config(providers=[_mistral_provider("TEST_API_KEY")])
     manager = ToolManager(lambda: config)
@@ -378,7 +378,7 @@ def test_tool_manager_websearch_availability_uses_provider_api_key_env_var(monke
 def test_tool_manager_websearch_availability_falls_back_without_mistral_provider(
     monkeypatch,
 ):
-    monkeypatch.setenv("MISTRAL_API_KEY", "fallback-key")
+    monkeypatch.setenv("VIBE_API_KEY", "fallback-key")
     config = build_test_vibe_config(
         active_model="local", providers=[_llamacpp_provider()]
     )
@@ -386,7 +386,7 @@ def test_tool_manager_websearch_availability_falls_back_without_mistral_provider
 
     assert "web_search" in manager.available_tools
 
-    monkeypatch.delenv("MISTRAL_API_KEY")
+    monkeypatch.delenv("VIBE_API_KEY")
     assert "web_search" not in manager.available_tools
 
 

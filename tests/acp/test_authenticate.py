@@ -48,7 +48,7 @@ def build_browser_sign_in_attempt(
 
 def build_mistral_provider(
     *,
-    api_key_env_var: str = "MISTRAL_API_KEY",
+    api_key_env_var: str = "VIBE_API_KEY",
     browser_auth_base_url: str = "https://console.mistral.ai",
     browser_auth_api_base_url: str = "https://console.mistral.ai/api",
 ) -> ProviderConfig:

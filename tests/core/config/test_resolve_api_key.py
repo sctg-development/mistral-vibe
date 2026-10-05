@@ -124,7 +124,7 @@ def test_resolve_returns_none_for_empty_env_key(
 def test_check_api_key_accepts_keyring_only_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setattr(
         keyring, "get_password", lambda service, username: "keyring-key"
     )
@@ -132,13 +132,13 @@ def test_check_api_key_accepts_keyring_only_key(
     # Should not raise MissingAPIKeyError despite the env var being unset.
     config = build_test_vibe_config()
 
-    assert config.get_active_provider().api_key_env_var == "MISTRAL_API_KEY"
+    assert config.get_active_provider().api_key_env_var == "VIBE_API_KEY"
 
 
 def test_check_api_key_raises_when_neither_env_nor_keyring(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setattr(keyring, "get_password", lambda service, username: None)
 
     config = build_test_vibe_config()
@@ -150,14 +150,14 @@ def test_check_api_key_raises_when_neither_env_nor_keyring(
 def test_mistral_backend_reads_keyring_only_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setattr(
         keyring, "get_password", lambda service, username: "keyring-key"
     )
     provider = ProviderConfig(
         name="mistral",
         api_base="https://api.mistral.ai/v1",
-        api_key_env_var="MISTRAL_API_KEY",
+        api_key_env_var="VIBE_API_KEY",
         backend=Backend.MISTRAL,
     )
 
@@ -169,7 +169,7 @@ def test_mistral_backend_reads_keyring_only_key(
 def test_mistral_api_key_resolves_from_keyring(
     monkeypatch: pytest.MonkeyPatch, build_config: ConfigBuilder
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setattr(
         keyring, "get_password", lambda service, username: "keyring-key"
     )
@@ -200,7 +200,7 @@ def test_mistral_api_key_uses_configured_mistral_provider_env_var(
 def test_mistral_api_key_reuses_cached_keyring_value(
     monkeypatch: pytest.MonkeyPatch, build_config: ConfigBuilder
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setattr(
         keyring, "get_password", lambda service, username: "keyring-key"
     )
@@ -215,7 +215,7 @@ def test_mistral_api_key_reuses_cached_keyring_value(
 def test_mistral_api_key_empty_when_cache_cleared_and_unresolved(
     monkeypatch: pytest.MonkeyPatch, build_config: ConfigBuilder
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setattr(
         keyring, "get_password", lambda service, username: "keyring-key"
     )

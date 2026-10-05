@@ -1,8 +1,8 @@
 """Multi-account API key pool with automatic failover.
 
 Several accounts can share one provider by listing their keys, comma separated,
-in the plural variant of the provider's key variable (``MISTRAL_API_KEYS`` next
-to ``MISTRAL_API_KEY``). The pool wraps the HTTP transport, so failover happens
+in the plural variant of the provider's key variable (``VIBE_API_KEYS`` next
+to ``VIBE_API_KEY``). The pool wraps the HTTP transport, so failover happens
 below the SDK: a request refused because one account is rate limited, out of
 quota or revoked is replayed on the next account before the SDK or the agent
 loop ever sees an error. The same code serves ``vibe`` and ``vibe-acp``.

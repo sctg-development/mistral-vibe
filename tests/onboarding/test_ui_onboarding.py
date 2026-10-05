@@ -106,7 +106,7 @@ def _build_onboarding_config(
     provider_name: str = "mistral",
     model_provider: str | None = None,
     backend: Backend = Backend.MISTRAL,
-    api_key_env_var: str = "MISTRAL_API_KEY",
+    api_key_env_var: str = "VIBE_API_KEY",
     browser_auth_base_url: str | None = None,
     browser_auth_api_base_url: str | None = None,
     browser_auth_allow_origin_rewrite: bool = False,
@@ -1093,7 +1093,7 @@ async def test_ui_browser_sign_in_falls_back_to_mistral_env_var_when_missing() -
 
     assert app.return_value == "completed"
     env_contents = _saved_env_contents()
-    assert "MISTRAL_API_KEY" in env_contents
+    assert "VIBE_API_KEY" in env_contents
     assert "sk-browser-onboarding-test-key" in env_contents
 
 
@@ -1363,7 +1363,7 @@ async def test_ui_uses_default_mistral_browser_auth_urls(
 async def test_ui_mistral_option_uses_default_domain_over_configured_custom_urls(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setenv("VIBE_HOME", str(tmp_path))
     config_file = tmp_path / "config.toml"
     config_file.write_text(
@@ -1372,7 +1372,7 @@ async def test_ui_mistral_option_uses_default_domain_over_configured_custom_urls
             "[[providers]]",
             'name = "mistral"',
             'api_base = "https://api.mistral.ai/v1"',
-            'api_key_env_var = "MISTRAL_API_KEY"',
+            'api_key_env_var = "VIBE_API_KEY"',
             'browser_auth_base_url = "http://127.0.0.1:8787"',
             'browser_auth_api_base_url = "http://127.0.0.1:8787"',
             'backend = "mistral"',
@@ -1412,7 +1412,7 @@ async def test_ui_mistral_option_uses_default_domain_over_configured_custom_urls
 async def test_ui_falls_back_to_default_onboarding_context_with_invalid_active_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setenv("VIBE_HOME", str(tmp_path))
     config_file = tmp_path / "config.toml"
     config_file.write_text(
@@ -1422,7 +1422,7 @@ async def test_ui_falls_back_to_default_onboarding_context_with_invalid_active_m
             "[[providers]]",
             'name = "mistral"',
             'api_base = "https://api.mistral.ai/v1"',
-            'api_key_env_var = "MISTRAL_API_KEY"',
+            'api_key_env_var = "VIBE_API_KEY"',
             'browser_auth_base_url = "https://console.mistral.ai"',
             'browser_auth_api_base_url = "https://console.mistral.ai/api"',
             'backend = "mistral"',
@@ -1500,7 +1500,7 @@ def test_api_key_screen_falls_back_to_mistral_for_provider_without_env_key() -> 
     )
 
     assert screen.provider.name == "mistral"
-    assert screen.provider.api_key_env_var == "MISTRAL_API_KEY"
+    assert screen.provider.api_key_env_var == "VIBE_API_KEY"
 
 
 def test_api_key_screen_keeps_provider_with_explicit_env_key() -> None:
@@ -1528,7 +1528,7 @@ def test_api_key_screen_uses_mistral_fallback_for_context_without_env_key(
     screen = ApiKeyScreen()
 
     assert screen.provider.name == "mistral"
-    assert screen.provider.api_key_env_var == "MISTRAL_API_KEY"
+    assert screen.provider.api_key_env_var == "VIBE_API_KEY"
 
 
 @pytest.mark.asyncio
@@ -1579,7 +1579,7 @@ def test_persist_api_key_sends_onboarding_telemetry_with_launch_context(
     provider = ProviderConfig(
         name="mistral",
         api_base="https://inference.mistral.test/v1",
-        api_key_env_var="MISTRAL_API_KEY",
+        api_key_env_var="VIBE_API_KEY",
         backend=Backend.MISTRAL,
     )
 

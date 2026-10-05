@@ -428,7 +428,7 @@ class MistralBackend:
             and self._api_key_origin is not None
             and self._api_key_origin.env_var.endswith(POOL_ENV_SUFFIX)
         ):
-            # A one-key MISTRAL_API_KEYS has no pool but is still reported.
+            # A one-key VIBE_API_KEYS has no pool but is still reported.
             record_key_usage(self._api_key, prompt_tokens or 0, completion_tokens or 0)
 
     def _wrap_transport(

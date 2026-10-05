@@ -61,7 +61,7 @@ async def test_generic_backend_streaming_uses_ssl_cert_file(
         provider = ProviderConfig(
             name="mock-provider",
             api_base=https_streaming_mock_server.server.api_base,
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
             backend=Backend.GENERIC,
         )
         model = ModelConfig(

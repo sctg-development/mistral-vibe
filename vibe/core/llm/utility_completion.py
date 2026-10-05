@@ -92,7 +92,11 @@ async def ensure_utility_models_probed(
 ) -> None:
     """Learn whether a fast model is served, before routes are derived.
 
-    Runs at session open: never raises, never takes over twice its budget.
+    Usable means: a Mistral provider is configured, the allowlist permits the fast
+    model, and its key resolves. A key check keeps ``is_fast_utility_model`` honest
+    so a missing ``VIBE_API_KEY`` falls back to the active model instead of a
+    doomed cross-provider call. A keyless local provider (empty env var) is never
+    skipped for want of a key.
     """
     if os.environ.get(_DISABLE_MODEL_PROBE_ENV_VAR) == "1":
         return

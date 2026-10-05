@@ -7,7 +7,7 @@ from vibe.config_values import (
     FALLBACK_THEME as FALLBACK_THEME,
 )
 
-DEFAULT_MISTRAL_API_ENV_KEY = "MISTRAL_API_KEY"
+DEFAULT_MISTRAL_API_ENV_KEY = "VIBE_API_KEY"
 DEFAULT_CONSOLE_BASE_URL = "https://console.mistral.ai"
 DEFAULT_VIBE_BASE_URL = "https://chat.mistral.ai"
 DEFAULT_MISTRAL_SERVER_URL = "https://api.mistral.ai"

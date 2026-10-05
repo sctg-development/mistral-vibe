@@ -120,7 +120,7 @@ async def unauthenticated_client(
     experimental_harness: bool, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncIterator[AppServerClient]:
     """A connected client for a user with no resolvable Mistral key."""
-    monkeypatch.delenv("MISTRAL_API_KEY")
+    monkeypatch.delenv("VIBE_API_KEY")
     client = await connect_backend_contract_client(
         experimental_harness,
         session_options=SessionOptions(),
@@ -239,7 +239,7 @@ async def test_account_read_reports_a_missing_key_after_the_key_disappears(
     async with _connected(experimental_harness, account_gateway=gateway) as connection:
         session = await connection.host.open_session()
         try:
-            monkeypatch.delenv("MISTRAL_API_KEY")
+            monkeypatch.delenv("VIBE_API_KEY")
 
             # Do
             account = await session.resources.account.read()
@@ -427,7 +427,7 @@ async def test_a_provider_401_mid_turn_yields_the_legacy_message(
 
     # Assert
     expected = _invalid_api_key_message(
-        ApiKeyOrigin(ApiKeySource.ENVIRONMENT, "MISTRAL_API_KEY")
+        ApiKeyOrigin(ApiKeySource.ENVIRONMENT, "VIBE_API_KEY")
     )
     assert expected in exc_info.value.error.message
     # Its own code, not BACKEND_ERROR: the CLI offers /retry on that one, and

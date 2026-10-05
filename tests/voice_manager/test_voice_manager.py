@@ -143,9 +143,9 @@ class TestStartRecording:
     async def test_start_raises_when_api_key_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
         manager, recorder, _ = _make_manager()
-        with pytest.raises(RecordingStartError, match="MISTRAL_API_KEY"):
+        with pytest.raises(RecordingStartError, match="VIBE_API_KEY"):
             manager.start_recording()
         assert manager.transcribe_state == TranscribeState.IDLE
         assert not recorder.is_recording

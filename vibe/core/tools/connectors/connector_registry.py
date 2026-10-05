@@ -226,7 +226,7 @@ def _format_http_status_error(
         case 401 | 403:
             detail = (
                 f"Connector {connector_ref} authentication failed "
-                f"(HTTP {status}). Check your MISTRAL_API_KEY."
+                f"(HTTP {status}). Check your VIBE_API_KEY."
             )
         case 404:
             detail = (

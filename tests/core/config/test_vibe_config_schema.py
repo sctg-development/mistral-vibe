@@ -739,12 +739,12 @@ def test_compaction_model_on_another_provider_yields_to_the_active_model() -> No
         ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
         ),
         ProviderConfig(
             name="other",
             api_base="https://other.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
         ),
     ]
     compaction = ModelConfig(name="compact-model", provider="other", alias="compact")
@@ -769,7 +769,7 @@ def test_vision_model_may_use_another_provider() -> None:
         ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
         ),
         ProviderConfig(
             name="other",
@@ -815,7 +815,7 @@ def test_vision_never_falls_back_across_providers() -> None:
         ProviderConfig(
             name="mistral",
             api_base="https://api.mistral.ai/v1",
-            api_key_env_var="MISTRAL_API_KEY",
+            api_key_env_var="VIBE_API_KEY",
         ),
         ProviderConfig(
             name="local", api_base="http://127.0.0.1:8080/v1", api_key_env_var=""
@@ -900,7 +900,7 @@ def test_no_vision_fallback_when_the_active_model_sees_images() -> None:
 def test_api_key_readiness_is_separate_from_schema_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     monkeypatch.setattr(keyring, "get_password", lambda service, username: None)
 
     config = VibeConfigSchema()

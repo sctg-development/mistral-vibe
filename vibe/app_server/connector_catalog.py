@@ -1511,7 +1511,7 @@ def _resolve_provider(config: VibeConfigSchema) -> _ConnectorProvider | None:
     provider = config.get_mistral_provider()
     if provider is None:
         return None
-    api_key_env = provider.api_key_env_var or "MISTRAL_API_KEY"
+    api_key_env = provider.api_key_env_var or "VIBE_API_KEY"
     api_key = resolve_api_key(api_key_env)
     if not api_key:
         return None

@@ -59,7 +59,7 @@ def invalid_api_key_message(api_key_source: str | None) -> str:
     """The rejection sentence, naming where the key came from.
 
     ``api_key_source`` is the Host's description of the origin, such as
-    "env var MISTRAL_API_KEY" or "the keyring": which places a credential can
+    "env var VIBE_API_KEY" or "the keyring": which places a credential can
     come from is the Host's knowledge, not the Harness's.
     """
     if not api_key_source:

@@ -37,7 +37,7 @@ def setup_e2e_env(
 ) -> None:
     vibe_home = tmp_path / "vibe-home"
     write_e2e_config(vibe_home, streaming_mock_server.api_base)
-    monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
+    monkeypatch.setenv("VIBE_API_KEY", "fake-key")
     monkeypatch.setenv("VIBE_HOME", str(vibe_home))
     monkeypatch.setenv("VIBE_TEST_DISABLE_KEYRING", "1")
     monkeypatch.setenv("VIBE_TEST_DISABLE_AUTO_TITLE", "1")

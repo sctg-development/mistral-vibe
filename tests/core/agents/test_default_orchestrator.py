@@ -31,7 +31,7 @@ _DISCOVERED_LAYER_DISABLED = pytest.mark.skip(
 async def test_build_default_orchestrator_does_not_validate_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY")
+    monkeypatch.delenv("VIBE_API_KEY")
 
     orchestrator = await build_default_orchestrator()
     await orchestrator.reload()

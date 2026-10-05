@@ -102,7 +102,7 @@ def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None
     if token := get_api_key_from_keyring(env_key):
         return token, ApiKeyOrigin(ApiKeySource.KEYRING, env_key)
     # Multi-account setups may only define the plural variable
-    # (``MISTRAL_API_KEYS``); its first key stands in for the single one so the
+    # (``VIBE_API_KEYS``); its first key stands in for the single one so the
     # rest of the CLI (account lookups, auth state) keeps working.
     plural = pool_env_var(env_key)
     if pooled := split_keys(os.environ.get(plural)):

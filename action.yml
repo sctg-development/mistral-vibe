@@ -9,7 +9,7 @@ inputs:
     required: true
     default: |
       You are a helpful assistant
-  MISTRAL_API_KEY:
+  VIBE_API_KEY:
     description: API Key for AI Studio
     required: true
   install_python:
@@ -51,7 +51,7 @@ runs:
       shell: bash
       working-directory: ${{ github.action_path }}
       env:
-        MISTRAL_API_KEY: "${{ inputs.MISTRAL_API_KEY }}"
+        VIBE_API_KEY: "${{ inputs.VIBE_API_KEY }}"
         PROMPT_INPUT: "${{ inputs.prompt }}"
       run: |
         cd "${{ github.workspace }}"

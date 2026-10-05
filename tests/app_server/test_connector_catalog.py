@@ -230,7 +230,7 @@ async def test_connector_bootstrap_processing_runs_off_the_event_loop(
 async def test_connector_catalog_trusts_server_capability_filter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     async def fetch(_base_url: str, _api_key: str) -> object:
         return {
@@ -263,7 +263,7 @@ async def test_connector_catalog_resolution_runs_off_the_event_loop(
 ) -> None:
     """Connector validation and projection do not stall the caller's event loop."""
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     event_loop_thread = threading.get_ident()
     resolution_threads: list[int] = []
     resolve_catalog = connector_catalog._resolve_catalog
@@ -298,7 +298,7 @@ async def test_connector_catalog_async_read_keeps_keyring_and_disk_off_event_loo
 ) -> None:
     """Opening the cached catalog does not perform blocking reads on the caller's loop."""
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     event_loop_thread = threading.get_ident()
     provider_threads: list[int] = []
     cache_threads: list[int] = []
@@ -457,7 +457,7 @@ async def test_connector_cache_ttl_never_slides(
     *Assert*: Reads do not extend the original stored-at expiry.
     """
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     cache_path = tmp_path / "connectors.json"
     now = [1_000]
     fetch_count = 0
@@ -507,7 +507,7 @@ def test_connector_cache_reads_safe_legacy_record_without_rewrite(
     *Assert*: The record is accepted, bounded in memory, and left byte-for-byte untouched.
     """
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     fingerprint = connector_cache_fingerprint("test-key", "https://api.mistral.ai")
     cache_path = tmp_path / "connectors.json"
     cache_path.write_text(
@@ -547,7 +547,7 @@ def test_connector_cache_reads_safe_legacy_record_without_rewrite(
 async def test_connector_cache_round_trip_preserves_diagnostics_and_revision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     cache_path = tmp_path / "connectors.json"
 
     async def fetch(_base_url: str, _api_key: str) -> object:
@@ -687,7 +687,7 @@ async def test_successful_bootstrap_writes_redacted_bounded_v2(
     *Assert*: The atomic V2 cache contains only reduced fields and no credentials or raw body.
     """
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "super-secret-key")
+    monkeypatch.setenv("VIBE_API_KEY", "super-secret-key")
     cache_path = tmp_path / "connectors.json"
 
     async def fetch(_base_url: str, _api_key: str) -> object:
@@ -756,7 +756,7 @@ async def test_failed_forced_refresh_preserves_last_catalog(
     *Assert*: Failure changes neither the accepted host catalog nor the cache file.
     """
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     cache_path = tmp_path / "connectors.json"
     should_fail = False
 
@@ -796,7 +796,7 @@ def test_connector_aliases_are_collision_safe_and_missing_ids_are_ignored(
     *Assert*: Aliases are deterministic and only connectors with IDs enter the catalog.
     """
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     fingerprint = connector_cache_fingerprint("test-key", "https://api.mistral.ai")
     cache_path = tmp_path / "connectors.json"
     cache_path.write_text(
@@ -833,7 +833,7 @@ def test_connector_aliases_are_collision_safe_and_missing_ids_are_ignored(
 async def test_connector_aliases_and_revision_are_independent_of_payload_order(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     first = _connector(connector_id="one", name="Docs & Search")
     second = _connector(connector_id="two", name="Docs & Search")
     payloads = iter(({"connectors": [second, first]}, {"connectors": [first, second]}))
@@ -863,7 +863,7 @@ async def test_connector_aliases_and_revision_are_independent_of_payload_order(
 async def test_connector_collision_suffix_stays_within_public_name_limit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     long_name = "x" * 256
 
     async def fetch(_base_url: str, _api_key: str) -> object:
@@ -1241,7 +1241,7 @@ def test_selection_revision_changes_for_effective_source_and_tool_decisions() ->
 async def test_busy_convergence_retains_candidate_across_later_config_change(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     fetch_count = 0
 
     async def fetch(_base_url: str, _api_key: str) -> object:
@@ -1322,7 +1322,7 @@ async def test_busy_convergence_retains_candidate_across_later_config_change(
 async def test_successful_accept_discards_stale_pending_candidate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     async def fetch(_base_url: str, _api_key: str) -> object:
         return {"connectors": [_connector()]}

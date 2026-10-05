@@ -1370,7 +1370,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         if provider is None:
             return None
 
-        api_key_env = provider.api_key_env_var or "MISTRAL_API_KEY"
+        api_key_env = provider.api_key_env_var or "VIBE_API_KEY"
         api_key = resolve_api_key(api_key_env) or ""
         if not api_key:
             return None

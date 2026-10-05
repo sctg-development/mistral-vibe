@@ -78,7 +78,7 @@ Add Mistral Vibe in the acp_providers section of your configuration
     ["mistral-vibe"] = {
       command = "vibe-acp",
       env = {
-         MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY"), -- necessary if you setup Mistral Vibe manually
+         VIBE_API_KEY = os.getenv("VIBE_API_KEY"), -- necessary if you setup Mistral Vibe manually
       },
     }
   }

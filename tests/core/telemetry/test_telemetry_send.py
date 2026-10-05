@@ -1403,7 +1403,7 @@ class TestTelemetryClient:
                 ProviderConfig(
                     name="mistral",
                     api_base=custom_api_base,
-                    api_key_env_var="MISTRAL_API_KEY",
+                    api_key_env_var="VIBE_API_KEY",
                     backend=Backend.MISTRAL,
                 )
             ],
@@ -1427,7 +1427,7 @@ class TestTelemetryClient:
                 ProviderConfig(
                     name="mistral",
                     api_base=custom_api_base,
-                    api_key_env_var="MISTRAL_API_KEY",
+                    api_key_env_var="VIBE_API_KEY",
                     backend=Backend.MISTRAL,
                 )
             ],
@@ -1449,7 +1449,7 @@ class TestTelemetryClient:
                 ProviderConfig(
                     name="mistral",
                     api_base="not-a-valid-url",
-                    api_key_env_var="MISTRAL_API_KEY",
+                    api_key_env_var="VIBE_API_KEY",
                     backend=Backend.MISTRAL,
                 )
             ],

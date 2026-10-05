@@ -19,7 +19,7 @@ from vibe.cli.transcribe import (
 def _make_provider() -> AudioProviderView:
     return AudioProviderView(
         api_base="https://api.mistral.ai",
-        api_key_env_var="MISTRAL_API_KEY",
+        api_key_env_var="VIBE_API_KEY",
         client="mistral",
     )
 

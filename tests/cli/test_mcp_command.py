@@ -48,7 +48,7 @@ def test_mcp_add_persists_canonical_mistral_config(
         "--transport",
         "streamable-http",
         "--api-key-env",
-        "MISTRAL_API_KEY",
+        "VIBE_API_KEY",
         "--api-key-header",
         "Authorization",
         "--api-key-format",
@@ -62,7 +62,7 @@ def test_mcp_add_persists_canonical_mistral_config(
             "name": "mistralai",
             "transport": "streamable-http",
             "url": "https://api.mistral.ai/mcp",
-            "auth": {"type": "static", "api_key_env": "MISTRAL_API_KEY"},
+            "auth": {"type": "static", "api_key_env": "VIBE_API_KEY"},
         }
     ]
 
@@ -74,7 +74,7 @@ def test_mcp_add_round_trips_through_vibe_config(config_dir: Path) -> None:
         "--url",
         "https://api.mistral.ai/mcp",
         "--api-key-env",
-        "MISTRAL_API_KEY",
+        "VIBE_API_KEY",
     )
 
     server = asyncio.run(build_default_orchestrator()).config.mcp_servers[0]
@@ -83,7 +83,7 @@ def test_mcp_add_round_trips_through_vibe_config(config_dir: Path) -> None:
     assert server.name == "mistralai"
     assert server.url == "https://api.mistral.ai/mcp"
     assert isinstance(server.auth, MCPStaticAuth)
-    assert server.auth.api_key_env == "MISTRAL_API_KEY"
+    assert server.auth.api_key_env == "VIBE_API_KEY"
     assert server.auth.api_key_header == "Authorization"
     assert server.auth.api_key_format == "Bearer {token}"
     assert len(_persisted_servers(config_dir)) == 1
@@ -201,13 +201,13 @@ def test_mcp_add_is_idempotent_for_equivalent_urls(
         "--url",
         "https://api.mistral.ai/mcp",
         "--api-key-env",
-        "MISTRAL_API_KEY",
+        "VIBE_API_KEY",
     )
     _run_mcp(*args)
     capsys.readouterr()
 
     _run_mcp(
-        "add", "mistralai", "--url", equivalent_url, "--api-key-env", "MISTRAL_API_KEY"
+        "add", "mistralai", "--url", equivalent_url, "--api-key-env", "VIBE_API_KEY"
     )
 
     assert capsys.readouterr().out == (
@@ -260,7 +260,7 @@ def test_mcp_add_targets_user_config_when_project_config_exists(
         "--url",
         "https://api.mistral.ai/mcp",
         "--api-key-env",
-        "MISTRAL_API_KEY",
+        "VIBE_API_KEY",
     )
 
     assert len(_persisted_servers(config_dir)) == 1
@@ -441,7 +441,7 @@ def test_mcp_add_reports_invalid_urls_without_traceback(
 def test_mcp_add_works_without_provider_api_key(
     monkeypatch: pytest.MonkeyPatch, config_dir: Path
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY")
+    monkeypatch.delenv("VIBE_API_KEY")
 
     _run_mcp(
         "add",

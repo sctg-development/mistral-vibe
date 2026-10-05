@@ -41,7 +41,7 @@ class ProviderCredentialSnapshot:
     revision: str
     expires_at: datetime | None = None
     # Where the Host read this credential from, phrased for an error message:
-    # "env var MISTRAL_API_KEY", "the keyring". ``None`` for a static or minted
+    # "env var VIBE_API_KEY", "the keyring". ``None`` for a static or minted
     # token, whose origin says nothing a user could act on. Carried so a
     # rejection can tell the user which of the two to fix.
     api_key_source: str | None = None

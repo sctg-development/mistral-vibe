@@ -115,7 +115,7 @@ async def test_vibe_enables_background_processes_for_every_host_shell_profile(
     *Assert*: Background tools are enabled and use the same explicit shell authority.
     """
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     monkeypatch.setattr(
         "vibe.app_server._runtime._command_environment_mode", lambda: profile
     )

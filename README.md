@@ -518,13 +518,13 @@ Vibe supports multiple ways to configure your API keys:
 2. **Environment Variables**: Set your API key as an environment variable:
 
    ```bash
-   export MISTRAL_API_KEY="your_mistral_api_key"
+   export VIBE_API_KEY="your_mistral_api_key"
    ```
 
 3. **`.env` File**: Create a `.env` file in `~/.vibe/` and add your API keys:
 
    ```bash
-   MISTRAL_API_KEY=your_mistral_api_key
+   VIBE_API_KEY=your_mistral_api_key
    ```
 
    Vibe automatically loads API keys from `~/.vibe/.env` on startup. Environment variables take precedence over the `.env` file if both are set.
@@ -720,7 +720,7 @@ server uses OAuth and starts browser login by default.
 vibe mcp add mistralai \
   --url https://api.mistral.ai/mcp \
   --transport streamable-http \
-  --api-key-env MISTRAL_API_KEY
+  --api-key-env VIBE_API_KEY
 
 vibe mcp add linear \
   --url https://mcp.linear.app/mcp

@@ -22,7 +22,7 @@ from vibe.core.types import Backend
 async def test_identity_controller_projects_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     gateway = FakeIdentityGateway(
         IdentityResult.model_validate({
@@ -55,7 +55,7 @@ async def test_identity_controller_returns_none_without_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent_loop = build_test_agent_loop()
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     gateway = FakeIdentityGateway(IdentityResult(id="user-1"))
 
     try:
@@ -71,7 +71,7 @@ async def test_identity_controller_returns_none_without_key(
 async def test_identity_controller_skips_non_mistral_active_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     base_config = build_test_vibe_config()
     provider = base_config.get_active_provider().model_copy(
         update={"backend": Backend.GENERIC}
@@ -97,7 +97,7 @@ async def test_identity_controller_skips_non_mistral_active_model(
 async def test_identity_controller_returns_none_on_gateway_failure(
     monkeypatch: pytest.MonkeyPatch, gateway: FakeIdentityGateway
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
 
     try:
@@ -112,7 +112,7 @@ async def test_identity_controller_returns_none_on_gateway_failure(
 async def test_identity_controller_logs_unauthorized_failures(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
 
     try:
@@ -134,7 +134,7 @@ async def test_identity_controller_logs_unauthorized_failures(
 async def test_identity_controller_reuses_experiment_cached_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     cached = IdentityResult.model_validate({
         "id": "user-1",
@@ -239,7 +239,7 @@ def test_identity_view_name_resolution(
 
 @pytest.mark.asyncio
 async def test_identity_resource_round_trips(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
     gateway = FakeIdentityGateway(
         IdentityResult(id="user-1", email="ada@example.com", first_name="Ada")
@@ -261,7 +261,7 @@ async def test_identity_resource_round_trips(monkeypatch: pytest.MonkeyPatch) ->
 async def test_identity_resource_clears_current_when_read_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "server-secret")
+    monkeypatch.setenv("VIBE_API_KEY", "server-secret")
     agent_loop = build_test_agent_loop()
 
     class FlakyGateway:

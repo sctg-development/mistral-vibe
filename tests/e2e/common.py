@@ -35,7 +35,7 @@ def write_e2e_config(
             "[[providers]]",
             f'name = "{provider_name}"',
             f'api_base = "{api_base}"',
-            'api_key_env_var = "MISTRAL_API_KEY"',
+            'api_key_env_var = "VIBE_API_KEY"',
             'backend = "generic"',
             "",
             "[[models]]",

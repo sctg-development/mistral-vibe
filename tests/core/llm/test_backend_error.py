@@ -64,11 +64,11 @@ class TestBackendErrorFmt:
         [
             (None, "Invalid API key."),
             (
-                ApiKeyOrigin(ApiKeySource.ENVIRONMENT, "MISTRAL_API_KEY"),
-                "Invalid API key (from env var MISTRAL_API_KEY).",
+                ApiKeyOrigin(ApiKeySource.ENVIRONMENT, "VIBE_API_KEY"),
+                "Invalid API key (from env var VIBE_API_KEY).",
             ),
             (
-                ApiKeyOrigin(ApiKeySource.KEYRING, "MISTRAL_API_KEY"),
+                ApiKeyOrigin(ApiKeySource.KEYRING, "VIBE_API_KEY"),
                 "Invalid API key (from the keyring).",
             ),
         ],

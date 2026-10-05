@@ -112,7 +112,7 @@ async def test_a_typescript_program_reads_and_writes_the_todo_list(
     session history carries the settled todo effect the pinned row is fed from.
     """
     # Prepare
-    monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
     scripted = _ScriptedCompletion()
     monkeypatch.setattr(
         "mistralai_vibe_local_harness.vibe._local_actions.execute_completion", scripted

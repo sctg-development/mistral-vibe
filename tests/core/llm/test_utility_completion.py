@@ -29,7 +29,7 @@ def _anthropic_config():
             ProviderConfig(
                 name="mistral",
                 api_base="https://api.mistral.ai/v1",
-                api_key_env_var="MISTRAL_API_KEY",
+                api_key_env_var="VIBE_API_KEY",
                 backend=Backend.MISTRAL,
             ),
             ProviderConfig(
@@ -85,7 +85,7 @@ class TestSelectUtilityModel:
     def test_falls_back_to_active_when_mistral_key_missing(self, monkeypatch) -> None:
         # Without a resolvable Mistral key the cross-provider route is unusable, so
         # the utility call stays on the session's active model.
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
         config = _anthropic_config()
 
         model, provider = select_utility_model(config)
@@ -109,7 +109,7 @@ class TestSelectUtilityModel:
                 ProviderConfig(
                     name="mistral",
                     api_base="https://api.mistral.ai/v1",
-                    api_key_env_var="MISTRAL_API_KEY",
+                    api_key_env_var="VIBE_API_KEY",
                 )
             ],
             models=[
@@ -197,7 +197,7 @@ class TestRunUtilityCompletion:
         self, monkeypatch
     ) -> None:
         config = build_test_vibe_config()
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
 
         def fail_create_backend(**_):
             raise AssertionError("backend must not be built when the key is missing")
@@ -254,7 +254,7 @@ class TestRunUtilityCompletion:
     @pytest.mark.asyncio
     async def test_skip_if_no_key_runs_when_key_present(self, monkeypatch) -> None:
         config = build_test_vibe_config()
-        monkeypatch.setenv("MISTRAL_API_KEY", "present")
+        monkeypatch.setenv("VIBE_API_KEY", "present")
         monkeypatch.setattr(
             utility_completion,
             "create_backend",

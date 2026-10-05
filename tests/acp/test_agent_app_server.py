@@ -171,7 +171,7 @@ async def test_new_session_without_a_key_is_unauthenticated(
     if the Unified one also answers ``UNAUTHORIZED`` with a provider.
     """
     # Prepare
-    monkeypatch.delenv("MISTRAL_API_KEY")
+    monkeypatch.delenv("VIBE_API_KEY")
     harness_host = LocalHarnessHost()
 
     async def start_session(options: LocalHarnessOptions) -> AppServerSession:

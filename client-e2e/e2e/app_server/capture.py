@@ -255,7 +255,7 @@ def _environment(
         "COLUMNS": str(COLUMNS),
         "LINES": str(ROWS),
         "VIBE_HOME": home,
-        "MISTRAL_API_KEY": "fake-key",
+        "VIBE_API_KEY": "fake-key",
         "VIBE_TEST_DISABLE_KEYRING": "1",
         "FORCE_COLOR": "1",
         "VIBE_THEME": "ansi-dark",

@@ -78,7 +78,7 @@ def test_programmatic_mode_does_not_run_onboarding_on_missing_api_key(
     orchestrator = load_orchestrator(build_test_vibe_config())
 
     def require_api_key(_config: VibeConfigSchema) -> None:
-        raise MissingAPIKeyError("MISTRAL_API_KEY", "mistral")
+        raise MissingAPIKeyError("VIBE_API_KEY", "mistral")
 
     monkeypatch.setattr(
         VibeConfigSchema, "require_active_provider_api_key", require_api_key
@@ -97,7 +97,7 @@ def test_programmatic_mode_does_not_run_onboarding_on_missing_api_key(
     assert exc_info.value.code == 1
     assert sentinel["called"] is False
     err = capsys.readouterr().err
-    assert "MISTRAL_API_KEY" in err
+    assert "VIBE_API_KEY" in err
     assert "vibe --setup" in err
 
 
@@ -109,7 +109,7 @@ def test_interactive_mode_still_runs_onboarding_on_missing_api_key(
     orchestrator = load_orchestrator(sentinel_config)
 
     def require_api_key(_config: VibeConfigSchema) -> None:
-        raise MissingAPIKeyError("MISTRAL_API_KEY", "mistral")
+        raise MissingAPIKeyError("VIBE_API_KEY", "mistral")
 
     monkeypatch.setattr(
         VibeConfigSchema, "require_active_provider_api_key", require_api_key

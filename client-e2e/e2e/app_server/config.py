@@ -36,7 +36,7 @@ disable_welcome_banner_animation = true
 [[providers]]
 name = "mistral"
 api_base = "https://api.mistral.ai/v1"
-api_key_env_var = "MISTRAL_API_KEY"
+api_key_env_var = "VIBE_API_KEY"
 backend = "mistral"
 
 [[models]]
