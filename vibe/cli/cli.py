@@ -475,6 +475,10 @@ def run_cli(args: argparse.Namespace) -> None:
         _print_export_keys()
         return
 
+    if getattr(args, "export_keys_json", False):
+        _print_export_keys_json()
+        return
+
     if args.setup:
         from vibe.setup.onboarding import run_onboarding
 
@@ -553,4 +557,15 @@ def _print_list_keys() -> None:
     keys = _gather_pooled_keys()
     for line in asyncio.run(format_key_accounts(keys)):
         print(line)
+    sys.exit(0 if keys else 1)
+
+
+def _print_export_keys_json() -> None:
+    import json
+
+    from vibe.cli.list_keys import build_keys_json
+
+    keys = _gather_pooled_keys()
+    output = asyncio.run(build_keys_json(keys))
+    print(json.dumps(output))
     sys.exit(0 if keys else 1)

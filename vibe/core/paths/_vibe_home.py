@@ -27,6 +27,7 @@ WHOAMI_CACHE_FILE = GlobalPath(lambda: VIBE_HOME.path / "whoami_cache.json")
 UTILITY_MODEL_CACHE_FILE = GlobalPath(
     lambda: VIBE_HOME.path / "utility_model_cache.json"
 )
+WHOAMI_CACHE_MULTI_FILE = GlobalPath(lambda: VIBE_HOME.path / "whoami_cache_multi.json")
 HISTORY_FILE = GlobalPath(lambda: VIBE_HOME.path / "vibehistory")
 PLANS_DIR = GlobalPath(lambda: VIBE_HOME.path / "plans")
 

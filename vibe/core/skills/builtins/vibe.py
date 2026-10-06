@@ -789,6 +789,9 @@ vibe --resume [SESSION_ID]          # Resume a specific session
 vibe -v / --version                 # Show version
 vibe --setup                        # Run onboarding/setup
 vibe update / vibe --check-upgrade  # Check for a Vibe update now, prompt to install it, and exit
+vibe --list-keys                    # Print pooled Mistral API keys with account, plan, org, and email, then exit
+vibe --export-keys                  # Print pooled Mistral API keys only, comma-separated, then exit
+vibe --export-keys-json             # Print pooled Mistral API keys as structured JSON (keys, owner email, plan type), then exit
 vibe --max-turns N                  # Max assistant turns (programmatic mode)
 vibe --max-price DOLLARS            # Max cost limit (programmatic mode)
 vibe --max-tokens N                 # Max total session tokens (programmatic mode)
