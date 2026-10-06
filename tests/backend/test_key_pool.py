@@ -73,9 +73,7 @@ def test_pool_needs_two_distinct_keys() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rate_limited_account_is_replayed_on_the_next_one(
-    tmp_path: Path,
-) -> None:
+async def test_rate_limited_account_is_replayed_on_the_next_one(tmp_path: Path) -> None:
     upstream = _Upstream({"key-a": [httpx.Response(429, headers={"retry-after": "5"})]})
     client, _ = _client(tmp_path, upstream, _Clock())
 
@@ -96,7 +94,7 @@ async def test_failed_account_is_skipped_by_later_requests(tmp_path: Path) -> No
     upstream.seen.clear()
     await _post(client)
 
-    assert upstream.seen == ["key-b"]  # sticky on the account that worked
+    assert upstream.seen == ["key-c"]  # a rests, b just served: c is next
 
 
 @pytest.mark.asyncio
@@ -109,15 +107,15 @@ async def test_cooldown_state_is_shared_between_pools(tmp_path: Path) -> None:
     second, _ = _client(tmp_path, upstream, clock)
     await _post(second)
 
-    assert upstream.seen == ["key-b"]
+    assert upstream.seen == ["key-c"]
 
 
 @pytest.mark.asyncio
 async def test_account_comes_back_after_cooldown(tmp_path: Path) -> None:
     clock = _Clock()
-    upstream = _Upstream(
-        {"key-a": [httpx.Response(429, headers={"retry-after": "10"})]}
-    )
+    upstream = _Upstream({
+        "key-a": [httpx.Response(429, headers={"retry-after": "10"})]
+    })
     client, _ = _client(tmp_path, upstream, clock, keys=["key-a", "key-b"])
     await _post(client)  # a refused, b answers and becomes the sticky account
 
@@ -241,7 +239,9 @@ async def test_mistral_backend_fails_over_through_the_sdk(
         seen.append(key)
         if key == "key-a":
             return httpx.Response(
-                429, json={"message": "Rate limit exceeded"}, headers={"retry-after": "60"}
+                429,
+                json={"message": "Rate limit exceeded"},
+                headers={"retry-after": "60"},
             )
         return httpx.Response(
             200,
@@ -257,12 +257,18 @@ async def test_mistral_backend_fails_over_through_the_sdk(
                         "message": {"role": "assistant", "content": f"hello {key}"},
                     }
                 ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
         )
 
     with respx.mock(assert_all_called=False) as router:
-        router.post("https://api.mistral.ai/v1/chat/completions").mock(side_effect=answer)
+        router.post("https://api.mistral.ai/v1/chat/completions").mock(
+            side_effect=answer
+        )
         async with MistralBackend(provider=provider) as backend:
             chunk = await backend.complete(
                 model=model,
@@ -276,3 +282,104 @@ async def test_mistral_backend_fails_over_through_the_sdk(
 
     assert chunk.message.content == "hello key-b"
     assert seen == ["key-a", "key-b"]
+
+
+def _limits(req_left: int, tokens_left: int = 400_000) -> dict[str, str]:
+    return {
+        "x-ratelimit-limit-req-minute": "50",
+        "x-ratelimit-remaining-req-minute": str(req_left),
+        "x-ratelimit-limit-tokens-minute": "500000",
+        "x-ratelimit-remaining-tokens-minute": str(tokens_left),
+    }
+
+
+@pytest.mark.asyncio
+async def test_usage_is_spread_evenly_over_accounts(tmp_path: Path) -> None:
+    upstream = _Upstream({})
+    clock = _Clock()
+    client, _ = _client(tmp_path, upstream, clock)
+
+    for _ in range(6):
+        await _post(client)
+        clock.now += 1
+
+    assert sorted(upstream.seen) == sorted(KEYS * 2)
+
+
+@pytest.mark.asyncio
+async def test_account_low_on_headroom_is_left_out(tmp_path: Path) -> None:
+    upstream = _Upstream({"key-a": [httpx.Response(200, headers=_limits(4))]})
+    clock = _Clock()
+    client, _ = _client(tmp_path, upstream, clock)
+
+    for _ in range(6):
+        await _post(client)
+        clock.now += 1
+
+    assert upstream.seen.count("key-a") == 1
+
+
+def test_window_expiry_makes_the_account_usable_again(tmp_path: Path) -> None:
+    clock = _Clock()
+    pool = KeyPool(["key-a", "key-b"], state_dir=tmp_path, clock=clock)
+    first = pool.acquire()
+    assert first is not None
+    pool.report_headroom(first, _limits(2))
+    clock.now += 1
+    second = pool.acquire()
+    assert second is not None
+    pool.report_headroom(second, _limits(40))
+
+    still_low = pool.acquire()
+    clock.now += 61
+    back = pool.acquire()
+
+    # a is nearly out and skipped; once its window has reset it is the least
+    # recently used account again.
+    assert (still_low.key if still_low else None, back.key if back else None) == (
+        "key-b",
+        "key-a",
+    )
+
+
+@pytest.mark.asyncio
+async def test_headroom_is_shared_between_pools(tmp_path: Path) -> None:
+    clock = _Clock()
+    first, _ = _client(
+        tmp_path, _Upstream({"key-a": [httpx.Response(200, headers=_limits(1))]}), clock
+    )
+    await _post(first)
+
+    upstream = _Upstream({})
+    second, _ = _client(tmp_path, upstream, clock)
+    await _post(second)
+
+    assert upstream.seen == ["key-b"]
+
+
+def test_concurrent_requests_spread_over_idle_accounts(tmp_path: Path) -> None:
+    pool = KeyPool(KEYS, state_dir=tmp_path, clock=_Clock())
+
+    first = pool.acquire()
+    assert first is not None
+    pool.begin(first)
+    second = pool.acquire()
+    assert second is not None
+    pool.begin(second)
+    third = pool.acquire()
+
+    assert (first.index, second.index, third.index if third else None) == (0, 1, 2)
+
+
+@pytest.mark.asyncio
+async def test_plain_rate_limit_rests_one_window_not_hours(tmp_path: Path) -> None:
+    clock = _Clock()
+    upstream = _Upstream({"key-a": [httpx.Response(429)]})
+    client, pool = _client(tmp_path, upstream, clock)
+    await _post(client)
+
+    clock.now += 61
+    lease = pool.acquire(exclude={"key-b", "key-c"})
+
+    assert lease is not None
+    assert lease.key == "key-a"

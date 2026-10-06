@@ -43,10 +43,16 @@ logger = logging.getLogger("vibe")
 _STATE_FILE_NAME = "key_pool_state.json"
 _STATE_LOCK_NAME = "key_pool_state.lock"
 
-# Rate limit without a Retry-After: wait this long, doubling on each further
-# failure of the same account, up to the cap below.
-_RATE_LIMIT_BASE_COOLDOWN = 30.0
-_RATE_LIMIT_MAX_COOLDOWN = 6 * 3600.0
+# Mistral rate limits are per-minute windows: a 429 without a Retry-After clears
+# when the window does, so wait one window, doubling only on repeated failures.
+_RATE_LIMIT_BASE_COOLDOWN = 60.0
+_RATE_LIMIT_MAX_COOLDOWN = 15 * 60.0
+# Headroom headers describe the current one-minute window; older than this the
+# account is assumed to have a fresh one.
+_WINDOW_SECONDS = 60.0
+_DEFAULT_LIMIT_REQ = 50
+_LEAVE_AT_FRACTION = 0.1
+_BYTES_PER_TOKEN = 4
 # A 429 that talks about a quota (as opposed to a per-minute limit) will not
 # clear soon, so skip the escalation and park the account for a long while.
 _QUOTA_COOLDOWN = 6 * 3600.0
@@ -130,6 +136,73 @@ def _parse_retry_after(value: str | None) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
+def _used_at(entry: Mapping[str, Any]) -> float:
+    try:
+        return float(entry.get("used", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _header_int(headers: Mapping[str, str], name: str) -> int | None:
+    try:
+        return int(headers[name])
+    except (KeyError, ValueError):
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class Headroom:
+    """What an account had left in its current window, as last reported."""
+
+    req_remaining: int | None = None
+    req_limit: int | None = None
+    tokens_remaining: int | None = None
+    seen: float = 0.0
+
+    @classmethod
+    def from_headers(cls, headers: Mapping[str, str], now: float) -> Headroom | None:
+        req = _header_int(headers, "x-ratelimit-remaining-req-minute")
+        tokens = _header_int(headers, "x-ratelimit-remaining-tokens-minute")
+        if req is None and tokens is None:
+            return None
+        return cls(
+            req_remaining=req,
+            req_limit=_header_int(headers, "x-ratelimit-limit-req-minute"),
+            tokens_remaining=tokens,
+            seen=now,
+        )
+
+    @classmethod
+    def from_entry(cls, entry: Mapping[str, Any]) -> Headroom:
+        try:
+            return cls(
+                req_remaining=entry.get("req"),
+                req_limit=entry.get("req_limit"),
+                tokens_remaining=entry.get("tok"),
+                seen=float(entry.get("seen", 0)),
+            )
+        except (TypeError, ValueError):
+            return cls()
+
+    def fresh(self, now: float) -> bool:
+        return now - self.seen < _WINDOW_SECONDS
+
+    def has_room(self, now: float, cost_tokens: int) -> bool:
+        """Whether one more request of ``cost_tokens`` is safe in this window."""
+        if not self.fresh(now):
+            return True
+        if self.req_remaining is not None:
+            limit = self.req_limit or _DEFAULT_LIMIT_REQ
+            if self.req_remaining <= max(1, int(limit * _LEAVE_AT_FRACTION)):
+                return False
+        return self.tokens_remaining is None or self.tokens_remaining >= cost_tokens
+
+    def score(self, now: float) -> int:
+        if not self.fresh(now) or self.req_remaining is None:
+            return self.req_limit or _DEFAULT_LIMIT_REQ
+        return self.req_remaining
+
+
 @dataclass(frozen=True, slots=True)
 class KeyLease:
     key: str
@@ -153,6 +226,7 @@ class KeyPool:
         self._state_dir = state_dir
         self._last_index: int | None = None
         self._active_index: int | None = None
+        self._inflight = [0] * len(unique)
 
     def __len__(self) -> int:
         return len(self._keys)
@@ -193,7 +267,7 @@ class KeyPool:
             logger.debug("Key pool state directory unavailable", exc_info=True)
             return None
 
-    def _locked(self, path: Path):
+    def _locked(self, path: Path) -> _StateLock:
         return _StateLock(path.with_name(_STATE_LOCK_NAME))
 
     def _load(self, path: Path | None) -> dict[str, Any]:
@@ -228,38 +302,81 @@ class KeyPool:
 
     # -- selection ---------------------------------------------------------
 
-    def acquire(self, exclude: Iterable[str] = ()) -> KeyLease | None:
+    def acquire(
+        self, exclude: Iterable[str] = (), *, cost_tokens: int = 0
+    ) -> KeyLease | None:
         """The account to use next, skipping ``exclude`` and accounts cooling.
 
-        Sticky: the account that last worked stays first, so one account is
-        used up before the next is touched. When every remaining account is
-        cooling, the one that recovers soonest is returned for a single try.
+        Spreads usage evenly: among accounts that still have room in their
+        current rate-limit window, the one with the fewest requests in flight
+        goes first, and ties go to the account used least recently (shared
+        between processes through the state file). The prompt cache is not
+        preserved on purpose. When no account has room, the one with the most
+        spare capacity is used; when all are cooling, the one that recovers
+        soonest is returned for a single try.
         """
         excluded = set(exclude)
         path = self._state_path()
         now = self._clock()
-        state = self._load(path)
-        accounts = self._accounts(state)
-        current = state.get("current")
-        start = (
-            self._fingerprints.index(current) if current in self._fingerprints else 0
-        )
-        order = [
-            (start + offset) % len(self._keys) for offset in range(len(self._keys))
-        ]
+        accounts = self._accounts(self._load(path))
 
         soonest: tuple[float, int] | None = None
-        for index in order:
-            if self._keys[index] in excluded:
+        ready: list[tuple[int, Headroom, float]] = []
+        for index, key in enumerate(self._keys):
+            if key in excluded:
                 continue
-            until = float(accounts.get(self._fingerprints[index], {}).get("until", 0))
-            if until <= now:
-                return KeyLease(self._keys[index], index)
-            if soonest is None or until < soonest[0]:
-                soonest = (until, index)
+            entry = accounts.get(self._fingerprints[index], {})
+            until = float(entry.get("until", 0))
+            if until > now:
+                if soonest is None or until < soonest[0]:
+                    soonest = (until, index)
+                continue
+            ready.append((index, Headroom.from_entry(entry), _used_at(entry)))
+
+        roomy = [item for item in ready if item[1].has_room(now, cost_tokens)]
+        if roomy:
+            index, _, _ = min(
+                roomy, key=lambda item: (self._inflight[item[0]], item[2], item[0])
+            )
+            return KeyLease(self._keys[index], index)
+        if ready:
+            index, _, _ = max(
+                ready, key=lambda item: item[1].score(now) - self._inflight[item[0]]
+            )
+            return KeyLease(self._keys[index], index)
         if soonest is not None and not excluded:
             return KeyLease(self._keys[soonest[1]], soonest[1])
         return None
+
+    def begin(self, lease: KeyLease) -> None:
+        self._inflight[lease.index] += 1
+
+    def end(self, lease: KeyLease) -> None:
+        self._inflight[lease.index] = max(0, self._inflight[lease.index] - 1)
+
+    def report_headroom(self, lease: KeyLease, headers: Mapping[str, str]) -> None:
+        """Stamp the account as just used and record its rate-limit headers."""
+        now = self._clock()
+        headroom = Headroom.from_headers(headers, now)
+        path = self._state_path()
+        if path is None:
+            return
+        fingerprint = self._fingerprints[lease.index]
+        with self._locked(path):
+            state = self._load(path)
+            accounts = self._accounts(state)
+            entry = dict(accounts.get(fingerprint, {}))
+            entry["used"] = now
+            if headroom is not None:
+                entry.update(
+                    req=headroom.req_remaining,
+                    req_limit=headroom.req_limit,
+                    tok=headroom.tokens_remaining,
+                    seen=now,
+                )
+            accounts[fingerprint] = entry
+            state["accounts"] = accounts
+            self._store(path, state)
 
     def report_success(self, lease: KeyLease) -> None:
         fingerprint = self._fingerprints[lease.index]
@@ -272,7 +389,11 @@ class KeyPool:
             accounts = self._accounts(state)
             changed = state.get("current") != fingerprint
             if accounts.get(fingerprint, {}).get("fails"):
-                accounts[fingerprint] = {"until": 0, "fails": 0}
+                accounts[fingerprint] = {
+                    **accounts[fingerprint],
+                    "until": 0,
+                    "fails": 0,
+                }
                 changed = True
             if changed:
                 state["current"] = fingerprint
@@ -307,7 +428,13 @@ class KeyPool:
             entry = accounts.get(fingerprint, {})
             fails = int(entry.get("fails", 0)) + 1
             cooldown = self._cooldown_for(status, retry_after, body, fails)
-            accounts[fingerprint] = {"until": now + cooldown, "fails": fails}
+            accounts[fingerprint] = {
+                **entry,
+                "until": now + cooldown,
+                "fails": fails,
+                "req": 0,
+                "seen": now,
+            }
             state["accounts"] = accounts
             self._store(path, state)
         logger.warning(
@@ -407,13 +534,19 @@ class KeyPoolTransport(httpx.AsyncBaseTransport):
             return await self._inner.handle_async_request(request)
 
         tried: set[str] = set()
-        lease = self._pool.acquire()
+        cost = len(request.content) // _BYTES_PER_TOKEN
+        lease = self._pool.acquire(cost_tokens=cost)
         while lease is not None:
             request.headers["authorization"] = f"Bearer {lease.key}"
             self._pool.note_active(lease.key)
-            response = await self._inner.handle_async_request(request)
+            self._pool.begin(lease)
+            try:
+                response = await self._inner.handle_async_request(request)
+            finally:
+                self._pool.end(lease)
+            self._pool.report_headroom(lease, response.headers)
             if response.status_code not in _FAILOVER_STATUSES:
-                if response.status_code < 400:
+                if response.status_code < httpx.codes.BAD_REQUEST:
                     self._pool.report_success(lease)
                 return response
             self._pool.report_failure(
@@ -423,7 +556,7 @@ class KeyPoolTransport(httpx.AsyncBaseTransport):
                 body=await _read_error_body(response),
             )
             tried.add(lease.key)
-            lease = self._pool.acquire(exclude=tried)
+            lease = self._pool.acquire(exclude=tried, cost_tokens=cost)
             if lease is None:
                 # Every account refused: hand the last refusal to the caller so
                 # the SDK's own retry and backoff take over.
