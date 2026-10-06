@@ -468,19 +468,12 @@ def run_cli(args: argparse.Namespace) -> None:
     bootstrap_vibe_home()
 
     if getattr(args, "list_keys", False):
-        from vibe.core.config._defaults import DEFAULT_MISTRAL_API_ENV_KEY
-        from vibe.utils.api_keys import pooled_keys, resolve_api_key
+        _print_list_keys()
+        return
 
-        keys = pooled_keys(DEFAULT_MISTRAL_API_ENV_KEY)
-        if (primary := resolve_api_key(DEFAULT_MISTRAL_API_ENV_KEY)) and (
-            primary not in keys
-        ):
-            keys.insert(0, primary)
-        from vibe.cli.list_keys import format_key_accounts
-
-        for line in asyncio.run(format_key_accounts(keys)):
-            print(line)
-        sys.exit(0 if keys else 1)
+    if getattr(args, "export_keys", False):
+        _print_export_keys()
+        return
 
     if args.setup:
         from vibe.setup.onboarding import run_onboarding
@@ -534,3 +527,30 @@ def run_cli(args: argparse.Namespace) -> None:
 
             if sentry_sdk.is_initialized():
                 sentry_sdk.flush(timeout=5)
+
+
+def _gather_pooled_keys() -> list[str]:
+    from vibe.core.config._defaults import DEFAULT_MISTRAL_API_ENV_KEY
+    from vibe.utils.api_keys import pooled_keys, resolve_api_key
+
+    keys = pooled_keys(DEFAULT_MISTRAL_API_ENV_KEY)
+    if (primary := resolve_api_key(DEFAULT_MISTRAL_API_ENV_KEY)) and (
+        primary not in keys
+    ):
+        keys.insert(0, primary)
+    return keys
+
+
+def _print_export_keys() -> None:
+    keys = _gather_pooled_keys()
+    print(",".join(keys))
+    sys.exit(0 if keys else 1)
+
+
+def _print_list_keys() -> None:
+    from vibe.cli.list_keys import format_key_accounts
+
+    keys = _gather_pooled_keys()
+    for line in asyncio.run(format_key_accounts(keys)):
+        print(line)
+    sys.exit(0 if keys else 1)
