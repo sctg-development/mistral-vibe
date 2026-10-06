@@ -4,7 +4,7 @@ import argparse
 import asyncio
 from pathlib import Path
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 from rich import print as rprint
@@ -566,6 +566,13 @@ def _print_export_keys_json() -> None:
     from vibe.cli.list_keys import build_keys_json
 
     keys = _gather_pooled_keys()
-    output = asyncio.run(build_keys_json(keys))
+    models: list[Any] = []
+    try:
+        orchestrator = load_config_orchestrator_or_exit()
+        config = orchestrator.config
+        models = list(config.available_models().values())
+    except Exception:
+        pass
+    output = asyncio.run(build_keys_json(keys, models=models))
     print(json.dumps(output))
     sys.exit(0 if keys else 1)

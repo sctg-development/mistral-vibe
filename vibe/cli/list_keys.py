@@ -201,10 +201,50 @@ def _plan_type(who: WhoAmIResult | None) -> str:
     return "free" if "FREE" in who.plan_name.upper() else "paid"
 
 
+def _model_to_entry(model: Any, priority: int) -> _ModelEntry:
+    from vibe.core.config.models import ModelConfig
+
+    if isinstance(model, ModelConfig):
+        input_modalities: list[str] = ["text"]
+        if model.supports_images:
+            input_modalities.append("image")
+        return _ModelEntry(
+            id=model.name,
+            usage="chat",
+            contextWindow=None,
+            maxOutputTokens=None,
+            tpmLimit=None,
+            priority=priority,
+            inputModalities=input_modalities,
+            outputModalities=["text"],
+        )
+    return _ModelEntry(
+        id=str(model.get("name", model.get("id", ""))),
+        usage="chat",
+        contextWindow=None,
+        maxOutputTokens=None,
+        tpmLimit=None,
+        priority=priority,
+        inputModalities=["text"],
+        outputModalities=["text"],
+    )
+
+
 class _KeyEntry(TypedDict):
     key: str
     owner: str | None
     type: str
+
+
+class _ModelEntry(TypedDict):
+    id: str
+    usage: str
+    contextWindow: int | None
+    maxOutputTokens: int | None
+    tpmLimit: int | None
+    priority: int
+    inputModalities: list[str]
+    outputModalities: list[str]
 
 
 async def format_key_accounts(
@@ -237,6 +277,7 @@ async def build_keys_json(
     *,
     lookup: WhoAmILookup = _lookup,
     identity_lookup: IdentityLookup = _lookup_identity,
+    models: Sequence[Any] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Build a structured JSON-safe dict for ``--export-keys-json``."""
     whoami_results, identity_results = await asyncio.gather(
@@ -252,11 +293,16 @@ async def build_keys_json(
                 type=_plan_type(who),
             )
         )
+    model_entries: list[_ModelEntry] = []
+    if models:
+        for idx, model in enumerate(models):
+            model_entries.append(_model_to_entry(model, idx * 10))
     return {
         "vibe": {
             "protocol": "vibe",
             "endpoint": _VIBE_API_ENDPOINT,
             "userAgent": get_user_agent("mistral"),
             "keys": key_entries,
+            "models": model_entries,
         }
     }

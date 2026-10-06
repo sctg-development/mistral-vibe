@@ -223,6 +223,46 @@ async def test_build_keys_json_empty_keys() -> None:
     assert result["vibe"]["keys"] == []
 
 
+@pytest.mark.asyncio
+async def test_build_keys_json_includes_models() -> None:
+    from vibe.core.config.models import ModelConfig
+
+    models = [
+        ModelConfig(
+            name="mistral-medium-3-5",
+            provider="mistral",
+            alias="mistral-medium-3.5",
+            supports_images=True,
+        ),
+        ModelConfig(
+            name="devstral", provider="llamacpp", alias="local", supports_images=False
+        ),
+    ]
+
+    result: Any = await build_keys_json([], models=models)
+
+    model_entries = result["vibe"]["models"]
+    assert len(model_entries) == 2
+    assert model_entries[0]["id"] == "mistral-medium-3-5"
+    assert model_entries[0]["usage"] == "chat"
+    assert model_entries[0]["priority"] == 0
+    assert model_entries[0]["inputModalities"] == ["text", "image"]
+    assert model_entries[0]["outputModalities"] == ["text"]
+    assert model_entries[0]["contextWindow"] is None
+    assert model_entries[0]["maxOutputTokens"] is None
+    assert model_entries[0]["tpmLimit"] is None
+    assert model_entries[1]["id"] == "devstral"
+    assert model_entries[1]["priority"] == 10
+    assert model_entries[1]["inputModalities"] == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_build_keys_json_no_models_when_none_provided() -> None:
+    result: Any = await build_keys_json([])
+
+    assert result["vibe"]["models"] == []
+
+
 def test_print_export_keys_json_outputs_formatted_json(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -236,10 +276,11 @@ def test_print_export_keys_json_outputs_formatted_json(
             "keys": [
                 {"key": "mstrl_abcd", "owner": "test@example.com", "type": "free"}
             ],
+            "models": [],
         }
     }
 
-    async def fake_build_keys_json(_keys: Any) -> Any:
+    async def fake_build_keys_json(_keys: Any, **kwargs: Any) -> Any:
         return expected
 
     monkeypatch.setattr("vibe.cli.list_keys.build_keys_json", fake_build_keys_json)
@@ -257,10 +298,16 @@ def test_print_export_keys_json_empty_exits_nonzero(
     monkeypatch.setattr(cli_mod, "_gather_pooled_keys", lambda: [])
 
     expected = {
-        "vibe": {"protocol": "vibe", "endpoint": "", "userAgent": "", "keys": []}
+        "vibe": {
+            "protocol": "vibe",
+            "endpoint": "",
+            "userAgent": "",
+            "keys": [],
+            "models": [],
+        }
     }
 
-    async def fake_build_keys_json(_keys: Any) -> Any:
+    async def fake_build_keys_json(_keys: Any, **kwargs: Any) -> Any:
         return expected
 
     monkeypatch.setattr("vibe.cli.list_keys.build_keys_json", fake_build_keys_json)
