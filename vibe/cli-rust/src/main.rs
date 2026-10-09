@@ -67,6 +67,20 @@ async fn run() -> Result<std::process::ExitCode> {
         return Ok(update_flow::run_check_upgrade().await);
     }
 
+    // Key management flags: list, export, or import keys, then exit.
+    if cli.list_keys {
+        return vibe_rs::credentials::api_keys::run_list_keys().await;
+    }
+    if cli.export_keys {
+        return vibe_rs::credentials::api_keys::run_export_keys().await;
+    }
+    if cli.export_keys_json {
+        return vibe_rs::credentials::api_keys::run_export_keys_json().await;
+    }
+    if cli.import_keys {
+        return vibe_rs::credentials::api_keys::run_import_keys().await;
+    }
+
     // Python reads piped stdin once, before choosing interactive vs headless, so
     // `echo hi | vibe` feeds the TUI initial prompt while /dev/tty (which
     // crossterm reads for events) keeps terminal input interactive.

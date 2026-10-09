@@ -12,7 +12,8 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 - `vibe/core/llm/key_pool.py` — pool (even spread: least-recent account with room, prompt cache sacrificed on purpose), cooldowns, rate-limit headroom
   (`x-ratelimit-*-minute` headers), in-flight spreading, per-key usage registry.
   State shared across processes in `$VIBE_HOME/key_pool_state.json`.
-- `vibe/cli/list_keys.py` — `--list-keys`, `--export-keys`, `--export-keys-json`.
+- `vibe/cli/list_keys.py` — `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys`.
+- `vibe/cli-rust/src/credentials/api_keys.rs` — Rust implementation of key management functions.
 - `tests/backend/test_key_pool.py`, `tests/test_key_accounts.py`,
   `tests/cli/test_list_keys.py`.
 
@@ -26,7 +27,10 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 | `vibe/_experimental_harness.py`, `vibe/app_server/_runtime.py` | `key_pool_active`: several keys force the legacy harness (only it can fail over; the native Unified harness bypasses our transport) |
 | `vibe/app_server/_provider_credentials.py`, `_unified_harness_backend_adapter.py` | per-key usage attribution on the Unified path |
 | `vibe/cli/session_exit.py` | per-key lines under the session total |
-| `vibe/cli/entrypoint.py`, `vibe/cli/cli.py` | `--list-keys`, `--export-keys`, `--export-keys-json` flags |
+| `vibe/cli/entrypoint.py`, `vibe/cli/cli.py` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` flags |
+| `vibe/cli-rust/src/cli.rs` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` CLI flags |
+| `vibe/cli-rust/src/main.rs` | Key management flag handlers for Rust CLI |
+| `vibe/cli-rust/src/credentials/mod.rs` | Added `api_keys` module to credentials |
 | `vibe/core/paths/*` | `whoami_cache_multi.json` path |
 
 ### Rename `MISTRAL_API_KEY(S)` → `VIBE_API_KEY(S)` (commit `01ae2bd2`)

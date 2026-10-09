@@ -479,6 +479,10 @@ def run_cli(args: argparse.Namespace) -> None:
         _print_export_keys_json()
         return
 
+    if getattr(args, "import_keys", False):
+        _run_import_keys()
+        return
+
     if args.setup:
         from vibe.setup.onboarding import run_onboarding
 
@@ -576,3 +580,32 @@ def _print_export_keys_json() -> None:
     output = asyncio.run(build_keys_json(keys, models=models))
     print(json.dumps(output))
     sys.exit(0 if keys else 1)
+
+
+def _run_import_keys() -> None:
+    from vibe.core.config._defaults import DEFAULT_MISTRAL_API_ENV_KEY
+    from vibe.utils.api_keys import split_keys
+    from vibe.utils.keyring import set_api_key_in_keyring
+
+    bootstrap_vibe_home()
+    try:
+        input_data = sys.stdin.read()
+    except KeyboardInterrupt:
+        rprint("\n[red]Import cancelled.[/]")
+        sys.exit(1)
+    except Exception as e:
+        rprint(f"[red]Error reading input: {e}[/]")
+        sys.exit(1)
+
+    keys = split_keys(input_data)
+    pool_env_var = f"{DEFAULT_MISTRAL_API_ENV_KEY}S"
+    try:
+        set_api_key_in_keyring(pool_env_var, ",".join(keys))
+        if keys:
+            rprint(f"[green]Successfully imported {len(keys)} key(s) into the keyring.[/]")
+        else:
+            rprint("[green]Cleared all keys from the keyring.[/]")
+        sys.exit(0)
+    except Exception as e:
+        rprint(f"[red]Error importing keys: {e}[/]")
+        sys.exit(1)

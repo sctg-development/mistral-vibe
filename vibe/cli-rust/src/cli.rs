@@ -120,6 +120,22 @@ pub struct Cli {
     /// Check for a Vibe update now, prompt to install it, and exit.
     #[arg(long = "check-upgrade", action = ArgAction::SetTrue)]
     pub check_upgrade: bool,
+
+    /// Print the pooled Mistral API keys in clear text with the account each belongs to (duplicates are flagged), then exit.
+    #[arg(long = "list-keys", action = ArgAction::SetTrue)]
+    pub list_keys: bool,
+
+    /// Print only the pooled Mistral API keys, comma-separated, then exit.
+    #[arg(long = "export-keys", action = ArgAction::SetTrue)]
+    pub export_keys: bool,
+
+    /// Print pooled Mistral API keys as structured JSON (keys, owner email, plan type) and exit.
+    #[arg(long = "export-keys-json", action = ArgAction::SetTrue)]
+    pub export_keys_json: bool,
+
+    /// Import API keys from stdin (comma, semicolon, or newline separated) into the keyring, replacing existing keys, then exit.
+    #[arg(long = "import-keys", action = ArgAction::SetTrue)]
+    pub import_keys: bool,
 }
 
 /// Python `parse_arguments`: a leading bare `update` is the `--check-upgrade`

@@ -792,6 +792,7 @@ vibe update / vibe --check-upgrade  # Check for a Vibe update now, prompt to ins
 vibe --list-keys                    # Print pooled Mistral API keys with account, plan, org, and email, then exit
 vibe --export-keys                  # Print pooled Mistral API keys only, comma-separated, then exit
 vibe --export-keys-json             # Print pooled Mistral API keys + configured models as structured JSON, then exit
+vibe --import-keys                  # Import API keys from stdin (comma, semicolon, or newline separated) into the keyring, replacing existing keys, then exit
 vibe --max-turns N                  # Max assistant turns (programmatic mode)
 vibe --max-price DOLLARS            # Max cost limit (programmatic mode)
 vibe --max-tokens N                 # Max total session tokens (programmatic mode)

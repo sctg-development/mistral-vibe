@@ -163,6 +163,11 @@ def parse_arguments() -> argparse.Namespace:
         help="Print pooled Mistral API keys as structured JSON (keys, owner email, plan type) and exit",
     )
     parser.add_argument(
+        "--import-keys",
+        action="store_true",
+        help="Import API keys from stdin (comma, semicolon, or newline separated) into the keyring, replacing existing keys, then exit",
+    )
+    parser.add_argument(
         "--check-upgrade",
         action="store_true",
         help="Check for a Vibe update now, prompt to install it, and exit",

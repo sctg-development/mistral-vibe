@@ -2,6 +2,7 @@
 //! env, dotenv, and OS keyring reads. Writes stay server-side through
 //! setup/store-credential — no set/delete surface lives here.
 
+pub mod api_keys;
 pub mod dotenv;
 pub mod keyring;
 
