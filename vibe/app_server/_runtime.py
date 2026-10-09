@@ -1192,7 +1192,7 @@ class HarnessProcess:
         selection = resolve_harness_selection(
             experimental_harness=experimental_harness,
             legacy_harness=legacy_harness,
-            cached_eval=cached_eval,
+            cached_eval=None,
             key_pool_active=len(pooled_keys(DEFAULT_MISTRAL_API_ENV_KEY)) > 1,
         )
         self.harness_selection_source = selection.source
