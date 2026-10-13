@@ -134,7 +134,6 @@ fn set_api_key_in_keyring(env_key: &str, api_key: &str) -> Result<()> {
     // On non-macOS platforms (Linux, Windows, etc.) we use the keyring crate
     #[cfg(not(target_os = "macos"))]
     {
-        use std::thread;
 
         if api_key.is_empty() {
             // Nothing to do for empty keys on non-macOS
@@ -147,9 +146,9 @@ fn set_api_key_in_keyring(env_key: &str, api_key: &str) -> Result<()> {
 
         // Use a thread for the blocking keyring call
         on_keyring_thread(move || {
-            let entry = keyring::Entry::new(&service, &username);
+            let entry = ::keyring::Entry::new(&service, &username);
             match entry {
-                Ok(mut entry) => {
+                Ok(entry) => {
                     entry
                         .set_password(&password)
                         .map_err(|e| format!("keyring write failed: {}", e))
@@ -157,7 +156,7 @@ fn set_api_key_in_keyring(env_key: &str, api_key: &str) -> Result<()> {
                 Err(e) => Err(format!("keyring entry create failed: {}", e)),
             }
         })
-        .context("keyring write")??;
+        .map_err(|e| anyhow::anyhow!(e))?;
     }
 
     Ok(())
