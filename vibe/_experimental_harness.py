@@ -4,16 +4,10 @@ import argparse
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import import_module, util
-from typing import TYPE_CHECKING, Literal, cast
-
-if TYPE_CHECKING:
-    from vibe.core.experiments.models import EvalResponse
+from typing import Literal, cast
 
 _HARNESS_DISTRIBUTION_MODULE = "mistralai_vibe_local_harness"
 _VIBE_HARNESS_MODULE = "mistralai_vibe_local_harness.vibe"
-
-# Kept for the legacy key-pool fallback path
-_ROLLOUT_EXPERIMENT_KEY = "vibe_cli_unified_harness_rollout"
 
 
 class ExperimentalHarnessUnavailableError(RuntimeError):
@@ -127,20 +121,15 @@ class HarnessSelection:
 
 
 def resolve_harness_selection(
-    *,
-    experimental_harness: bool,
-    legacy_harness: bool,
-    cached_eval: EvalResponse | None = None,
-    key_pool_active: bool = False,
+    *, experimental_harness: bool, legacy_harness: bool, key_pool_active: bool = False
 ) -> HarnessSelection:
     """Resolve which harness to use, combining the CLI flags.
 
     Precedence (highest wins):
-      1. ``--legacy-harness``  -> legacy (escape hatch)
-      2. ``--experimental-harness`` -> unified (if available; else fallback)
+      1. ``--legacy-harness``  -> legacy (escape hatch until the cutover)
+      2. ``--experimental-harness`` -> unified
       3. Several pooled API keys -> legacy (only it can fail over between them)
-      4. GrowthBook rollout cache -> unified (if available; else legacy)
-      5. Default -> legacy
+      4. Default -> unified
     """
     if legacy_harness:
         return HarnessSelection(use_unified=False, source="flag-legacy")
@@ -151,11 +140,7 @@ def resolve_harness_selection(
     if key_pool_active:
         return HarnessSelection(use_unified=False, source="key-pool")
 
-    variant = _rollout_variant_from_cache(cached_eval)
-    if variant == "unified" and experimental_harness_available():
-        return HarnessSelection(use_unified=True, source="rollout")
-
-    return HarnessSelection(use_unified=False, source="default")
+    return HarnessSelection(use_unified=True, source="default")
 
 
 def create_experimental_harness_host() -> object:
@@ -176,24 +161,3 @@ def create_experimental_harness_host() -> object:
         raise runtime_startup_error(
             f"initialization failed with {type(exc).__name__}: {exc}"
         ) from exc
-
-
-def _rollout_variant_from_cache(cached_eval: object | None) -> str | None:
-    """Extract the rollout variant from a cached EvalResponse, or ``None``.
-
-    A pure data lookup — no HTTP client, no ExperimentManager. The cache is
-    surface-agnostic (keyed by hashed API key), so this works regardless of
-    which surface the previous session ran on.
-    """
-    if cached_eval is None:
-        return None
-    features = getattr(cached_eval, "features", None)
-    if not isinstance(features, dict):
-        return None
-    feature = features.get(_ROLLOUT_EXPERIMENT_KEY)
-    if feature is None:
-        return None
-    value = feature.resolved_value()
-    if isinstance(value, str):
-        return value
-    return None

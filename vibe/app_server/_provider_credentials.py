@@ -23,7 +23,6 @@ from mistralai_vibe_local_harness.vibe import (
     ProviderCredentialResult,
     ProviderCredentialSnapshot,
 )
-
 from vibe.core.llm.key_pool import note_active_key
 from vibe.core.types import Backend
 from vibe.observability.logging import logger

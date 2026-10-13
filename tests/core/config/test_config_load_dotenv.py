@@ -63,9 +63,7 @@ def test_adds_dotenv_value_when_process_env_is_empty(tmp_path: Path) -> None:
 
 def test_ignores_empty_values(tmp_path: Path) -> None:
     env_path = tmp_path / ".env"
-    _write_env_file(
-        env_path, "\n".join(["EMPTY=", "VIBE_API_KEY=", "NO_VALUE"]) + "\n"
-    )
+    _write_env_file(env_path, "\n".join(["EMPTY=", "VIBE_API_KEY=", "NO_VALUE"]) + "\n")
     environ: dict[str, str] = {}
 
     load_dotenv_values(env_path=env_path, environ=environ)
