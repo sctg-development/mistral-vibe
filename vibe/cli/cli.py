@@ -479,8 +479,8 @@ def run_cli(args: argparse.Namespace) -> None:
         _print_export_keys_json()
         return
 
-    if getattr(args, "import_keys", False):
-        _run_import_keys()
+    if getattr(args, "import_keys", None) is not None:
+        _run_import_keys(args.import_keys)
         return
 
     if args.setup:
@@ -582,27 +582,32 @@ def _print_export_keys_json() -> None:
     sys.exit(0 if keys else 1)
 
 
-def _run_import_keys() -> None:
+def _run_import_keys(raw_keys: str = "-") -> None:
     from vibe.core.config._defaults import DEFAULT_MISTRAL_API_ENV_KEY
     from vibe.utils.api_keys import split_keys
     from vibe.utils.keyring import set_api_key_in_keyring
 
     bootstrap_vibe_home()
-    try:
-        input_data = sys.stdin.read()
-    except KeyboardInterrupt:
-        rprint("\n[red]Import cancelled.[/]")
-        sys.exit(1)
-    except Exception as e:
-        rprint(f"[red]Error reading input: {e}[/]")
-        sys.exit(1)
+    if raw_keys != "-":
+        input_data = raw_keys
+    else:
+        try:
+            input_data = sys.stdin.read()
+        except KeyboardInterrupt:
+            rprint("\n[red]Import cancelled.[/]")
+            sys.exit(1)
+        except Exception as e:
+            rprint(f"[red]Error reading input: {e}[/]")
+            sys.exit(1)
 
     keys = split_keys(input_data)
     pool_env_var = f"{DEFAULT_MISTRAL_API_ENV_KEY}S"
     try:
         set_api_key_in_keyring(pool_env_var, ",".join(keys))
         if keys:
-            rprint(f"[green]Successfully imported {len(keys)} key(s) into the keyring.[/]")
+            rprint(
+                f"[green]Successfully imported {len(keys)} key(s) into the keyring.[/]"
+            )
         else:
             rprint("[green]Cleared all keys from the keyring.[/]")
         sys.exit(0)

@@ -13,7 +13,11 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
   (`x-ratelimit-*-minute` headers), in-flight spreading, per-key usage registry.
   State shared across processes in `$VIBE_HOME/key_pool_state.json`.
 - `vibe/cli/list_keys.py` — `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys`.
-- `vibe/cli-rust/src/credentials/api_keys.rs` — Rust implementation of key management functions.
+- `vibe/cli-rust/src/credentials/api_keys.rs` — Rust port of the key management flags (`vibe-rs` is what `vibe` runs
+  when `VIBE_CLI=rust` or the rollout selects it). `--list-keys` queries console `/api/vibe/whoami` and API `/v1/users/me`
+  per key (identity: 3 concurrent, 3 tries) and shares `$VIBE_HOME/whoami_cache_multi.json` (6 h TTL, key =
+  first 32 hex of SHA-256) with the Python implementation. `--import-keys [KEYS]` takes the keys as an argument, or
+  reads stdin when omitted or `-` (Python and Rust).
 - `tests/backend/test_key_pool.py`, `tests/test_key_accounts.py`,
   `tests/cli/test_list_keys.py`.
 
@@ -30,6 +34,7 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 | `vibe/cli/entrypoint.py`, `vibe/cli/cli.py` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` flags |
 | `vibe/cli-rust/src/cli.rs` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` CLI flags |
 | `vibe/cli-rust/src/main.rs` | Key management flag handlers for Rust CLI |
+| `vibe/cli-rust/src/session_exit.rs`, `src/server/process.rs`, `tests/session_exit.rs` | Rust TUI exit summary prints per-key usage under the session total. The app-server child runs in another process, so `key_pool.py` mirrors its usage (masked keys) to `$VIBE_KEY_USAGE_FILE`; the client sets that to `<tmp>/vibe-key-usage-<client pid>.json` at spawn and reads/removes it on exit |
 | `vibe/cli-rust/src/credentials/mod.rs` | Added `api_keys` module to credentials |
 | `vibe/core/paths/*` | `whoami_cache_multi.json` path |
 

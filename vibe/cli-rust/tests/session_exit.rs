@@ -18,7 +18,30 @@ fn summary(session_id: Option<&str>, usage: TokenUsage) -> SessionExitSummary {
     SessionExitSummary {
         session_id: session_id.map(str::to_owned),
         usage,
+        key_usage: Vec::new(),
     }
+}
+
+#[test]
+fn key_usage_lines_follow_the_total() {
+    let key_usage = [vibe_rs::session_exit::KeyUsage {
+        key: "mst***abc".into(),
+        input_tokens: 1200,
+        output_tokens: 30,
+    }];
+    let text = vibe_rs::session_exit::format_session_usage_with_keys(
+        TokenUsage {
+            input_tokens: 1200,
+            output_tokens: 30,
+            total_tokens: 1230,
+        },
+        &key_usage,
+    );
+    assert_eq!(
+        text,
+        "Total tokens used this session: input=1,200 output=30 (total=1,230)\n\
+         key mst***abc : input=1,200 output=30 (total=1,230)"
+    );
 }
 
 #[test]

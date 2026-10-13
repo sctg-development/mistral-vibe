@@ -133,9 +133,9 @@ pub struct Cli {
     #[arg(long = "export-keys-json", action = ArgAction::SetTrue)]
     pub export_keys_json: bool,
 
-    /// Import API keys from stdin (comma, semicolon, or newline separated) into the keyring, replacing existing keys, then exit.
-    #[arg(long = "import-keys", action = ArgAction::SetTrue)]
-    pub import_keys: bool,
+    /// Import API keys (comma, semicolon, or newline separated) into the keyring, replacing existing keys, then exit. Read from KEYS, or from stdin when omitted or `-`.
+    #[arg(long = "import-keys", value_name = "KEYS", num_args = 0..=1, default_missing_value = "-")]
+    pub import_keys: Option<String>,
 }
 
 /// Python `parse_arguments`: a leading bare `update` is the `--check-upgrade`

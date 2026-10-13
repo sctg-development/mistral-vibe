@@ -20,6 +20,45 @@ const EXIT_READ_TIMEOUT: Duration = Duration::from_millis(500);
 pub struct SessionExitSummary {
     pub session_id: Option<String>,
     pub usage: TokenUsage,
+    /// Tokens spent per pooled API key (masked), reported by the app-server.
+    pub key_usage: Vec<KeyUsage>,
+}
+
+/// One pooled key's tokens this session (Python `session_key_usage`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyUsage {
+    pub key: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Env var telling the app-server where to mirror its per-key usage
+/// (Python `key_pool._USAGE_FILE_ENV_VAR`).
+pub const KEY_USAGE_FILE_ENV_VAR: &str = "VIBE_KEY_USAGE_FILE";
+
+/// Per-client scratch file for the app-server's per-key usage.
+pub fn key_usage_file() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("vibe-key-usage-{}.json", std::process::id()))
+}
+
+/// Read, then remove, the per-key usage the app-server wrote; empty when it
+/// never recorded any (single key, no calls, older server).
+pub fn take_key_usage() -> Vec<KeyUsage> {
+    let path = key_usage_file();
+    let rows = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok())
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    rows.iter()
+        .filter_map(|row| {
+            Some(KeyUsage {
+                key: row.get("key")?.as_str()?.to_owned(),
+                input_tokens: row.get("input")?.as_u64()?,
+                output_tokens: row.get("output")?.as_u64()?,
+            })
+        })
+        .collect()
 }
 
 /// The `[bold dark_orange]` span on a 256-color-or-better terminal.
@@ -62,6 +101,21 @@ pub fn format_session_usage(usage: TokenUsage) -> String {
     )
 }
 
+/// Python `format_session_usage` plus its per-key lines.
+pub fn format_session_usage_with_keys(usage: TokenUsage, key_usage: &[KeyUsage]) -> String {
+    let mut text = format_session_usage(usage);
+    for row in key_usage {
+        text.push_str(&format!(
+            "\nkey {} : input={} output={} (total={})",
+            row.key,
+            thousands(row.input_tokens),
+            thousands(row.output_tokens),
+            thousands(row.input_tokens + row.output_tokens),
+        ));
+    }
+    text
+}
+
 /// Python `print_session_resume_message` as one block: nothing at all without a
 /// persisted session id, otherwise the usage line and the two resume lines.
 pub fn session_resume_message(
@@ -74,7 +128,10 @@ pub fn session_resume_message(
     let Some(session_id) = summary.session_id.as_deref() else {
         return String::new();
     };
-    let mut text = format!("\n{}\n\n", format_session_usage(summary.usage));
+    let mut text = format!(
+        "\n{}\n\n",
+        format_session_usage_with_keys(summary.usage, &summary.key_usage)
+    );
     match orange {
         Some(code) => {
             text.push_str(&format!(
@@ -133,16 +190,19 @@ pub async fn exit_summary(app: &App, client: &Arc<Client>) -> SessionExitSummary
     let current = current_usage(app);
     // A quit before `ready` never attached, so nothing was used since attach.
     let usage = usage_since_baseline(current, app.session.usage_baseline.unwrap_or(current));
+    let key_usage = take_key_usage();
     let Some(session_id) = app.session.session_id.clone() else {
         return SessionExitSummary {
             session_id: None,
             usage,
+            key_usage,
         };
     };
     let resumable = is_resumable(client, &session_id, EXIT_READ_TIMEOUT).await;
     SessionExitSummary {
         session_id: resumable.then_some(session_id),
         usage,
+        key_usage,
     }
 }
 

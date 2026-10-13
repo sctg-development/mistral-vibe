@@ -67,6 +67,7 @@ _FAILOVER_STATUSES = frozenset({401, 402, 403, 429})
 
 # Tokens spent per key in this process, for the summary shown on exit.
 _SESSION_USAGE: dict[str, list[int]] = {}
+_USAGE_FILE_ENV_VAR = "VIBE_KEY_USAGE_FILE"
 
 
 _MASK_EDGE = 3
@@ -85,6 +86,27 @@ def record_key_usage(key: str, input_tokens: int, output_tokens: int) -> None:
     counts = _SESSION_USAGE.setdefault(key, [0, 0])
     counts[0] += input_tokens
     counts[1] += output_tokens
+    _export_session_usage()
+
+
+def _export_session_usage() -> None:
+    """Mirror the usage to ``$VIBE_KEY_USAGE_FILE`` for a client that runs this
+    process as its app-server (the Rust TUI), which prints the exit summary.
+    """
+    path = os.environ.get(_USAGE_FILE_ENV_VAR)
+    if not path:
+        return
+    rows = [
+        {"key": masked, "input": input_tokens, "output": output_tokens}
+        for masked, input_tokens, output_tokens in session_key_usage()
+    ]
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle)
+        os.replace(tmp_path, path)
+    except OSError:
+        pass
 
 
 # Key the Unified harness resolved for its latest model call. That path does not

@@ -164,8 +164,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--import-keys",
-        action="store_true",
-        help="Import API keys from stdin (comma, semicolon, or newline separated) into the keyring, replacing existing keys, then exit",
+        nargs="?",
+        const="-",
+        default=None,
+        metavar="KEYS",
+        help="Import API keys (comma, semicolon, or newline separated) into the keyring, replacing existing keys, then exit. Keys are read from KEYS, or from stdin when omitted or '-'",
     )
     parser.add_argument(
         "--check-upgrade",

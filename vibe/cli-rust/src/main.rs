@@ -77,8 +77,8 @@ async fn run() -> Result<std::process::ExitCode> {
     if cli.export_keys_json {
         return vibe_rs::credentials::api_keys::run_export_keys_json().await;
     }
-    if cli.import_keys {
-        return vibe_rs::credentials::api_keys::run_import_keys().await;
+    if let Some(raw_keys) = cli.import_keys.as_deref() {
+        return vibe_rs::credentials::api_keys::run_import_keys(raw_keys).await;
     }
 
     // Python reads piped stdin once, before choosing interactive vs headless, so

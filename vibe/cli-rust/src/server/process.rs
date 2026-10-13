@@ -134,6 +134,10 @@ impl Client {
         for key in crate::credentials::dotenv::dotenv_set_keys() {
             cmd.env_remove(&key);
         }
+        // The server mirrors its per-key token usage here for the exit summary.
+        let usage_file = crate::session_exit::key_usage_file();
+        let _ = std::fs::remove_file(&usage_file);
+        cmd.env(crate::session_exit::KEY_USAGE_FILE_ENV_VAR, usage_file);
 
         let mut child = ChildHandle::spawn(&mut cmd)
             .with_context(|| format!("failed to spawn `{}`", launch.program))?;
