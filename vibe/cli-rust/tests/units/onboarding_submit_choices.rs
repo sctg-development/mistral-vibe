@@ -30,7 +30,7 @@ fn the_provider_view_rides_the_wire_as_the_six_field_camelcase_frame() {
         json!({
             "name": "mistral",
             "apiBase": "https://api.globalaegis.net/v1",
-            "apiKeyEnvVar": "MISTRAL_API_KEY",
+            "apiKeyEnvVar": "VIBE_API_KEY",
             "browserAuthBaseUrl": "https://console.globalaegis.net",
             "browserAuthApiBaseUrl": "https://console.globalaegis.net/api",
             "browserAuthAllowOriginRewrite": true,

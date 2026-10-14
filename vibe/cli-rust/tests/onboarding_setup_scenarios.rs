@@ -311,7 +311,7 @@ async fn single_custom_domain_derives_submits_and_round_trips() {
     );
     let provider = choices.provider.expect("provider on drift");
     assert_eq!(provider.browser_auth_base_url, Some(mock.console.url()));
-    assert_eq!(provider.api_key_env_var, "MISTRAL_API_KEY");
+    assert_eq!(provider.api_key_env_var, "VIBE_API_KEY");
 }
 
 #[test]

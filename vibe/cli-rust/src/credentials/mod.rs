@@ -22,7 +22,7 @@ pub fn resolve_api_key(env_key: &str) -> Option<String> {
     keyring::get_api_key_from_keyring(env_key)
 }
 
-/// Whether `MISTRAL_API_KEY` resolves at all (env or keyring): the cheap
+/// Whether `VIBE_API_KEY` resolves at all (env or keyring): the cheap
 /// pre-spawn probe (Python `require_api_key_or_onboarding`) that lets a
 /// normal launch skip the pre-session `setup/status` and overlap the child
 /// boot with the first draw. A positive probe never decides the key IS
@@ -30,7 +30,7 @@ pub fn resolve_api_key(env_key: &str) -> Option<String> {
 /// handshake's typed missing-key verdict — the universal backstop that
 /// session start, resume, continue, and fork all raise server-side.
 pub fn default_key_present() -> bool {
-    if resolve_api_key("MISTRAL_API_KEY").is_some() {
+    if resolve_api_key("VIBE_API_KEY").is_some() {
         return true;
     }
     // When VIBE_ACTIVE_MODEL is set, the active provider may not need a key

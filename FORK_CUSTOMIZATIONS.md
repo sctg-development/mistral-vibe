@@ -36,7 +36,8 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 | `vibe/cli-rust/src/cli.rs` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` CLI flags |
 | `vibe/cli-rust/src/main.rs` | Key management flag handlers for Rust CLI |
 | `vibe/cli-rust/src/session_exit.rs`, `src/server/process.rs`, `tests/session_exit.rs` | Rust TUI exit summary prints per-key usage under the session total. The app-server child runs in another process, so `key_pool.py` mirrors its usage (masked keys) to `$VIBE_KEY_USAGE_FILE`; the client sets that to `<tmp>/vibe-key-usage-<client pid>.json` at spawn and reads/removes it on exit |
-| `vibe/cli-rust/src/credentials/mod.rs` | Added `api_keys` module to credentials |
+| `vibe/cli-rust/src/credentials/mod.rs` | Added `api_keys` module to credentials; `default_key_present` probes `VIBE_API_KEY` (rename) |
+| `vibe/cli-rust/src/setup/wizard/context.rs` | `DEFAULT_MISTRAL_API_ENV_KEY` = `VIBE_API_KEY` (rename); Rust tests that pin it (`setup_probe`, `onboarding_setup_scenarios`, `onboarding_submit_choices`) follow |
 | `vibe/core/paths/*` | `whoami_cache_multi.json` path |
 
 ### Rename `MISTRAL_API_KEY(S)` → `VIBE_API_KEY(S)` (commit `01ae2bd2`)

@@ -4,7 +4,7 @@
 
 use crate::setup::auth::rpc::{ProviderView, SetupStatus};
 
-pub const DEFAULT_MISTRAL_API_ENV_KEY: &str = "MISTRAL_API_KEY";
+pub const DEFAULT_MISTRAL_API_ENV_KEY: &str = "VIBE_API_KEY";
 const DEFAULT_MISTRAL_SERVER_URL: &str = "https://api.mistral.ai";
 const DEFAULT_MISTRAL_BROWSER_AUTH_URL: &str = "https://console.mistral.ai";
 const DEFAULT_MISTRAL_BROWSER_AUTH_API_URL: &str = "https://console.mistral.ai/api";
