@@ -42,7 +42,7 @@ async def _status(client: AppServerClient) -> SetupStatusResponse:
 async def test_setup_status_seeds_the_wizard_from_the_resolved_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     client, client_transport, server_transport = await setup_client()
     try:
         response = await _status(client)
@@ -52,7 +52,7 @@ async def test_setup_status_seeds_the_wizard_from_the_resolved_config(
 
     assert response.provider.name == "mistral"
     assert response.provider.api_base == "https://api.mistral.ai/v1"
-    assert response.provider.api_key_env_var == "MISTRAL_API_KEY"
+    assert response.provider.api_key_env_var == "VIBE_API_KEY"
     assert response.provider.browser_auth_base_url == "https://console.mistral.ai"
     assert (
         response.provider.browser_auth_api_base_url == "https://console.mistral.ai/api"
@@ -70,7 +70,7 @@ async def test_setup_status_seeds_the_wizard_from_the_resolved_config(
 async def test_setup_status_has_api_key_true_from_process_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "env-key")
+    monkeypatch.setenv("VIBE_API_KEY", "env-key")
 
     def _fail(service: str, username: str) -> str | None:
         raise AssertionError("keyring must not be consulted when env is set")
@@ -91,7 +91,7 @@ async def test_setup_status_has_api_key_true_from_process_env(
 async def test_setup_status_has_api_key_true_from_keyring_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
 
     monkeypatch.setattr(
         keyring, "get_password", lambda service, username: "keyring-key"
@@ -254,7 +254,7 @@ async def test_setup_status_seeds_the_named_provider_not_the_active_one(
     ``--agent`` run's config layering can differ from the active provider),
     resolved through the runtime's own ``_named_provider`` path.
     """
-    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
     client, client_transport, server_transport = await setup_client()
     try:
         response = validate_wire(

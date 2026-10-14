@@ -385,7 +385,7 @@ async def test_a_credential_says_which_source_it_came_from(
     from_env = await service.resolve()
     monkeypatch.delenv("PRIMARY_KEY")
     monkeypatch.setattr(
-        api_keys, "get_api_key_from_keyring", lambda _key: "from-the-keyring"
+        api_keys, "get_api_key_from_keyring", lambda _key, **_kwargs: "from-the-keyring"
     )
     from_keyring = await service.resolve()
 

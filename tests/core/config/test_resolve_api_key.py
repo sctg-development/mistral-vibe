@@ -67,7 +67,13 @@ def test_resolve_caches_empty_keyring_lookup_for_env_key(
 
     assert resolve_api_key("CUSTOM_API_KEY") is None
     assert resolve_api_key("CUSTOM_API_KEY") is None
-    assert calls == [("ai.mistral.vibe", "CUSTOM_API_KEY"), ("vibe", "CUSTOM_API_KEY")]
+    # Fork: the plural pool entry (``CUSTOM_API_KEYS``) is the last fallback and
+    # is cached like the singular one.
+    assert calls == [
+        ("ai.mistral.vibe", "CUSTOM_API_KEY"),
+        ("vibe", "CUSTOM_API_KEY"),
+        ("ai.mistral.vibe", "CUSTOM_API_KEYS"),
+    ]
 
 
 def test_resolve_returns_none_when_env_unset_and_keyring_empty(
@@ -96,8 +102,10 @@ def test_resolve_does_not_cache_keyring_errors(monkeypatch: pytest.MonkeyPatch) 
     calls = 0
     monkeypatch.delenv("CUSTOM_API_KEY", raising=False)
 
-    def _sometimes_unavailable(service: str, username: str) -> str:
+    def _sometimes_unavailable(service: str, username: str) -> str | None:
         nonlocal calls
+        if username != "CUSTOM_API_KEY":
+            return None  # the fork's plural pool entry stays empty
         calls += 1
         if calls == 1:
             raise KeyringError("temporary failure")

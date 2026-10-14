@@ -27,7 +27,7 @@ def _provider(api_base: str = "https://llm.acme.internal/v1") -> ProviderConfig:
     return ProviderConfig(
         name="mistral",
         api_base=api_base,
-        api_key_env_var="MISTRAL_API_KEY",
+        api_key_env_var="VIBE_API_KEY",
         backend=Backend.MISTRAL,
     )
 
@@ -108,7 +108,7 @@ class TestEnsureFirstAvailable:
     async def test_a_missing_key_is_not_a_verdict(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
         source = _RecordingSource({_MODEL.name: True})
         cache = ModelAvailabilityCache(source)
 
@@ -205,10 +205,10 @@ class TestRemembering:
 
     def test_verdicts_are_per_credential(self, monkeypatch: pytest.MonkeyPatch) -> None:
         cache = ModelAvailabilityCache()
-        monkeypatch.setenv("MISTRAL_API_KEY", "first-key")
+        monkeypatch.setenv("VIBE_API_KEY", "first-key")
         cache.remember(provider=_provider(), model=_MODEL, available=True)
 
-        monkeypatch.setenv("MISTRAL_API_KEY", "second-key")
+        monkeypatch.setenv("VIBE_API_KEY", "second-key")
 
         assert ModelAvailabilityCache().peek(provider=_provider(), model=_MODEL) is None
 

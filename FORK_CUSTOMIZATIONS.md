@@ -1,7 +1,8 @@
 # Fork customizations (sctg-development/mistral-vibe)
 
 What this fork changes on top of upstream, so a sync keeps it. Upstream base:
-`7c19608a` (v2.25.8). Re-check with `git diff <upstream-tag> --stat -- vibe`.
+`4ae5c595` (v2.26.1, merged in `9a9584e1`). Re-check with `git diff <upstream-tag> --stat -- vibe`.
+Upstream remote: `upstream` = `https://github.com/mistralai/mistral-vibe.git`.
 
 ## Multi-account key pool (Vibe sign-in keys)
 
@@ -28,7 +29,7 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 | `vibe/utils/http.py` | `transport_wrapper` argument on `VibeAsyncHTTPClient` |
 | `vibe/core/llm/backend/mistral.py` | builds the `KeyPool`, wraps the transport, records per-key usage (`_record_pool_usage`) |
 | `vibe/setup/auth/api_key_persistence.py` | every sign-in is appended to the pool (`add_pooled_key`) |
-| `vibe/_experimental_harness.py`, `vibe/app_server/_runtime.py` | `key_pool_active`: several keys force the legacy harness (only it can fail over; the native Unified harness bypasses our transport) |
+| `vibe/_experimental_harness.py`, `vibe/app_server/_runtime.py` | `key_pool_active`: several keys force the legacy harness (only it can fail over; the native Unified harness bypasses our transport). Everything else follows upstream: Unified is the unconditional default, `--legacy-harness` the escape hatch. The old GrowthBook rollout-cache path (`cached_eval`) is gone: do not reintroduce it, upstream's cutover made it dead and it broke every e2e that needs the Unified harness |
 | `vibe/app_server/_provider_credentials.py`, `_unified_harness_backend_adapter.py` | per-key usage attribution on the Unified path |
 | `vibe/cli/session_exit.py` | per-key lines under the session total |
 | `vibe/cli/entrypoint.py`, `vibe/cli/cli.py` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` flags |
@@ -44,10 +45,17 @@ Touches ~70 files, mostly tests and docs. The one line that matters is
 After a sync, re-run: `git grep -l MISTRAL_API_KEY` and rename only what refers
 to the Vibe sign-in key, leaving third-party providers on their own variables.
 
+### Tests we adapted (expect conflicts here after a sync)
+Upstream tests still say `MISTRAL_API_KEY` and a single keyring read. Take upstream's side, then re-apply:
+- the rename to `VIBE_API_KEY` on the lines upstream added (Python tests only; Rust tests keep `MISTRAL_API_KEY`);
+- `tests/app_server/test_setup_store_credential.py`: a sign-in also writes `VIBE_API_KEYS` (pool), so the keyring write list has two entries;
+- `tests/core/config/test_resolve_api_key.py`: the plural `…_KEYS` entry is a third, cached keyring read;
+- `tests/app_server/test_provider_credentials.py`: keyring stubs take `**kwargs` (`search_legacy_services`).
+
 ## Sync procedure
 1. `git fetch upstream && git merge upstream/main` (or rebase our commits).
 2. Resolve conflicts in the table above; our own files will not conflict.
 3. Re-run the rename check above.
-4. `python -m pytest tests/backend tests/cli tests/test_key_accounts.py`.
+4. `uv run pytest tests -n auto`, and compare any failure with the same run on the pre-merge commit (a `git worktree`) so only merge-induced failures are chased. If the `programmatic` e2e fail with "requires the Unified Harness", check `resolve_harness_selection` first.
 5. Native module: a test run may rebuild `mistralai_vibe_local_harness/_native.abi3.so`
    (`uv build` via maturin); wait for it to finish before judging results.

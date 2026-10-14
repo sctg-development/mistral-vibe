@@ -67,7 +67,7 @@ def _write_custom_provider_config(config_file: Path, *, api_key_env_var: str) ->
 async def test_store_credential_completed_writes_keyring_and_process_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
     written: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
         keyring, "set_password", lambda s, u, p: written.append((s, u, p))
@@ -82,8 +82,12 @@ async def test_store_credential_completed_writes_keyring_and_process_env(
 
     assert response.outcome == "completed"
     assert response.detail is None
-    assert os.environ["MISTRAL_API_KEY"] == "new-key"
-    assert written == [("ai.mistral.vibe", "MISTRAL_API_KEY", "new-key")]
+    assert os.environ["VIBE_API_KEY"] == "new-key"
+    # Fork: every sign-in is also appended to the multi-account pool.
+    assert written == [
+        ("ai.mistral.vibe", "VIBE_API_KEY", "new-key"),
+        ("ai.mistral.vibe", "VIBE_API_KEYS", "new-key"),
+    ]
     # The keyring write succeeded, so no plaintext .env fallback is created.
     assert not GLOBAL_ENV_FILE.path.exists()
 
@@ -95,7 +99,7 @@ async def test_store_credential_env_var_error_for_invalid_env_var_name(
     _write_custom_provider_config(
         config_dir / "config.toml", api_key_env_var="BAD=NAME"
     )
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
 
     def _fail(service: str, username: str, password: str) -> None:
         raise AssertionError("keyring must not be used on env_var_error")
@@ -120,7 +124,7 @@ async def test_store_credential_empty_env_var_falls_back_to_mistral_var(
 ) -> None:
     # Python parity (resolve_api_key_provider): the default Mistral env var.
     _write_custom_provider_config(config_dir / "config.toml", api_key_env_var="")
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
     written: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
         keyring, "set_password", lambda s, u, p: written.append((s, u, p))
@@ -134,14 +138,18 @@ async def test_store_credential_empty_env_var_falls_back_to_mistral_var(
         await server_transport.close()
 
     assert response.outcome == "completed"
-    assert written == [("ai.mistral.vibe", "MISTRAL_API_KEY", "new-key")]
+    # Fork: every sign-in is also appended to the multi-account pool.
+    assert written == [
+        ("ai.mistral.vibe", "VIBE_API_KEY", "new-key"),
+        ("ai.mistral.vibe", "VIBE_API_KEYS", "new-key"),
+    ]
 
 
 @pytest.mark.asyncio
 async def test_store_credential_save_error_when_keyring_and_env_file_both_fail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
 
     def _unavailable(service: str, username: str, password: str) -> None:
         raise KeyringError("no keyring")
@@ -160,7 +168,7 @@ async def test_store_credential_save_error_when_keyring_and_env_file_both_fail(
     assert response.outcome == "save_error"
     assert response.detail is not None
     # The key is still exported to the server process env, exactly like Python.
-    assert os.environ["MISTRAL_API_KEY"] == "new-key"
+    assert os.environ["VIBE_API_KEY"] == "new-key"
 
 
 @pytest.mark.asyncio
@@ -168,7 +176,7 @@ async def test_store_credential_save_error_when_keyring_and_env_file_both_fail(
 async def test_store_credential_env_file_fallback_is_owner_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
 
     def _unavailable(service: str, username: str, password: str) -> None:
         raise KeyringError("no keyring")
@@ -184,7 +192,7 @@ async def test_store_credential_env_file_fallback_is_owner_only(
 
     assert response.outcome == "completed"
     assert stat.S_IMODE(os.lstat(GLOBAL_ENV_FILE.path).st_mode) == 0o600
-    assert dotenv_values(GLOBAL_ENV_FILE.path)["MISTRAL_API_KEY"] == "new-key"
+    assert dotenv_values(GLOBAL_ENV_FILE.path)["VIBE_API_KEY"] == "new-key"
 
 
 @pytest.mark.asyncio
@@ -192,7 +200,7 @@ async def test_store_credential_env_file_fallback_is_owner_only(
 async def test_store_credential_tightens_existing_env_file_to_owner_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
 
     def _unavailable(service: str, username: str, password: str) -> None:
         raise KeyringError("no keyring")
@@ -200,7 +208,7 @@ async def test_store_credential_tightens_existing_env_file_to_owner_only(
     monkeypatch.setattr(keyring, "set_password", _unavailable)
     clear_api_key_keyring_cache()
     GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
-    GLOBAL_ENV_FILE.path.write_text("MISTRAL_API_KEY=stale\n", encoding="utf-8")
+    GLOBAL_ENV_FILE.path.write_text("VIBE_API_KEY=stale\n", encoding="utf-8")
     os.chmod(GLOBAL_ENV_FILE.path, 0o644)
     client, client_transport, server_transport = await setup_client()
     try:
@@ -211,14 +219,14 @@ async def test_store_credential_tightens_existing_env_file_to_owner_only(
 
     assert response.outcome == "completed"
     assert stat.S_IMODE(os.lstat(GLOBAL_ENV_FILE.path).st_mode) == 0o600
-    assert dotenv_values(GLOBAL_ENV_FILE.path)["MISTRAL_API_KEY"] == "new-key"
+    assert dotenv_values(GLOBAL_ENV_FILE.path)["VIBE_API_KEY"] == "new-key"
 
 
 @pytest.mark.asyncio
 async def test_store_credential_unknown_provider_is_rejected_as_invalid_params(
     monkeypatch: pytest.MonkeyPatch, config_dir: Path
 ) -> None:
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
     client, client_transport, server_transport = await setup_client()
     try:
         with pytest.raises(AppServerResponseError) as exc_info:
@@ -262,7 +270,7 @@ async def test_store_credential_emits_onboarding_telemetry_once(
     """
     captured = _capture_telemetry(monkeypatch)
     monkeypatch.setenv("VIBE_ENABLE_TELEMETRY", "true")
-    monkeypatch.setenv("MISTRAL_API_KEY", "placeholder")
+    monkeypatch.setenv("VIBE_API_KEY", "placeholder")
     client, client_transport, server_transport = await setup_client(entrypoint="cli")
     try:
         response = await _store(client, custom_domain=True)

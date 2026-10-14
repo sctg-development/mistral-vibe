@@ -153,7 +153,7 @@ async def test_session_start_without_a_key_is_unauthorized(
     assert exc_info.value.error.code is ProtocolErrorCode.UNAUTHORIZED
     assert exc_info.value.error.data == {
         "provider": "mistral",
-        "env_key": "MISTRAL_API_KEY",
+        "env_key": "VIBE_API_KEY",
     }
 
 

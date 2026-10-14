@@ -369,7 +369,7 @@ def _mistral_provider(api_base: str) -> ProviderConfig:
     return ProviderConfig(
         name="mistral",
         api_base=api_base,
-        api_key_env_var="MISTRAL_API_KEY",
+        api_key_env_var="VIBE_API_KEY",
         backend=Backend.MISTRAL,
     )
 
