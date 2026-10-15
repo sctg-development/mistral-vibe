@@ -6,7 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  id-token: write # PyPI trusted publishing + build provenance attestation
+  contents: write # upload assets to the GitHub Release
+  attestations: write # attest-build-provenance
 
 jobs:
   configure:
