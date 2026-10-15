@@ -220,15 +220,15 @@ jobs:
             fi
           done
 
-       - name: Upload all distributions to GitHub Release
-         uses: softprops/action-gh-release@0976c9c8984f3404f97434941823c649c1333f9 # v2.0.8
-         with:
-           files: |
-             dist/*.whl
-             dist/*.tar.gz
-           generate_release_notes: false
-         env:
-           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload all distributions to GitHub Release
+        uses: softprops/action-gh-release@0976c9c8984f3404f97434941823c649c1333f9 # v2.0.8
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Attest release artifacts
         uses: actions/attest-build-provenance@v4
