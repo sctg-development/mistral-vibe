@@ -197,8 +197,9 @@ jobs:
       name: pypi
       url: https://pypi.org/p/mistral-vibe
     permissions:
-      id-token: write
-      contents: read
+      id-token: write # PyPI trusted publishing + build provenance attestation
+      contents: write # upload assets to the GitHub Release
+      attestations: write # attest-build-provenance
 
     steps:
       - name: Download all distributions
