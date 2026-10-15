@@ -220,8 +220,18 @@ jobs:
             fi
           done
 
-      - name: Publish distribution to PyPI
-        if: github.repository == 'mistralai/mistral-vibe'
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+      - name: Upload all distributions to GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          packages-dir: dist
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          generate_release_notes: true
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/

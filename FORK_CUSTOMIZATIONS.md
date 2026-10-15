@@ -60,3 +60,8 @@ Upstream tests still say `MISTRAL_API_KEY` and a single keyring read. Take upstr
 4. `uv run pytest tests -n auto`, and compare any failure with the same run on the pre-merge commit (a `git worktree`) so only merge-induced failures are chased. If the `programmatic` e2e fail with "requires the Unified Harness", check `resolve_harness_selection` first.
 5. Native module: a test run may rebuild `mistralai_vibe_local_harness/_native.abi3.so`
    (`uv build` via maturin); wait for it to finish before judging results.
+
+## Release procedure
+- `release.yml` is modified to publish all `.whl` and `.tar.gz` files to GitHub Releases via `softprops/action-gh-release`, and attest all release artifacts in `dist/` using `actions/attest-build-provenance@v2`.
+- GitHub Releases: All `.whl` and `.tar.gz` files are published to GitHub Releases via `softprops/action-gh-release`
+- Attestations: All release artifacts in `dist/` are attested using `actions/attest-build-provenance@v2`
