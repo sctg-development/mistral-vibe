@@ -5,6 +5,9 @@ on:
     types: [published]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   configure:
     runs-on: ubuntu-latest
@@ -19,16 +22,18 @@ jobs:
           # One wheel per OS/arch (the bundled vibe-rs makes it platform-specific); Linux uses digest-pinned manylinux_2_28 containers.
           # cargo_flags: Linux builds without voice (cpal needs ALSA/libasound,
           # absent from manylinux); macOS/Windows use CoreAudio/WASAPI, so voice ships.
-          matrix='{
-            "include": [
-              {"runner": "ubuntu-22.04", "os": "linux", "arch": "x86_64", "container": "quay.io/pypa/manylinux_2_28_x86_64@sha256:65140ef21cef92d0c13d001708afd7d304d7a154f7120d039df99dac708f3ffb", "cargo_flags": "--no-default-features"},
-              {"runner": "ubuntu-22.04-arm", "os": "linux", "arch": "aarch64", "container": "quay.io/pypa/manylinux_2_28_aarch64@sha256:360bf4ec4349372e9bcfb123bf11bcc4f085072bfa4f3b946d98f5a28f9c03b0", "cargo_flags": "--no-default-features"},
-              {"runner": "macos-15-intel", "os": "darwin", "arch": "x86_64", "cargo_flags": ""},
-              {"runner": "macos-14", "os": "darwin", "arch": "aarch64", "cargo_flags": ""},
-              {"runner": "windows-2022", "os": "windows", "arch": "x86_64", "cargo_flags": ""}
-            ]
-          }'
-          echo "matrix=$(echo $matrix | jq -c .)" >> $GITHUB_OUTPUT
+          matrix=$(
+            jq -n '{
+              include: [
+                {runner: "ubuntu-22.04", os: "linux", arch: "x86_64", container: "quay.io/pypa/manylinux_2_28_x86_64@sha256:65140ef21cef92d0c13d001708afd7d304d7a154f7120d039df99dac708f3ffb", cargo_flags: "--no-default-features"},
+                {runner: "ubuntu-22.04-arm", os: "linux", arch: "aarch64", container: "quay.io/pypa/manylinux_2_28_aarch64@sha256:360bf4ec4349372e9bcfb123bf11bcc4f085072bfa4f3b946d98f5a28f9c03b0", cargo_flags: "--no-default-features"},
+                {runner: "macos-15-intel", os: "darwin", arch: "x86_64", cargo_flags: ""},
+                {runner: "macos-14", os: "darwin", arch: "aarch64", cargo_flags: ""},
+                {runner: "windows-2022", os: "windows", arch: "x86_64", cargo_flags: ""}
+              ]
+            }'
+          )
+          echo "matrix=$(echo "$matrix" | jq -c .)" >> "$GITHUB_OUTPUT"
 
   build-wheels:
     needs: configure

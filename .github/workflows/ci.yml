@@ -44,7 +44,7 @@ jobs:
         run: uv pip install pip
 
       - name: Add virtual environment to PATH
-        run: echo "$(pwd)/.venv/bin" >> $GITHUB_PATH
+        run: echo "$(pwd)/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Cache pre-commit
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
