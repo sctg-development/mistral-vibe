@@ -49,13 +49,14 @@ def test_environment_accounts_come_before_saved_ones(
     assert api_keys.pooled_keys("VIBE_API_KEY") == ["mstrl_a", "mstrl_b"]
 
 
-def test_key_pool_keeps_the_legacy_harness_unless_unified_is_forced() -> None:
+def test_key_pool_keeps_the_legacy_harness_even_when_unified_is_requested() -> None:
     pooled = harness.resolve_harness_selection(
         experimental_harness=False, legacy_harness=False, key_pool_active=True
     )
-    forced = harness.resolve_harness_selection(
+    # The Rust TUI always starts its app-server with --experimental-harness.
+    requested = harness.resolve_harness_selection(
         experimental_harness=True, legacy_harness=False, key_pool_active=True
     )
 
     assert (pooled.use_unified, pooled.source) == (False, "key-pool")
-    assert forced.use_unified is True
+    assert (requested.use_unified, requested.source) == (False, "key-pool")

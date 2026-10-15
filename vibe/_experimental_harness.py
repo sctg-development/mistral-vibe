@@ -127,20 +127,22 @@ def resolve_harness_selection(
 
     Precedence (highest wins):
       1. ``--legacy-harness``  -> legacy (escape hatch until the cutover)
-      2. ``--experimental-harness`` -> unified
-      3. Several pooled API keys -> legacy (only it can fail over between them)
-      4. Default -> unified
+      2. Several pooled API keys -> legacy (only it can fail over between them)
+      3. ``--experimental-harness`` and the default -> unified
+
+    The pool outranks ``--experimental-harness`` because that flag is redundant
+    (Unified is the default) and the Rust TUI always passes it to its
+    app-server: honoring it would silently disable key rotation there.
     """
     if legacy_harness:
         return HarnessSelection(use_unified=False, source="flag-legacy")
 
-    if experimental_harness:
-        return HarnessSelection(use_unified=True, source="flag")
-
     if key_pool_active:
         return HarnessSelection(use_unified=False, source="key-pool")
 
-    return HarnessSelection(use_unified=True, source="default")
+    return HarnessSelection(
+        use_unified=True, source="flag" if experimental_harness else "default"
+    )
 
 
 def create_experimental_harness_host() -> object:
