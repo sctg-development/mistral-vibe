@@ -18,7 +18,6 @@ from vibe.app_server.protocol import (
     WorkspaceTrustStatusResponse,
     WorkspaceUntrustedConfigResponse,
 )
-from vibe.core.agent_loop import AgentLoop
 from vibe.core.autocompletion.path_prompt import (
     PathPromptPayload,
     PathResource,
@@ -40,7 +39,7 @@ from vibe.user_content import UserTextResource
 from vibe.utils.images import MAX_IMAGES_PER_MESSAGE
 from vibe.utils.io import BoundedReadResult, read_lines_safe, read_lines_safe_async
 
-_MENTIONED_FILE_MAX_BYTES = 50 * 1024
+_MENTIONED_FILE_MAX_BYTES = 64_000
 _MENTIONED_FILE_LINE_LIMIT = 2000
 _MENTIONED_FILE_MAX_FILES = 8
 _TRUNCATED_FILE_NOTE = "\n\n[File mention truncated to fit context limits.]"
@@ -149,19 +148,6 @@ def _workspace_trust_details(prompt: WorkspaceTrustPrompt) -> WorkspaceTrustDeta
             )
         ],
     )
-
-
-def prepare_prompt(agent_loop: AgentLoop, message: str) -> PreparedPrompt:
-    model = agent_loop.config.get_active_model()
-    prompt = prepare_prompt_from_context(
-        message, cwd=agent_loop.cwd, session_dir=agent_loop.session_logger.session_dir
-    )
-    if prompt.images and not model.supports_images:
-        raise PromptPreparationError(
-            f"Model `{model.display_name or model.alias}` does not support images. "
-            "Switch with /model or remove the attachment."
-        )
-    return prompt
 
 
 def prepare_prompt_from_context(

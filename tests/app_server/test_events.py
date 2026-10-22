@@ -3,6 +3,10 @@ from __future__ import annotations
 from pydantic import JsonValue, ValidationError
 import pytest
 
+from vibe.app_server._effect_output_cap import (
+    EFFECT_OUTPUT_TEXT_MAX_CHARS,
+    TRUNCATION_MARKER,
+)
 from vibe.app_server._patch import apply_json_patch
 from vibe.app_server._projector import EventProjector
 from vibe.app_server.events import (
@@ -25,7 +29,10 @@ from vibe.app_server.events import (
 from vibe.app_server.models import (
     ApprovalCallbackDetail,
     CompletedEffectState,
+    EffectCallDisplay,
+    EffectResultDisplay,
     IdleSessionStatus,
+    OpenCallbackState,
     PublicCallbackEntry,
     PublicChildSession,
     PublicEffectEntry,
@@ -33,7 +40,6 @@ from vibe.app_server.models import (
     PublicError,
     PublicMessageEntry,
     PublicQueuedTurn,
-    PublicReasoningEntry,
     PublicRetryCategory,
     PublicRetryState,
     PublicSession,
@@ -42,13 +48,13 @@ from vibe.app_server.models import (
     PublicTurnQueue,
     PublicTurnStatus,
     ResourceContentBlock,
+    RunningEffectState,
     RunningSessionStatus,
     TextContentBlock,
     TokenUsage,
 )
 from vibe.app_server.protocol import (
     ChildSessionUpdatedParams,
-    HistoryEntryAddedParams,
     JsonPatchOperation,
     MCPAuthRequiredParams,
     Notification,
@@ -56,21 +62,19 @@ from vibe.app_server.protocol import (
     TurnQueueUpdatedParams,
     TurnUserInputEntry,
 )
-from vibe.core.tools.builtins.read_file import ReadFile, ReadFileArgs, ReadFileResult
-from vibe.core.tools.ui import ToolUIDataAdapter
+from vibe.core.tools.builtins.read_file import ReadFile, ReadFileArgs
 from vibe.core.types import (
     AssistantEvent,
     BaseEvent,
     ImageAttachment,
     InlineImageSource,
-    ReasoningEvent,
     SessionTitleUpdatedEvent,
     ToolCallEvent,
-    ToolResultEvent,
     ToolStreamEvent,
     UserMessageEvent,
 )
 from vibe.user_content import UserDisplayContent, UserResourceLink
+from vibe.utils.tool_presentation import ToolCallPresentation, ToolEffectKind
 
 
 def _projection() -> ClientProjection:
@@ -486,33 +490,17 @@ def test_live_snapshot_preserves_loaded_history_and_turn_prefixes() -> None:
 
 
 def _read_call() -> ToolCallEvent:
-    event = ToolCallEvent(
+    return ToolCallEvent(
         tool_call_id="tool-1",
         tool_name="read_file",
         tool_class=ReadFile,
         args=ReadFileArgs(file_path="README.md"),
-    )
-    return event.model_copy(
-        update={
-            "presentation": ToolUIDataAdapter(ReadFile).get_call_presentation(event)
-        }
-    )
-
-
-def _read_result() -> ToolResultEvent:
-    event = ToolResultEvent(
-        tool_call_id="tool-1",
-        tool_name="read_file",
-        tool_class=ReadFile,
-        result=ReadFileResult(
-            file_path="README.md", content="hello", num_lines=1, start_line=1
+        presentation=ToolCallPresentation(
+            kind=ToolEffectKind.TOOL,
+            display=EffectCallDisplay(
+                summary="Reading README.md", status_text="Reading"
+            ),
         ),
-        duration=0.25,
-    )
-    return event.model_copy(
-        update={
-            "presentation": ToolUIDataAdapter(ReadFile).get_result_presentation(event)
-        }
     )
 
 
@@ -523,69 +511,65 @@ def test_private_runtime_events_are_not_mirrored_to_public_history() -> None:
     assert projector.history == []
 
 
-def test_tool_is_one_public_lifecycle_entry() -> None:
+def test_streamed_tool_output_stops_at_the_cap() -> None:
     projector = EventProjector("session-1", "turn-1")
-    call = projector.project(_read_call())
-    stream = projector.project(
-        ToolStreamEvent(tool_call_id="tool-1", tool_name="read_file", message="reading")
-    )
-    result = projector.project(_read_result())
+    projector.project(_read_call())
+    chunk = "x" * (EFFECT_OUTPUT_TEXT_MAX_CHARS // 2 + 1)
 
-    assert call[0].method == "history/entryAdded"
-    assert all(update.method == "history/entryUpdated" for update in [*stream, *result])
-    assert len(projector.history) == 1
+    for _ in range(3):
+        projector.project(
+            ToolStreamEvent(tool_call_id="tool-1", tool_name="read_file", message=chunk)
+        )
+
     entry = projector.history[0]
     assert isinstance(entry, PublicEffectEntry)
-    assert isinstance(entry.state, CompletedEffectState)
-    assert entry.generation_status == "completed"
-    assert entry.state.duration_ms == 250
-
-    projection = _projection()
-    added = projection.consume(_notification(1, call[0]))
-    streamed = projection.consume(_notification(2, stream[0]))
-    completed = projection.consume(_notification(3, result[0]))
-    assert isinstance(added, HistoryEntryAdded)
-    assert isinstance(streamed, HistoryEntryUpdated)
-    assert isinstance(completed, HistoryEntryUpdated)
-    reduced = projection.history[0]
-    assert isinstance(reduced, PublicEffectEntry)
-    assert isinstance(reduced.state, CompletedEffectState)
-    assert isinstance(reduced.state.output, dict)
-    assert reduced.state.output["content"] == "hello"
+    assert isinstance(entry.state, RunningEffectState)
+    assert entry.state.output_text == (
+        f"{'x' * EFFECT_OUTPUT_TEXT_MAX_CHARS}{TRUNCATION_MARKER}"
+    )
 
 
-def test_callback_entry_is_emitted_before_related_effect_is_blocked() -> None:
+def test_directly_completed_effect_is_capped() -> None:
     projector = EventProjector("session-1", "turn-1")
     projector.project(_read_call())
 
-    updates = projector.open_callback(
-        "callback-1",
-        ApprovalCallbackDetail(
-            effect=projector.effect_detail("tool-1"), related_entry_id="tool-1"
+    projector.complete_effect(
+        "tool-1",
+        CompletedEffectState(
+            output={"stdout": "x" * (EFFECT_OUTPUT_TEXT_MAX_CHARS * 2)},
+            output_text="x" * (EFFECT_OUTPUT_TEXT_MAX_CHARS * 2),
+            display=EffectResultDisplay(success=True, message="done"),
         ),
-        "Allow read_file?",
     )
 
-    assert [update.method for update in updates] == [
-        "history/entryAdded",
-        "history/entryUpdated",
-    ]
-    assert isinstance(updates[0].params, HistoryEntryAddedParams)
-    assert updates[0].params.entry.type == "callback"
+    entry = projector.history[0]
+    assert isinstance(entry, PublicEffectEntry)
+    assert isinstance(entry.state, CompletedEffectState)
+    capped = f"{'x' * EFFECT_OUTPUT_TEXT_MAX_CHARS}{TRUNCATION_MARKER}"
+    assert entry.state.output_text == capped
+    assert entry.state.output == {"stdout": capped}
 
 
 def test_paged_history_and_callback_redelivery_share_one_identity_index() -> None:
     projector = EventProjector("session-1", "turn-1")
     projector.project(_read_call())
-    projector.open_callback(
-        "callback-1",
-        ApprovalCallbackDetail(
-            effect=projector.effect_detail("tool-1"), related_entry_id="tool-1"
+    read_entry = projector.history[0]
+    assert isinstance(read_entry, PublicEffectEntry)
+    callback = PublicCallbackEntry(
+        id="callback:callback-1",
+        session_id="session-1",
+        turn_id="turn-1",
+        callback_id="callback-1",
+        title="Allow read_file?",
+        generation_status=PublicEntryGenerationStatus.IN_PROGRESS,
+        created_at=1,
+        updated_at=1,
+        detail=ApprovalCallbackDetail(
+            effect=read_entry.detail, related_entry_id="tool-1"
         ),
-        "Allow read_file?",
+        state=OpenCallbackState(),
+        related_entry_id="tool-1",
     )
-    callback = projector.history[-1]
-    assert isinstance(callback, PublicCallbackEntry)
     projection = _projection()
     projection.state.active_callbacks.append(callback)
 
@@ -802,57 +786,6 @@ def test_in_progress_entry_identity_is_frozen() -> None:
         )
 
     assert projector.history[0].turn_id == "turn-1"
-
-
-def test_tool_call_completes_streamed_text_before_adding_effect() -> None:
-    projector = EventProjector("session-1", "turn-1")
-    projector.project(ReasoningEvent(content="thinking", message_id="reasoning-1"))
-    projector.project(AssistantEvent(content="answer", message_id="message-1"))
-
-    updates = projector.project(_read_call())
-
-    assert [update.method for update in updates] == [
-        "history/entryUpdated",
-        "history/entryUpdated",
-        "history/entryAdded",
-    ]
-    reasoning, message, effect = projector.history
-    assert isinstance(reasoning, PublicReasoningEntry)
-    assert isinstance(message, PublicMessageEntry)
-    assert isinstance(effect, PublicEffectEntry)
-    assert reasoning.generation_status == "completed"
-    assert message.generation_status == "completed"
-    assert effect.generation_status == "in_progress"
-
-    # The backend can keep reusing the same message_id for reasoning/text
-    # that streams in after the tool call already completed that entry (seen
-    # with reasoning + speculative decoding on some OpenAI-compatible
-    # backends). That must start a fresh entry, not patch the frozen one.
-    late_updates = projector.project(
-        ReasoningEvent(content="late", message_id="reasoning-1")
-    )
-    assert [update.method for update in late_updates] == ["history/entryAdded"]
-    *_, late_reasoning = projector.history
-    assert isinstance(late_reasoning, PublicReasoningEntry)
-    assert late_reasoning.id != reasoning.id
-    assert late_reasoning.text == "late"
-    assert late_reasoning.generation_status == "in_progress"
-
-
-def test_assistant_text_after_tool_call_reusing_message_id_starts_a_new_entry() -> None:
-    projector = EventProjector("session-1", "turn-1")
-    projector.project(AssistantEvent(content="answer", message_id="message-1"))
-    projector.project(_read_call())
-
-    updates = projector.project(AssistantEvent(content="more", message_id="message-1"))
-
-    assert [update.method for update in updates] == ["history/entryAdded"]
-    message, _effect, late_message = projector.history
-    assert isinstance(message, PublicMessageEntry)
-    assert isinstance(late_message, PublicMessageEntry)
-    assert late_message.id != message.id
-    assert late_message.text == "more"
-    assert late_message.generation_status == "in_progress"
 
 
 def test_event_sequence_rejects_gaps_and_read_resynchronizes() -> None:

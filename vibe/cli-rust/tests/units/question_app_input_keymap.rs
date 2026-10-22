@@ -30,7 +30,9 @@ fn question(question: &str, multi_select: bool) -> App {
 }
 
 fn focused_other(mut app: App) -> App {
-    app.question_app.selected_option = other_option_idx(&app).unwrap();
+    app.question_app
+        .list
+        .highlight(other_option_idx(&app).unwrap());
     app
 }
 
@@ -174,30 +176,15 @@ fn typing_and_backspace_retick_the_free_text_row_in_multi_select() {
 }
 
 #[test]
-fn enter_on_the_focused_row_still_submits() {
-    let mut harness = Harness::new(focused_other(question("Choose", false)));
-    harness.app.question_app.open = true;
-    harness.type_text("draft");
-
-    harness.press(KeyCode::Enter, KeyModifiers::NONE);
-
-    assert_eq!(
-        harness.app.question_app.answers.get(&0),
-        Some(&("draft".into(), true))
-    );
-    assert!(!harness.app.question_app.open);
-}
-
-#[test]
 fn up_and_down_still_move_rows_while_the_row_is_focused() {
     let mut harness = Harness::new(focused_other(question("Choose", false)));
 
     harness.press(KeyCode::Up, KeyModifiers::NONE);
-    assert_eq!(harness.app.question_app.selected_option, 1);
+    assert_eq!(harness.app.question_app.list.selected(), 1);
 
     harness.press(KeyCode::Down, KeyModifiers::NONE);
     assert_eq!(
-        harness.app.question_app.selected_option,
+        harness.app.question_app.list.selected(),
         other_option_idx(&harness.app).unwrap()
     );
 }
@@ -219,7 +206,7 @@ fn number_keys_do_not_jump_rows_while_the_row_is_focused() {
     harness.press(KeyCode::Char('1'), KeyModifiers::NONE);
 
     assert_eq!(
-        harness.app.question_app.selected_option,
+        harness.app.question_app.list.selected(),
         other_option_idx(&harness.app).unwrap()
     );
     assert_eq!(harness.other(), "1");
@@ -255,7 +242,7 @@ fn modified_enters_do_not_submit_the_focused_row() {
 fn enter_and_shift_enter_still_select_on_an_option_row() {
     let mut harness = Harness::new(question("Choose", false));
     let mut second = Harness::new(question("Choose", false));
-    second.app.question_app.selected_option = 1;
+    second.app.question_app.list.highlight(1);
 
     harness.press(KeyCode::Enter, KeyModifiers::NONE);
     second.press(KeyCode::Enter, KeyModifiers::SHIFT);

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
@@ -9,55 +8,28 @@ import json
 import os
 import re
 import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 import httpx
 
 from vibe.core.paths import CONNECTOR_BOOTSTRAP_CACHE_FILE
-from vibe.core.tools.base import (
-    BaseTool,
-    BaseToolConfig,
-    BaseToolState,
-    InvokeContext,
-    ToolError,
-)
+from vibe.core.tools.base import BaseTool, BaseToolConfig, BaseToolState
 from vibe.core.tools.remote import MCPTool, MCPToolResult, RemoteTool, _OpenArgs
-from vibe.core.tools.ui import ToolResultDisplay
-from vibe.core.types import ToolStreamEvent
 from vibe.core.utils import run_sync
-from vibe.core.utils.exceptions import (
-    describe_exception,
-    first_of_type,
-    leaf_exceptions,
-)
+from vibe.core.utils.exceptions import first_of_type
 from vibe.observability.logging import logger
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
-
-if TYPE_CHECKING:
-    from vibe.core.types import ToolResultEvent
 
 _BOOTSTRAP_TIMEOUT = 30.0
 _BOOTSTRAP_CACHE_TTL_SECONDS = 10 * 60
 _SERVER_ERROR_STATUS = 500
-_MCP_SESSION_TERMINATED_CODE = 32600
-
-
-async def call_tool_http(
-    url: str,
-    tool_name: str,
-    arguments: dict[str, Any],
-    *,
-    headers: dict[str, str] | None = None,
-) -> MCPToolResult:
-    from vibe.core.tools.mcp.tools import call_tool_http as call_mcp_tool_http
-
-    return await call_mcp_tool_http(url, tool_name, arguments, headers=headers)
 
 
 class ConnectorAuthAction(StrEnum):
     NONE = "none"
     OAUTH = "oauth"
     CREDENTIALS_SETUP = "credentials_setup"
+    NO_AUTH_CONNECT = "no_auth_connect"
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any] | None) -> ConnectorAuthAction:
@@ -68,6 +40,8 @@ class ConnectorAuthAction(StrEnum):
                 return cls.OAUTH
             case "credentials_setup":
                 return cls.CREDENTIALS_SETUP
+            case "no_auth_connect":
+                return cls.NO_AUTH_CONNECT
             case _:
                 return cls.NONE
 
@@ -233,36 +207,6 @@ def _bootstrap_cache_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _format_http_status_error(
-    exc: httpx.HTTPStatusError, connector_name: str, connector_id: str
-) -> str:
-    """Format an HTTP status error with response body for debugging."""
-    status = exc.response.status_code
-    connector_ref = f"'{connector_name}' (id: {connector_id})"
-    try:
-        body = exc.response.text[:500]
-    except Exception:
-        body = ""
-
-    match status:
-        case 401 | 403:
-            detail = (
-                f"Connector {connector_ref} authentication failed "
-                f"(HTTP {status}). Check your VIBE_API_KEY."
-            )
-        case 404:
-            detail = (
-                f"Connector {connector_ref} not found (HTTP 404). "
-                "It may have been deleted or is not accessible."
-            )
-        case _:
-            detail = f"Connector {connector_ref} request failed (HTTP {status})."
-
-    if body:
-        detail += f"\nServer response: {body}"
-    return detail
-
-
 def _format_connector_bootstrap_errors(bootstrap_errors: Any) -> str:
     """Flatten a connector's per-bootstrap error payload into readable text."""
     if isinstance(bootstrap_errors, list):
@@ -304,66 +248,11 @@ def _unwrap_http_status_error(exc: Exception) -> httpx.HTTPStatusError | None:
     return None
 
 
-def _is_mcp_session_terminated(exc: BaseException) -> bool:
-    from mcp.shared.exceptions import McpError
-
-    # The MCP SDK reports any HTTP 404 from the server as this synthetic error.
-    return (
-        isinstance(exc, McpError)
-        and exc.error.code == _MCP_SESSION_TERMINATED_CODE
-        and exc.error.message == "Session terminated"
-    )
-
-
-def _single_connector_error_message(
-    exc: BaseException, connector_id: str, connector_name: str
-) -> str:
-    if isinstance(exc, httpx.TimeoutException):
-        return (
-            f"Connector '{connector_name}' timed out. "
-            "The remote service may be slow or unreachable."
-        )
-    if isinstance(exc, httpx.ConnectError):
-        return (
-            f"Cannot reach connector proxy for '{connector_name}'. "
-            f"Check your network connection. ({describe_exception(exc)})"
-        )
-    if _is_mcp_session_terminated(exc):
-        return (
-            f"Connector '{connector_name}' (id: {connector_id}) gateway returned "
-            "HTTP 404 (MCP session terminated). If the API is behind a proxy, "
-            "check that it routes /v1/connectors-gateway/ to the Mistral API."
-        )
-    return f"Connector '{connector_name}' call failed: {describe_exception(exc)}"
-
-
-def _connector_error_message(
-    exc: Exception, connector_id: str, connector_name: str
-) -> str:
-    """Return an actionable error message for connector proxy failures."""
-    if http_err := _unwrap_http_status_error(exc):
-        return _format_http_status_error(http_err, connector_name, connector_id)
-    leaves = leaf_exceptions(exc)
-    if len(leaves) == 1:
-        return _single_connector_error_message(leaves[0], connector_id, connector_name)
-    return (
-        f"Connector '{connector_name}' call failed with multiple errors: "
-        + "; ".join(describe_exception(leaf) for leaf in leaves)
-    )
-
-
 def create_connector_proxy_tool_class(
-    *,
-    connector_name: str,
-    connector_alias: str,
-    connector_id: str,
-    remote: RemoteTool,
-    api_key: str,
-    server_url: str | None = None,
+    *, connector_alias: str, remote: RemoteTool
 ) -> type[BaseTool[_OpenArgs, MCPToolResult, BaseToolConfig, BaseToolState]]:
     alias = connector_alias
     published_name = f"connector_{alias}_{remote.name}"
-    base_url = server_url or _DEFAULT_BASE_URL
 
     class ConnectorProxyTool(MCPTool):
         description: ClassVar[str] = f"[{alias}] " + (
@@ -373,10 +262,6 @@ def create_connector_proxy_tool_class(
         _remote_name: ClassVar[str] = remote.name
         _input_schema: ClassVar[dict[str, Any]] = remote.input_schema
         _is_connector: ClassVar[bool] = True
-        _connector_id: ClassVar[str] = connector_id
-        _connector_name: ClassVar[str] = connector_name
-        _api_key: ClassVar[str] = api_key
-        _base_url: ClassVar[str] = base_url
 
         @classmethod
         def get_name(cls) -> str:
@@ -385,45 +270,6 @@ def create_connector_proxy_tool_class(
         @classmethod
         def get_parameters(cls) -> dict[str, Any]:
             return dict(cls._input_schema)
-
-        async def run(
-            self, args: _OpenArgs, ctx: InvokeContext | None = None
-        ) -> AsyncGenerator[ToolStreamEvent | MCPToolResult, None]:
-            url = f"{self._base_url}/v1/connectors-gateway/{self._connector_id}/mcp"
-            headers = {"Authorization": f"Bearer {self._api_key}"}
-            payload = args.model_dump(exclude_none=True)
-            try:
-                yield await call_tool_http(
-                    url, self._remote_name, payload, headers=headers
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Connector call failed connector=%s tool=%s",
-                    self._connector_name,
-                    self._remote_name,
-                    exc_info=exc,
-                )
-                msg = _connector_error_message(
-                    exc, self._connector_id, self._connector_name
-                )
-                raise ToolError(msg) from exc
-
-        @classmethod
-        def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
-            if not isinstance(event.result, MCPToolResult):
-                return ToolResultDisplay(
-                    success=False,
-                    message=event.error or event.skip_reason or "No result",
-                )
-            return ToolResultDisplay(
-                success=event.result.ok,
-                verb="Ran",
-                message=f"connector {event.result.tool}",
-            )
-
-        @classmethod
-        def get_status_text(cls) -> str:
-            return f"Calling connector tool {remote.name}"
 
     ConnectorProxyTool.__name__ = f"Connector_{alias}__{remote.name}"
     return ConnectorProxyTool
@@ -490,19 +336,6 @@ class ConnectorRegistry:
         if catalog_entries is not None:
             self._accept_catalog(catalog_entries)
 
-    def clone_configuration(self) -> ConnectorRegistry:
-        return ConnectorRegistry(
-            api_key=self._api_key,
-            server_url=self._server_url,
-            catalog_entries=self._host_catalog_entries,
-            builtins=self._builtins,
-        )
-
-    def reconfigure(self, entries: tuple[ConnectorCatalogEntry, ...]) -> None:
-        self._host_managed = True
-        self._host_catalog_entries = entries
-        self._accept_catalog(entries)
-
     def _accept_catalog(self, entries: tuple[ConnectorCatalogEntry, ...]) -> None:
         cache: dict[str, dict[str, type[BaseTool]]] = {}
         connector_names: list[str] = []
@@ -521,7 +354,6 @@ class ConnectorRegistry:
                 connector_connected[entry.alias] = False
                 continue
             tools = self._build_tools_for_connector(
-                connector_id=entry.connector_id,
                 alias=entry.alias,
                 name=entry.display_name,
                 raw_tools=[
@@ -599,12 +431,7 @@ class ConnectorRegistry:
         _write_bootstrap_cache_entries(entries)
 
     def _build_tools_for_connector(
-        self,
-        *,
-        connector_id: str,
-        alias: str,
-        name: str,
-        raw_tools: list[dict[str, Any]],
+        self, *, alias: str, name: str, raw_tools: list[dict[str, Any]]
     ) -> dict[str, type[BaseTool]]:
         tools_map: dict[str, type[BaseTool]] = {}
         for tool in raw_tools:
@@ -613,12 +440,7 @@ class ConnectorRegistry:
                 continue
             try:
                 proxy_cls = create_connector_proxy_tool_class(
-                    connector_name=name,
-                    connector_alias=alias,
-                    connector_id=connector_id,
-                    remote=remote,
-                    api_key=self._api_key,
-                    server_url=self._server_url,
+                    connector_alias=alias, remote=remote
                 )
                 tools_map[proxy_cls.get_name()] = proxy_cls
             except Exception:
@@ -701,10 +523,7 @@ class ConnectorRegistry:
                     continue
 
                 tools_map = self._build_tools_for_connector(
-                    connector_id=connector_id,
-                    alias=alias,
-                    name=name,
-                    raw_tools=connector.get("tools") or [],
+                    alias=alias, name=name, raw_tools=connector.get("tools") or []
                 )
                 cache[connector_id] = tools_map
                 all_tools.update(tools_map)
@@ -756,124 +575,6 @@ class ConnectorRegistry:
 
     def get_auth_action(self, alias: str) -> ConnectorAuthAction:
         return self._connector_auth_action.get(alias, ConnectorAuthAction.NONE)
-
-    def get_connector_id(self, alias: str) -> str | None:
-        """Return the API connector ID for a given alias, or None."""
-        return self._alias_to_id.get(alias)
-
-    async def refresh_connector_async(self, alias: str) -> dict[str, type[BaseTool]]:
-        """Re-fetch tools for a single connector by alias.
-
-        Calls the bootstrap endpoint and extracts the matching connector.
-        Updates the internal cache for that connector only. Returns
-        the new tool map (empty dict on failure).
-        """
-        connector_id = self._alias_to_id.get(alias)
-        if connector_id is None:
-            return {}
-        if self._host_managed:
-            return dict((self._cache or {}).get(connector_id, {}))
-
-        tools_map: dict[str, type[BaseTool]] | None = None
-        fresh_auth_action: ConnectorAuthAction | None = None
-        fresh_error: str | None = None
-        found = False
-        fetch_ok = False
-        try:
-            data = await self._fetch_bootstrap()
-            fetch_ok = True
-            self._write_cached_bootstrap(data)
-            for connector in data.get("connectors") or []:
-                if str(connector.get("id")) != connector_id:
-                    continue
-
-                found = True
-                name = connector.get("name") or connector_id
-                fresh_auth_action = ConnectorAuthAction.from_payload(
-                    connector.get("auth_action")
-                )
-                if bootstrap_errors := connector.get("bootstrap_errors"):
-                    fresh_error = _format_connector_bootstrap_errors(bootstrap_errors)
-                status = connector.get("status") or {}
-                if not status.get("is_ready", False):
-                    break
-
-                tools_map = self._build_tools_for_connector(
-                    connector_id=connector_id,
-                    alias=alias,
-                    name=name,
-                    raw_tools=connector.get("tools") or [],
-                )
-                break
-        except Exception:
-            logger.debug("Failed to refresh connector %s", alias)
-
-        if self._cache is None:
-            self._cache = {}
-
-        if fetch_ok and not found:
-            self._drop_connector(alias, connector_id)
-            return {}
-
-        if fresh_auth_action is not None:
-            self._connector_auth_action[alias] = fresh_auth_action
-
-        if fetch_ok and found:
-            if fresh_error is not None:
-                self._connector_errors[alias] = fresh_error
-            else:
-                self._connector_errors.pop(alias, None)
-
-        if tools_map is None:
-            self._cache.pop(connector_id, None)
-            self._connector_connected[alias] = False
-            return {}
-
-        self._cache[connector_id] = tools_map
-        self._connector_connected[alias] = bool(tools_map)
-        return tools_map
-
-    def _drop_connector(self, alias: str, connector_id: str) -> None:
-        if self._cache is not None:
-            self._cache.pop(connector_id, None)
-        self._connector_connected.pop(alias, None)
-        self._connector_auth_action.pop(alias, None)
-        self._connector_errors.pop(alias, None)
-        self._alias_to_id.pop(alias, None)
-        if alias in self._connector_names:
-            self._connector_names.remove(alias)
-
-    async def get_auth_url(self, alias: str) -> str | None:
-        """Return the OAuth authorization URL for a connector, or None.
-
-        Returns None when the connector does not support OAuth or the
-        alias is unknown.
-        """
-        connector_id = self._alias_to_id.get(alias)
-        if connector_id is None:
-            return None
-        try:
-            http_client = VibeAsyncHTTPClient(
-                verify=build_ssl_context(), follow_redirects=True
-            )
-            try:
-                from mistralai.client import Mistral
-
-                sdk_client = Mistral(
-                    api_key=self._api_key,
-                    server_url=self._server_url,
-                    async_client=http_client,
-                )
-                async with sdk_client as client:
-                    result = await client.beta.connectors.get_auth_url_async(
-                        connector_id_or_name=connector_id
-                    )
-                return result.auth_url
-            finally:
-                await http_client.aclose()
-        except Exception:
-            logger.debug("Failed to get auth URL for connector %s", alias)
-            return None
 
     def clear(self) -> None:
         if self._host_catalog_entries is not None:

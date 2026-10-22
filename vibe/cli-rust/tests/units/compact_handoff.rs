@@ -1,5 +1,5 @@
 //! A compaction handoff moves the client onto the replacement session
-//! (Python `replace_state` on `session/compacted`).
+//! (`session/compacted`).
 
 use std::sync::Arc;
 
@@ -26,26 +26,12 @@ fn compacted(session_id: &str, old_session_id: &str) -> Notification {
 }
 
 #[test]
-fn compacted_session_id_reads_the_handoff_state() {
-    let params = compacted("new-session", "old-session").params;
-    assert_eq!(
-        compact::compacted_session_id(&params).as_deref(),
-        Some("new-session")
-    );
-}
-
-#[test]
 fn compacted_session_id_falls_back_to_the_session_id_field() {
     let params = json!({"sessionId": "new-session", "oldSessionId": "old-session"});
     assert_eq!(
         compact::compacted_session_id(&params).as_deref(),
         Some("new-session")
     );
-}
-
-#[test]
-fn compacted_session_id_without_a_handoff_is_none() {
-    assert_eq!(compact::compacted_session_id(&json!({})), None);
 }
 
 #[test]

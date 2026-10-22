@@ -71,15 +71,6 @@ class ModelCall:
         )
 
 
-class IncompleteStreamError(RuntimeError):
-    def __init__(self, provider: str, model: str) -> None:
-        self.provider = provider
-        self.model = model
-        super().__init__(
-            f"Model stream from {provider} ({model}) ended without a finish reason."
-        )
-
-
 class BackendError(RuntimeError):
     def __init__(
         self,

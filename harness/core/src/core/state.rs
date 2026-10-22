@@ -15,7 +15,7 @@ use crate::core::step_protocol::{
     CommandState, PendingActionInspection, PendingCompletionPurpose,
     PendingFilesystemOperationInspection, SessionStatus, Turn,
 };
-use crate::core::step_protocol::{Observation, Outcome, TurnCompletion};
+use crate::core::step_protocol::{DeterminismContext, Observation, Outcome, TurnCompletion};
 use crate::core::tools::context::ToolContext;
 use crate::core::tools::execution::ToolBatch;
 use crate::core::tools::resolved::ResolvedTools;
@@ -72,6 +72,7 @@ impl PartialEq for ToolCatalogLedger {
 }
 
 pub(crate) struct StateInspection {
+    pub(crate) has_pending_model_input: bool,
     pub(crate) status: SessionStatus,
     pub(crate) active_turn_id: Option<String>,
     pub(crate) last_turn_id: Option<String>,
@@ -100,7 +101,12 @@ impl HarnessState {
             TurnState::Active(_) | TurnState::Compacting { .. } => Delivery::Deferred,
             TurnState::Idle | TurnState::Terminal { .. } => Delivery::Immediate,
         };
-        let acceptance = self.notifications.accept(notification.clone(), delivery)?;
+        let acceptance = self.notifications.accept(
+            notification.clone(),
+            delivery,
+            &self.config.settings.context.notifications,
+            self.active().map_or(0, |active| active.pending_steer.len()),
+        )?;
         if matches!(acceptance, Acceptance::Duplicate) {
             return Ok(Outcome::quiet());
         }
@@ -196,6 +202,7 @@ impl HarnessState {
                     compaction_id: pending.compaction_id().to_string(),
                     trigger: pending.trigger(),
                     attempt: pending.attempt(),
+                    request: pending.projection().request_kind(),
                 },
                 0,
             )],
@@ -215,6 +222,7 @@ impl HarnessState {
                         compaction_id: pending.compaction_id().to_string(),
                         trigger: pending.trigger(),
                         attempt: pending.attempt(),
+                        request: pending.projection().request_kind(),
                     },
                     active.iterations,
                 )],
@@ -391,6 +399,7 @@ impl HarnessState {
             })
             .collect();
         StateInspection {
+            has_pending_model_input: self.has_pending_model_input(),
             status,
             active_turn_id: self.active_turn_id().map(str::to_string),
             last_turn_id: self.last_finished_turn_id.clone(),
@@ -441,7 +450,8 @@ impl HarnessState {
     pub(crate) fn finish_turn(&mut self, outcome: TurnOutcome) -> Result<String, CoreError> {
         let turn_id = match std::mem::replace(&mut self.turn, TurnState::Idle) {
             TurnState::Active(mut active) => {
-                self.context.extend(active.take_pending_steer());
+                self.context
+                    .extend_current_turn(active.take_pending_steer());
                 active.turn_id
             }
             restored => {
@@ -503,6 +513,7 @@ fn completion_action(
 /// "completed with both an output and a rejection reason", are no longer
 /// representable.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // One state per Session; boxing would only add indirection.
 pub(crate) enum TurnState {
     Idle,
     Compacting {
@@ -526,6 +537,9 @@ pub(crate) struct ActiveTurn {
     /// pending steering and notifications may be included in the next agent
     /// completion Action.
     pub model_input_ready: bool,
+    /// Agent completions this turn discarded because they reached the output
+    /// token limit; bounded by `settings.turn.output_limit_recovery`.
+    pub output_limit_retries: u32,
     /// User messages that arrived mid-turn and start the next turn once this
     /// one completes normally. Scoped to the active turn, so terminating a turn
     /// discards them rather than carrying a stale turn id into the next one.
@@ -585,7 +599,9 @@ impl ActiveTurn {
 impl ActivePhase {
     pub(crate) fn interrupt(
         &self,
+        tools: &ToolContext<'_>,
         interruption_message: &str,
+        determinism: DeterminismContext,
     ) -> Result<InterruptionResolution, CoreError> {
         match self {
             Self::AwaitingCompletion { action_id } => {
@@ -596,7 +612,11 @@ impl ActivePhase {
             Self::AwaitingCompaction { .. } => Ok(InterruptionResolution::Quiet),
             Self::AwaitingToolBatch { batch, .. } => {
                 Ok(InterruptionResolution::CommitToolMessages {
-                    messages: batch.interrupted_messages(interruption_message)?,
+                    messages: batch.interrupted_messages(
+                        tools,
+                        interruption_message,
+                        determinism,
+                    )?,
                 })
             }
             Self::AwaitingHook { pending } => match pending.interrupted_completion_action_id() {

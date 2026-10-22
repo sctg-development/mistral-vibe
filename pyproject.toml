@@ -1,6 +1,6 @@
 [project]
 name = "mistral-vibe"
-version = "2.26.1"
+version = "3.0.1"
 description = "Minimal CLI coding agent by Mistral"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,6 +21,8 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Utilities",
@@ -131,8 +133,8 @@ dependencies = [
 [project.optional-dependencies]
 # Opt-in for aarch64 Linux, where upstream publishes no miniaudio wheel. The
 # default install needs no C++ toolchain; uv tool install "mistral-vibe[voice-aarch64]"
-# resolves the prebuilt manylinux wheel the release CI publishes to Gemfury
-# (see the miniaudio-aarch64 job in vibe-release-gemfury.yaml).
+# resolves the prebuilt manylinux wheel the release CI publishes to Artifact Registry
+# (see the miniaudio-aarch64 job in vibe-release-internal.yaml).
 voice-aarch64 = ["miniaudio>=1.59"]
 
 [project.urls]

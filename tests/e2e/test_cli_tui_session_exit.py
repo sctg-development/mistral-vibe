@@ -13,7 +13,6 @@ import pytest
 
 from tests.e2e.common import (
     SpawnedVibeProcessFixture,
-    ansi_tolerant_pattern,
     poll_until,
     send_ctrl_c_until_quit_confirmation,
     strip_ansi,
@@ -109,7 +108,7 @@ def _finish_turn(
         expected_count=expected_request_count,
         timeout=10,
     )
-    child.expect(ansi_tolerant_pattern(expected_reply), timeout=10)
+    wait_for_rendered_text(child, captured, expected_reply, timeout=10)
 
     start = time.monotonic()
     last_change = start

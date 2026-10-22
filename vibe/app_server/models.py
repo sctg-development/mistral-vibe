@@ -434,6 +434,8 @@ class TokenUsage(ProtocolModel):
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    # The part of ``input_tokens`` the provider served from its prompt cache.
+    cached_input_tokens: int = 0
 
 
 class AgentStatsSnapshot(ProtocolModel):
@@ -484,6 +486,7 @@ class AgentStatsSnapshot(ProtocolModel):
             input_tokens=self.session_prompt_tokens,
             output_tokens=self.session_completion_tokens,
             total_tokens=self.session_total_llm_tokens,
+            cached_input_tokens=self.session_cached_tokens,
         )
 
 
@@ -775,6 +778,7 @@ class MCPSourceStatus(StrEnum):
     ENABLED = auto()
     NEEDS_AUTH = auto()
     NEEDS_SETUP = auto()
+    NEEDS_CONNECT = auto()
     UNAVAILABLE = auto()
 
 
@@ -810,6 +814,7 @@ class MCPState(ProtocolModel):
     discovery_errors: dict[str, str] = Field(default_factory=dict)
     connector_error: str | None = None
     manage_connectors_url: str | None = None
+    private_connectors_hidden: bool = False
 
     def resolve_source(self, query: str) -> MCPSourceSummary | None:
         # `/mcp <query>` takes an alias, or the display name the browser shows.
@@ -853,23 +858,6 @@ class SessionLogSummary(ProtocolModel):
     path: str | None = None
     title: str | None = None
     needs_initial_auto_title: bool = False
-
-
-class SavedSessionSummary(ProtocolModel):
-    session_id: str
-    cwd: str
-    parent_session_id: str | None = None
-    title: str | None = None
-    end_time: str | None = None
-    preview: str = ""
-
-    @property
-    def option_id(self) -> str:
-        return self.session_id
-
-    @property
-    def short_id(self) -> str:
-        return self.session_id[:8]
 
 
 class PendingEffectState(ProtocolModel):
@@ -984,12 +972,31 @@ class _PublicHistoryEntryBase(ProtocolModel):
 type PublicMessageSource = Literal["turn_start", "turn_steer", "harness"]
 
 
+class CommittedGenerationOutcome(ProtocolModel):
+    type: Literal["committed"] = "committed"
+
+
+class DiscardedGenerationOutcome(ProtocolModel):
+    type: Literal["discarded"] = "discarded"
+    # Any string, not the Harness's current set: an app-server must not reject
+    # an entry over a cause a newer Harness added.
+    cause: str
+
+
+# Whether completed assistant output was kept or discarded, and why. Unset while
+# the entry is generating and on entries a Harness does not settle.
+type GenerationOutcome = Annotated[
+    CommittedGenerationOutcome | DiscardedGenerationOutcome, Field(discriminator="type")
+]
+
+
 class PublicMessageEntry(_PublicHistoryEntryBase):
     type: Literal["message"] = "message"
     role: Literal["system", "user", "assistant"]
     content: list[ContentBlock]
     source: PublicMessageSource | None = None
     user_display_content: UserDisplayContent | None = None
+    outcome: GenerationOutcome | None = None
 
     @property
     def text(self) -> str:
@@ -1010,6 +1017,7 @@ class PublicReasoningEntry(_PublicHistoryEntryBase):
     type: Literal["reasoning"] = "reasoning"
     text: str
     summary: list[str] = Field(default_factory=list)
+    outcome: GenerationOutcome | None = None
 
 
 class PublicEffectEntry(_PublicHistoryEntryBase):
@@ -1056,23 +1064,9 @@ class AgentChangedNoticeDetail(ProtocolModel):
     agent_name: str
 
 
-class ContextClearedNoticeDetail(ProtocolModel):
-    kind: Literal["context_cleared"] = "context_cleared"
-    plan_file_path: str | None = None
-
-
 class SessionTitleUpdatedNoticeDetail(ProtocolModel):
     kind: Literal["session_title_updated"] = "session_title_updated"
     title: str
-
-
-class PlanReviewStartedNoticeDetail(ProtocolModel):
-    kind: Literal["plan_review_started"] = "plan_review_started"
-    file_path: str
-
-
-class PlanReviewEndedNoticeDetail(ProtocolModel):
-    kind: Literal["plan_review_ended"] = "plan_review_ended"
 
 
 class WaitingForInputNoticeDetail(ProtocolModel):
@@ -1090,10 +1084,7 @@ class ScheduledLoopFiredNoticeDetail(ProtocolModel):
 NoticeDetail = Annotated[
     HookNoticeDetail
     | AgentChangedNoticeDetail
-    | ContextClearedNoticeDetail
     | SessionTitleUpdatedNoticeDetail
-    | PlanReviewStartedNoticeDetail
-    | PlanReviewEndedNoticeDetail
     | WaitingForInputNoticeDetail
     | ScheduledLoopFiredNoticeDetail,
     Field(discriminator="kind"),
@@ -1224,6 +1215,18 @@ class PublicSession(ProtocolModel):
     token_usage: TokenUsage | None = None
     context_usage: TokenUsage | None = None
     harness: Literal["legacy", "unified"] | None = None
+    # Scheduled loops persisted for this session. The additive default keeps
+    # old clients and old servers working (ADR 0014).
+    loops: list[ScheduledLoop] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _default_bumped_at(self) -> Self:
+        # A session that has not started a user turn yet ranks by its creation.
+        # Clients that each picked their own fallback ranked it differently
+        # depending on the endpoint that answered, so the session moved.
+        if self.bumped_at is None:
+            self.bumped_at = self.created_at
+        return self
 
 
 class PublicChildSession(ProtocolModel):
@@ -1251,10 +1254,17 @@ class PublicQueuedTurn(ProtocolModel):
 TURN_QUEUE_MAX_ITEMS = 32
 
 
+class PublicTurnQueueEditState(ProtocolModel):
+    queue_item_id: str
+
+
 class PublicTurnQueue(ProtocolModel):
     items: list[PublicQueuedTurn] = Field(default_factory=list)
     paused: bool = False
     max_items: int = Field(default=TURN_QUEUE_MAX_ITEMS, ge=1, strict=True)
+    editing: PublicTurnQueueEditState | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class PublicTurn(ProtocolModel):
@@ -1292,6 +1302,31 @@ class PublicBackgroundProcess(ProtocolModel):
     created_at: str
 
 
+class ImportJobStatus(StrEnum):
+    QUEUED = auto()
+    RUNNING = auto()
+    COMPLETED = auto()
+    FAILED = auto()
+
+
+class ImportHarness(StrEnum):
+    CLAUDE = auto()
+
+
+class ImportHarnessDiscovery(ProtocolModel):
+    harness: ImportHarness
+    project_count: int = Field(ge=0, strict=True)
+    session_count: int = Field(ge=0, strict=True)
+
+
+class ImportJob(ProtocolModel):
+    id: str
+    status: ImportJobStatus
+    message: str | None = None
+    created_at: int
+    updated_at: int
+
+
 class PublicSessionState(ProtocolModel):
     format: Literal["vibe.public-session-state/v1"] = "vibe.public-session-state/v1"
     event_id: int = Field(ge=0, strict=True)
@@ -1325,11 +1360,3 @@ class ScheduledLoop(ProtocolModel):
     interval_seconds: int | None = None
     cron: str | None = Field(default=None, exclude_if=lambda value: value is None)
     next_fire_at: float
-
-
-class CompactionDetails(ProtocolModel):
-    current_context_tokens: int | None = None
-    threshold: int | None = None
-    summary_length: int | None = None
-    old_session_id: str | None = None
-    new_session_id: str | None = None

@@ -36,11 +36,17 @@ fn config_with_post_llm_hook() -> HarnessConfig {
 }
 
 fn input(input_id: u64, command: Value) -> HarnessInput {
+    input_at(input_id, input_id, command)
+}
+
+/// An input whose clock reads `time_offset_ms` after the test epoch, for a
+/// restored session that renumbers inputs but keeps the original clock.
+fn input_at(input_id: u64, time_offset_ms: u64, command: Value) -> HarnessInput {
     serde_json::from_value(json!({
         "protocol_version": 1,
         "input_id": input_id,
         "determinism": {
-            "time_unix_ms": 1_700_000_000_000_u64 + input_id,
+            "time_unix_ms": 1_700_000_000_000_u64 + time_offset_ms,
             "random_seed": input_id,
         },
         "command": command,
@@ -160,6 +166,7 @@ fn inspection_serializes_the_idle_running_and_completed_lifecycle() {
             "message_count": 0,
             "context_revision": 0,
             "tool_catalog_revision": 0,
+            "has_pending_model_input": false,
             "last_input_id": 0,
         })
     );
@@ -178,6 +185,7 @@ fn inspection_serializes_the_idle_running_and_completed_lifecycle() {
             "message_count": 2,
             "context_revision": 1,
             "tool_catalog_revision": 0,
+            "has_pending_model_input": false,
             "last_input_id": 1,
         })
     );
@@ -193,6 +201,7 @@ fn inspection_serializes_the_idle_running_and_completed_lifecycle() {
             "message_count": 3,
             "context_revision": 2,
             "tool_catalog_revision": 0,
+            "has_pending_model_input": false,
             "last_input_id": 2,
         })
     );

@@ -17,14 +17,32 @@ import truststore
 from vibe import __version__
 
 _use_system_trust_store = False
+# Set by `pin_ssl_context`: the trust store no longer follows each config load.
+_pinned = False
 
 
 def configure_ssl_context(*, enable_system_trust_store: bool) -> None:
+    """Use the system trust store, or certifi's, for the process's TLS.
+
+    Does nothing once :func:`pin_ssl_context` has fixed it.
+    """
     global _use_system_trust_store
-    if _use_system_trust_store == enable_system_trust_store:
+    if _pinned or _use_system_trust_store == enable_system_trust_store:
         return
     _use_system_trust_store = enable_system_trust_store
     build_ssl_context.cache_clear()
+
+
+def pin_ssl_context(*, enable_system_trust_store: bool) -> None:
+    """Fix the process's trust store, whatever configs it loads later.
+
+    For a process serving many configs at once, where the store, being the
+    process's, cannot follow each.
+    """
+    global _pinned
+    _pinned = False
+    configure_ssl_context(enable_system_trust_store=enable_system_trust_store)
+    _pinned = True
 
 
 @functools.lru_cache(maxsize=1)
@@ -33,6 +51,9 @@ def build_ssl_context() -> ssl.SSLContext:
         ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     else:
         ctx = ssl.create_default_context(cafile=certifi.where())
+        # Match the Python 3.13+ defaults on 3.12: strict RFC 5280 checks, and
+        # a trusted intermediate may anchor a chain.
+        ctx.verify_flags |= ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
 
     # Custom certs are additive so private-CA users don't lose public roots.
     ssl_cert_file = os.getenv("SSL_CERT_FILE")
@@ -48,6 +69,21 @@ def build_ssl_context() -> ssl.SSLContext:
                 ssl_cert_file,
                 ssl_cert_dir,
             )
+        else:
+            if not _use_system_trust_store:
+                # The Certifi context validates chains with strict RFC 5280
+                # checks (VERIFY_X509_STRICT); the truststore context does
+                # not, so only warn on this path.
+                from vibe.observability.logging import logger
+
+                logger.warning(
+                    "Loaded custom SSL certificates (SSL_CERT_FILE=%s SSL_CERT_DIR=%s); "
+                    "certificate chains are validated with strict RFC 5280 checks, "
+                    "so a private CA missing SKID/AKID or KeyUsage extensions will "
+                    "be rejected",
+                    ssl_cert_file,
+                    ssl_cert_dir,
+                )
     return ctx
 
 
@@ -244,4 +280,5 @@ __all__ = [
     "configure_ssl_context",
     "get_server_url_from_api_base",
     "get_user_agent",
+    "pin_ssl_context",
 ]

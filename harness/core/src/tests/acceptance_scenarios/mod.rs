@@ -4,12 +4,17 @@
 
 use super::*;
 
+mod agents;
 mod async_features;
+mod builtin_features;
 mod compaction;
 mod completion_and_tools;
+mod conversation;
 mod hooks;
 mod large_output;
+mod model_wait;
 mod permissions;
+mod program_timing;
 mod recovery;
 mod runtime_driver;
 mod steering;
@@ -17,6 +22,17 @@ mod tool_argument_validation;
 mod turn_lifecycle;
 
 use runtime_driver::*;
+
+/// The call list Core adds to a failed or interrupted `run_typescript`
+/// result, from its entry lines.
+fn program_call_summary(entries: &[&str]) -> String {
+    let mut lines = vec!["Calls, in order:".to_string()];
+    lines.extend(entries.iter().map(|entry| entry.to_string()));
+    if entries.iter().any(|entry| entry.ends_with(": done")) {
+        lines.push("Do not repeat done calls; continue with the rest.".to_string());
+    }
+    lines.join("\n")
+}
 
 fn tool_call(id: &str, name: &str, arguments: Value) -> Value {
     json!({
@@ -91,6 +107,20 @@ fn run_typescript_success(structured_content: Value) -> Value {
     })
 }
 
+/// Stands in for the V8 stack of an uncaught program error; see
+/// `runtime_driver::without_program_error_stacks`.
+const PROGRAM_ERROR_STACK: &str = "<stack>";
+
+/// The `run_typescript` failure for an uncaught JavaScript error.
+fn run_typescript_uncaught_error(name: &str, message: &str) -> Value {
+    let error = json!({"name": name, "message": message, "stack": PROGRAM_ERROR_STACK});
+    json!({
+        "type": "failure",
+        "content": [{"type": "text", "text": format!("run_typescript failed: {error}")}],
+        "error": {"code": name, "message": message, "retryable": false, "details": null},
+    })
+}
+
 fn file_read_success(action: &Value, content: &str) -> Value {
     structured_tool_success(
         action,
@@ -115,14 +145,6 @@ fn hook_completed(action: &Value, hook: &str, output: Value) -> Value {
             "output": output,
         },
     })
-}
-
-fn pre_llm_continue_with_context(context: &[(&str, &str)]) -> Value {
-    let context_messages = context
-        .iter()
-        .map(|(key, text)| json!({"key": key, "content": [{"type": "text", "text": text}]}))
-        .collect::<Vec<_>>();
-    json!({"type": "continue", "context_messages": context_messages})
 }
 
 fn turn_started(turn_id: &str, text: &str) -> Value {
@@ -210,6 +232,7 @@ fn tool_result_committed(turn_id: &str, action: &Value, result: Value) -> Value 
         "turn_id": turn_id,
         "action_id": action_id(action),
         "call_id": action["call_id"],
+        "call": action["call"],
         "result": result,
     })
 }
@@ -272,6 +295,15 @@ fn turn_completed_at_iteration_limit(turn_id: &str, output: Vec<Value>) -> Value
         "turn_id": turn_id,
         "output": output,
         "stop_reason": "iteration_limit",
+    })
+}
+
+fn turn_completed_skipped(turn_id: &str, reason: Vec<Value>) -> Value {
+    json!({
+        "type": "turn_completed",
+        "turn_id": turn_id,
+        "output": reason,
+        "stop_reason": "skipped",
     })
 }
 

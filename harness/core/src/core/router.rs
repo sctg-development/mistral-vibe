@@ -38,6 +38,28 @@ pub(crate) fn reduce(
             },
             determinism,
         ),
+        HarnessCommand::AgentMessage {
+            turn_id,
+            message,
+            mode,
+        } => dispatch(
+            state,
+            TurnEvent::UserMessage {
+                turn_id,
+                content: crate::core::helpers::render_agent_message(
+                    message,
+                    &state.config.settings.prompts.agent_messages,
+                    state
+                        .config
+                        .settings
+                        .tools
+                        .subagents
+                        .messages_resume_idle_children(),
+                )?,
+                mode,
+            },
+            determinism,
+        ),
         HarnessCommand::UserMessage {
             turn_id,
             content,

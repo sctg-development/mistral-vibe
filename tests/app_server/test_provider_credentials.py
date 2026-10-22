@@ -8,9 +8,12 @@ the Unified path sending a header the legacy path stopped sending.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import asyncio
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import PropertyMock, patch
 
+import keyring
+from keyring.errors import KeyringError
 import pytest
 
 from tests.conftest import build_test_vibe_config
@@ -22,6 +25,7 @@ from vibe.core.llm.exceptions import BackendError, PayloadSummary
 from vibe.core.types import LLMMessage, Role
 import vibe.utils.api_keys as api_keys
 from vibe.utils.api_keys import ApiKeyOrigin, ApiKeySource
+import vibe.utils.keyring as keyring_utils
 
 if TYPE_CHECKING:
     from vibe.core.config.orchestrator import ConfigOrchestrator
@@ -197,6 +201,57 @@ async def test_a_missing_key_is_a_state_not_a_failure(
     assert result.reason == "missing"
     assert result.provider == "primary"
     assert "PRIMARY_KEY" in result.message
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_keyring_is_named_instead_of_a_missing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = ProviderCredentialService(_orchestrator(_config(_provider("primary"))))
+    monkeypatch.delenv("PRIMARY_KEY")
+
+    def _locked(service_name: str, username: str) -> str | None:
+        raise KeyringError("keychain locked")
+
+    monkeypatch.setattr(keyring, "get_password", _locked)
+
+    result = await service.resolve()
+
+    assert isinstance(result, ProviderAuthRequired)
+    assert result.reason == "missing"
+    assert "Can't read PRIMARY_KEY from the system keyring" in result.message
+    assert "keychain locked" in result.message
+    assert "Missing PRIMARY_KEY" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_a_turn_after_the_keyring_is_unlocked_reads_it_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = ProviderCredentialService(_orchestrator(_config(_provider("primary"))))
+    monkeypatch.delenv("PRIMARY_KEY")
+    elapsed = [0.0]
+    real_monotonic = keyring_utils.time.monotonic
+    monkeypatch.setattr(
+        keyring_utils.time, "monotonic", lambda: real_monotonic() + elapsed[0]
+    )
+    locked = True
+
+    def _get(service_name: str, username: str) -> str | None:
+        if locked:
+            raise KeyringError("keychain locked")
+        return "unlocked-key"
+
+    monkeypatch.setattr(keyring, "get_password", _get)
+    assert isinstance(await service.resolve(), ProviderAuthRequired)
+
+    locked = False
+    elapsed[0] = keyring_utils.READ_FAILURE_TTL_SECONDS
+
+    result = await service.resolve()
+
+    assert isinstance(result, ProviderCredentialSnapshot)
+    assert keyring_utils.keyring_read_failure("PRIMARY_KEY") is None
 
 
 @pytest.mark.asyncio
@@ -394,6 +449,37 @@ async def test_a_credential_says_which_source_it_came_from(
     assert isinstance(from_keyring, ProviderCredentialSnapshot)
     assert from_env.api_key_source == "env var PRIMARY_KEY"
     assert from_keyring.api_key_source == "the keyring"
+
+
+@pytest.mark.asyncio
+async def test_each_session_resolves_its_own_credentials_before_the_process_key() -> (
+    None
+):
+    """*Prepare*: Three services on one config: two with credentials of their
+    own for the provider's variable, one without.
+    *Do*: Resolve all three at once.
+    *Assert*: Each with credentials sends its own, named as the run's; the
+    other sends the process's key.
+    """
+    # Prepare
+    orchestrator = _orchestrator(_config(_provider("primary")))
+    first = ProviderCredentialService(
+        orchestrator, credentials={"PRIMARY_KEY": "run-a-secret"}
+    )
+    second = ProviderCredentialService(
+        orchestrator, credentials={"PRIMARY_KEY": "run-b-secret"}
+    )
+    plain = ProviderCredentialService(orchestrator)
+
+    # Do
+    results = await asyncio.gather(first.resolve(), second.resolve(), plain.resolve())
+
+    # Assert
+    assert all(isinstance(result, ProviderCredentialSnapshot) for result in results)
+    tokens = [cast(ProviderCredentialSnapshot, result).token for result in results]
+    assert tokens == ["run-a-secret", "run-b-secret", "primary-secret"]
+    first_result = cast(ProviderCredentialSnapshot, results[0])
+    assert first_result.api_key_source == "the run's credential PRIMARY_KEY"
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ import weakref
 import pytest
 
 from vibe.app_server._runtime import HarnessServer, create_harness_server
-from vibe.app_server.multiplex import serve_multiplexed
+from vibe.app_server.multiplex import ChannelOpen, serve_multiplexed
 from vibe.app_server.server import AppServer
 from vibe.app_server.transport import JsonRpcTransport, memory_transport_pair
 
@@ -43,10 +43,10 @@ thinking = "off"
     client, transport = memory_transport_pair()
     references: list[weakref.ReferenceType[AppServer]] = []
 
-    async def factory(channel: JsonRpcTransport) -> HarnessServer:
-        server = await create_harness_server(
-            channel, transport_kind="stdio", experimental_harness=True
-        )
+    async def factory(
+        channel: JsonRpcTransport, _options: ChannelOpen | None
+    ) -> HarnessServer:
+        server = await create_harness_server(channel, transport_kind="stdio")
         references.append(weakref.ref(server._server))
         return server
 

@@ -51,6 +51,7 @@ from vibe.app_server.protocol import (
     ConnectorAuthUrlParams,
     ConnectorCatalogAuthRequestParams,
     ConnectorCatalogAuthRequestResponse,
+    ConnectorCatalogConnectParams,
     ConnectorCatalogEntryView,
     ConnectorCatalogMutationResponse,
     ConnectorCatalogReadParams,
@@ -79,6 +80,7 @@ from vibe.core.tools.connectors.connector_registry import builtin_connectors
 from vibe.core.tools.mcp_settings import persist_mcp_toggle
 from vibe.core.utils.matching import name_matches
 from vibe.observability.logging import logger
+from vibe.setup.auth.whoami import WhoAmICache, load_cached_whoami
 from vibe.utils.http import (
     VibeAsyncHTTPClient,
     build_ssl_context,
@@ -104,6 +106,12 @@ _DEFAULT_BUILTIN_CONNECTORS = builtin_connectors(
 
 # Resolves the caller's org/workspace once per (base_url, api_key) for the console link.
 _IDENTITY_CACHE = IdentityCache()
+_WHOAMI_CACHE = WhoAmICache()
+# Last /whoami failure per key, so an unreachable console doesn't slow every read.
+_WHOAMI_FAILED_AT: dict[tuple[str, str], float] = {}
+_WHOAMI_RETRY_SECONDS = 5 * 60
+# Caps how long a cache miss can delay /mcp for the shared-only warning.
+_WHOAMI_TIMEOUT_SECONDS = 2.0
 _BOOTSTRAP_CACHE_FORMAT = 2
 _BOOTSTRAP_CACHE_TTL_SECONDS = 10 * 60
 _BOOTSTRAP_TIMEOUT_SECONDS = 30.0
@@ -114,6 +122,8 @@ _MAX_DIAGNOSTICS_PER_CONNECTOR = 3
 _MAX_DIAGNOSTIC_CHARACTERS = 512
 _MAX_CACHE_ENTRY_BYTES = 2 * 1024 * 1024
 _MAX_PUBLIC_NAME_CHARACTERS = 256
+# The dashboard names a no-auth connection this way; reusing it keeps one row.
+_DEFAULT_CONNECTION_NAME = "default"
 _ALIASES = {
     "connectors/read": "connector_catalog/read",
     "connectors/refresh": "connector_catalog/refresh",
@@ -551,6 +561,10 @@ class ConnectorCatalogService:
                 response, broker = await self._request_auth(params, root, notify)
                 runtime_updated = False
                 after_response = broker
+            case "connector_catalog/connect":
+                params = validate_wire(ConnectorCatalogConnectParams, raw_params)
+                response, runtime_updated = await self._connect(params, root)
+                after_response = None
             case _:
                 raise method_not_found(method)
         return DispatchResult(
@@ -620,11 +634,16 @@ class ConnectorCatalogService:
             if context.control is not None
             else None
         )
+        manage_url, private_connectors_hidden = await asyncio.gather(
+            _manage_connectors_url(context.orchestrator.config),
+            _private_connectors_hidden(context.orchestrator.config),
+        )
         return ConnectorCatalogReadResponse(
             catalog=_project_catalog(result),
             selections=_project_selections(context.orchestrator.config, result.catalog),
             session=_project_session(session) if session is not None else None,
-            manage_url=await _manage_connectors_url(context.orchestrator.config),
+            manage_url=manage_url,
+            private_connectors_hidden=private_connectors_hidden,
         )
 
     async def _refresh_request(
@@ -777,6 +796,50 @@ class ConnectorCatalogService:
                 accepted_catalog_revision=request.accepted_catalog_revision,
             ),
             start_broker,
+        )
+
+    async def _connect(
+        self, params: ConnectorCatalogConnectParams, root: SessionBackend | None
+    ) -> tuple[ConnectorCatalogMutationResponse, bool]:
+        """Create the user's connection for a no-auth connector, then refresh."""
+        _validate_toggle(params.alias, None)
+        context = await self._target(params.session_id, root)
+        request = await context.require_control().request_connector_connect(
+            alias=params.alias
+        )
+        provider = _resolve_provider(context.orchestrator.config)
+        if provider is None:
+            raise RequestFailure(
+                ProtocolErrorCode.UNAUTHORIZED,
+                "Connectors need a Mistral API key to connect",
+            )
+        started_at = time.perf_counter()
+        outcome = "failure"
+        try:
+            await _connect_without_credentials(provider, request.raw_connector_id)
+            outcome = "success"
+        except Exception as exc:
+            logger.warning(
+                "Failed to connect a no-auth connector",
+                extra={
+                    "provider_fingerprint": provider.fingerprint[:12],
+                    "connector_error": type(exc).__name__,
+                    "http_status": getattr(exc, "status_code", None),
+                },
+            )
+            raise RequestFailure(
+                ProtocolErrorCode.INTERNAL_ERROR,
+                _connect_failure_message(exc, request.display_name),
+            ) from exc
+        finally:
+            record_connector_catalog_operation(
+                time.perf_counter() - started_at,
+                operation="connect",
+                outcome=outcome,
+                backend=self._backend,
+            )
+        return await self._refresh_request(
+            ConnectorCatalogRefreshParams(session_id=params.session_id), root
         )
 
     async def accept_auth_required(
@@ -1409,6 +1472,55 @@ async def _connector_auth_url(
         await http_client.aclose()
 
 
+async def _connect_without_credentials(
+    provider: _ConnectorProvider, raw_connector_id: str
+) -> None:
+    # Mirrors the dashboard's connect button: a no-auth connector becomes usable
+    # once the user owns a default connection, which carries no secret.
+    http_client = VibeAsyncHTTPClient(verify=build_ssl_context(), follow_redirects=True)
+    try:
+        from mistralai.client import Mistral
+
+        sdk_client = Mistral(
+            api_key=provider.api_key,
+            server_url=provider.base_url,
+            async_client=http_client,
+        )
+        async with sdk_client as client:
+            await client.beta.connectors.create_or_update_user_credentials_async(
+                connector_id_or_name=raw_connector_id,
+                name=_DEFAULT_CONNECTION_NAME,
+                is_default=True,
+                credentials={"headers": {}},
+            )
+    finally:
+        await http_client.aclose()
+
+
+def _connect_failure_message(exc: Exception, display_name: str) -> str:
+    # Redacted like bootstrap failures: the status explains it, the body stays in logs.
+    from mistralai.client.errors import MistralError
+
+    prefix = f"Could not connect {display_name}"
+    if isinstance(exc, httpx.TransportError):
+        return f"{prefix}: the Mistral API could not be reached. Try again in a moment."
+    if not isinstance(exc, MistralError):
+        return f"{prefix}: {type(exc).__name__}."
+    match exc.status_code:
+        case httpx.codes.UNAUTHORIZED | httpx.codes.FORBIDDEN:
+            return (
+                f"{prefix}: your API key may not create connections "
+                f"(HTTP {exc.status_code}). Check your VIBE_API_KEY."
+            )
+        case httpx.codes.NOT_FOUND:
+            return f"{prefix}: the connector no longer exists (HTTP 404)."
+        case _:
+            return (
+                f"{prefix} (HTTP {exc.status_code}). Try again, "
+                "or enable it in the Mistral dashboard."
+            )
+
+
 def _catalog_read_result(
     catalog: ResolvedConnectorCatalog | None,
     disposition: CacheDisposition,
@@ -1456,13 +1568,15 @@ def _project_catalog_entry(connector: ResolvedConnector) -> ConnectorCatalogEntr
 
 def _connector_readiness(
     connector: ResolvedConnector,
-) -> Literal["ready", "needs_auth", "needs_setup", "unavailable"]:
+) -> Literal["ready", "needs_auth", "needs_setup", "needs_connect", "unavailable"]:
     if connector.ready:
         return "ready"
     if connector.auth_action == "oauth":
         return "needs_auth"
     if connector.auth_action == "credentials_setup":
         return "needs_setup"
+    if connector.auth_action == "no_auth_connect":
+        return "needs_connect"
     return "unavailable"
 
 
@@ -1583,6 +1697,30 @@ async def _manage_connectors_url(config: VibeConfigSchema) -> str | None:
         f"{console_base_url}/build/connectors"
         f"?shareContext={quote(share_context, safe='')}"
     )
+
+
+async def _private_connectors_hidden(config: VibeConfigSchema) -> bool:
+    provider = _resolve_provider(config)
+    if provider is None:
+        return False
+    key = (config.console_base_url, provider.api_key)
+    failed_at = _WHOAMI_FAILED_AT.get(key)
+    cooling_down = (
+        failed_at is not None and time.monotonic() - failed_at < _WHOAMI_RETRY_SECONDS
+    )
+    # The cooldown only skips the network; another caller may have cached whoami since.
+    if cooling_down:
+        whoami = load_cached_whoami(provider.api_key)
+    else:
+        whoami = await _WHOAMI_CACHE.resolve(
+            base_url=key[0], api_key=key[1], timeout=_WHOAMI_TIMEOUT_SECONDS
+        )
+    if whoami is None:
+        if not cooling_down:
+            _WHOAMI_FAILED_AT[key] = time.monotonic()
+        return False
+    _WHOAMI_FAILED_AT.pop(key, None)
+    return whoami.primitive_access_scope == "shared_only"
 
 
 def _resolve_catalog(
@@ -1804,6 +1942,8 @@ def _auth_action(action: _BootstrapAuthAction | None) -> ConnectorAuthAction:
         return "oauth"
     if action.type == "credentials_setup":
         return "credentials_setup"
+    if action.type == "no_auth_connect":
+        return "no_auth_connect"
     return "unknown"
 
 

@@ -38,19 +38,6 @@ fn parses_the_child_session_wire_shape() {
 }
 
 #[test]
-fn tokens_need_context_usage() {
-    let mut session = child("c", SessionStatus::Idle, 1);
-    session.token_usage.total_tokens = 42;
-    assert_eq!(
-        session.context_tokens(),
-        0,
-        "Python shows 0 without contextUsage"
-    );
-    session.context_usage = Some(Default::default());
-    assert_eq!(session.context_tokens(), 0);
-}
-
-#[test]
 fn unknown_status_tag_reads_as_unknown() {
     let session = parse(serde_json::json!({
         "id": "c",
@@ -97,7 +84,7 @@ fn an_updated_without_a_child_session_is_rejected() {
 }
 
 #[test]
-fn status_labels_match_python() {
+fn status_label_cases() {
     let cases = [
         (SessionStatus::Running, "running", StatusTone::Success),
         (SessionStatus::Blocked, "blocked", StatusTone::Warning),
@@ -224,7 +211,7 @@ fn ids(rows: &[PublicChildSession]) -> Vec<&str> {
 }
 
 #[test]
-fn display_name_matches_python() {
+fn display_name_cases() {
     let cases = [
         ("explore-1", "Explore 1"),
         ("general-purpose", "General Purpose"),

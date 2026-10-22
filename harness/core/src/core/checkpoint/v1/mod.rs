@@ -10,7 +10,7 @@ use crate::core::model_context::ModelContext;
 use crate::core::state::{ActivePhase, HarnessState, TurnState};
 use crate::core::step_protocol::Action;
 use crate::core::tools::execution::{ToolBatch, ToolExecution, ToolExecutionState};
-use crate::core::turn::{PendingLifecycleHook, SuspendedTurn};
+use crate::core::turn::PendingLifecycleHook;
 use crate::core::wire::message::tool_calls_from_parts;
 use crate::core::wire::message::{Message, StoredMessageSource};
 use crate::core::wire::tool::ToolCall;
@@ -75,10 +75,18 @@ impl CheckpointV1 {
             CompactionBudget {
                 token_threshold: state.config.settings.context.compaction.token_threshold(),
                 image_delivery: state.config.settings.context.image_delivery.compaction,
+                image_cost: state.config.settings.context.image_token_cost,
             },
         )?;
         state.last_finished_turn_id = self.last_finished_turn_id;
-        state.notifications = self.notifications.restore()?;
+        state.notifications = self.notifications.restore(
+            state
+                .active()
+                .map_or(0, |active| active.pending_steer.len()),
+        )?;
+        state
+            .notifications
+            .retain_recent(state.config.settings.context.notifications.recent_ids);
         validate_restored_state(&state)?;
         Ok(state)
     }
@@ -130,14 +138,6 @@ fn validate_restored_state(state: &HarnessState) -> Result<(), String> {
             ActivePhase::AwaitingHook { pending } => {
                 validate_hook_binding_ids(pending.hook_binding_ids())?;
                 insert_pending_action_id(&mut pending_action_ids, pending.action_id())?;
-                if let PendingLifecycleHook::PreAgentTurn { suspended, .. } = pending
-                    && let SuspendedTurn::Terminal { turn_id, .. } = suspended
-                    && state.last_finished_turn_id.as_deref() != Some(turn_id)
-                {
-                    return Err(
-                        "pre-agent previous turn does not match the last finished turn".to_string(),
-                    );
-                }
             }
             ActivePhase::AwaitingToolBatch { batch, .. } => {
                 validate_tool_batch_context(state, batch)?;

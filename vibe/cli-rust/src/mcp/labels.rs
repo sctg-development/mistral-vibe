@@ -1,4 +1,4 @@
-//! Column texts of an `/mcp` source row (Python `_add_source_group` helpers).
+//! Column texts of an `/mcp` source row.
 
 use crate::server::{MCPSourceKind, MCPSourceStatus, MCPSourceSummary};
 
@@ -9,6 +9,7 @@ pub(super) fn source_status(source: &MCPSourceSummary) -> (&'static str, bool, S
         MCPSourceStatus::Enabled => ("●", true, "enabled".to_owned()),
         MCPSourceStatus::NeedsAuth => ("○", false, "needs auth".to_owned()),
         MCPSourceStatus::NeedsSetup => ("○", false, "needs setup".to_owned()),
+        MCPSourceStatus::NeedsConnect => ("○", false, "not connected".to_owned()),
         MCPSourceStatus::Unavailable => {
             let hint = match source.kind {
                 MCPSourceKind::Server => "check your config",

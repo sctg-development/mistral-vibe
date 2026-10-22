@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 import io
 import os
 from pathlib import Path
@@ -10,8 +11,10 @@ import subprocess
 import sys
 import time
 from typing import Any, Protocol
+import weakref
 
 import pexpect
+import pyte
 
 from vibe.app_server.run_export import EXPORT_FILENAME, RunExport
 
@@ -23,6 +26,28 @@ class SpawnedVibeProcessFixture(Protocol):
 
 
 VIBE_EXECUTABLE = str(Path(sys.executable).with_name("vibe"))
+# The Rust CLI a test runs, set by the `rust_cli` fixture.
+RUST_CLI_ENV = "VIBE_E2E_RUST_CLI"
+
+
+def run_rust_vibe(
+    cwd: Path, args: Sequence[str], *, timeout: float = 60
+) -> subprocess.CompletedProcess[str]:
+    """Run the Rust CLI in `cwd` to completion, on this checkout's app server."""
+    env = os.environ.copy()
+    executable = env.pop(RUST_CLI_ENV)
+    env["VIBE_APP_SERVER_BIN"] = str(Path(sys.executable).with_name("vibe-app-server"))
+    for name in ("VIBE_APP_SERVER_CMD", "VIBE_APP_SERVER_CWD", "VIBE_CLI"):
+        env.pop(name, None)
+    return subprocess.run(
+        [executable, *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        check=False,
+    )
 
 
 def run_vibe_headless(
@@ -58,7 +83,45 @@ def read_export_config(output_dir: Path) -> dict[str, Any]:
 
 def ansi_tolerant_pattern(text: str) -> re.Pattern[str]:
     ansi = r"(?:\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r|\n)*"
-    return re.compile(ansi.join(re.escape(char) for char in text))
+    # The TUI may draw a gap with a cursor move instead of a space character.
+    return re.compile(
+        ansi.join(" ?" if char == " " else re.escape(char) for char in text)
+    )
+
+
+# The size `spawned_vibe_process` gives the child terminal.
+TERMINAL_ROWS, TERMINAL_COLUMNS = 36, 120
+
+
+@dataclass
+class _Terminal:
+    screen: pyte.Screen
+    stream: pyte.Stream
+    fed: int = 0
+
+
+_terminals: weakref.WeakKeyDictionary[io.StringIO, _Terminal] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def rendered_screen(captured: io.StringIO) -> str:
+    """The child terminal's current screen, as a terminal would display it.
+
+    The TUI redraws only the cells that change, in any order, so text that
+    reads as one line on screen is rarely contiguous in the raw output.
+    Each capture keeps its terminal and is fed only the output it has not
+    seen: re-parsing the whole capture on every poll slows the reader enough
+    for the child to block on a full pty.
+    """
+    terminal = _terminals.get(captured)
+    if terminal is None:
+        screen = pyte.Screen(TERMINAL_COLUMNS, TERMINAL_ROWS)
+        terminal = _terminals[captured] = _Terminal(screen, pyte.Stream(screen))
+    output = captured.getvalue()
+    terminal.stream.feed(output[terminal.fed :])
+    terminal.fed = len(output)
+    return "\n".join(line.rstrip() for line in terminal.screen.display)
 
 
 def write_e2e_config(
@@ -117,6 +180,28 @@ def poll_until(predicate: Callable[[], bool], timeout: float, message: str) -> N
 # a pty nobody reads eventually stalls the app's event loop: it stops handling input,
 # never dispatches the turn, and the request the caller is waiting for never arrives.
 # The startup burst alone is ~26KB against a 64KB Linux pty buffer.
+def still_running(pids: Sequence[int], timeout: float = 15.0) -> list[int]:
+    """Those of `pids` still running after up to `timeout` seconds; a zombie,
+    which only waits for its parent to reap it, has ended.
+    """
+    deadline = time.monotonic() + timeout
+    while (running := [pid for pid in pids if _running(pid)]) and (
+        time.monotonic() < deadline
+    ):
+        time.sleep(0.05)
+    return running
+
+
+def _running(pid: int) -> bool:
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
 def wait_for_request_count_while_draining_child_output(
     child: pexpect.spawn,
     captured: io.StringIO,
@@ -144,13 +229,19 @@ def wait_for_main_screen(child: pexpect.spawn, timeout: float = 20.0) -> None:
     child.expect(ansi_tolerant_pattern("Mistral Vibe v"), timeout=timeout)
 
 
-def wait_for_rendered_text(
+def _rendered_within(
     child: pexpect.spawn, captured: io.StringIO, needle: str, timeout: float
-) -> None:
+) -> bool:
+    """Whether `needle` shows on the rendered screen within `timeout` seconds.
+
+    The TUI redraws only the cells that change, so a text can be on screen
+    without ever crossing the output stream whole: match the screen, not the
+    stream.
+    """
     start = time.monotonic()
     while time.monotonic() - start < timeout:
-        if needle in strip_ansi(captured.getvalue()):
-            return
+        if needle in rendered_screen(captured):
+            return True
         try:
             child.expect(r"\S", timeout=0.1)
         except pexpect.TIMEOUT:
@@ -160,9 +251,17 @@ def wait_for_rendered_text(
             raise AssertionError(
                 f"Child exited while waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
             ) from exc
-    rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+    return needle in rendered_screen(captured)
+
+
+def wait_for_rendered_text(
+    child: pexpect.spawn, captured: io.StringIO, needle: str, timeout: float
+) -> None:
+    if _rendered_within(child, captured, needle, timeout):
+        return
     raise AssertionError(
-        f"Timed out waiting for rendered text: {needle!r}\n\nRendered tail:\n{rendered_tail}"
+        f"Timed out waiting for rendered text: {needle!r}\n\n"
+        f"Rendered screen:\n{rendered_screen(captured)}"
     )
 
 
@@ -173,15 +272,12 @@ def send_ctrl_c_until_quit_confirmation(
     start = time.monotonic()
     while time.monotonic() - start < timeout:
         child.sendcontrol("c")
-        try:
-            child.expect(ansi_tolerant_pattern("Press Ctrl+C again to quit"), timeout=2)
+        if _rendered_within(child, captured, "Press Ctrl+C again to quit", 2):
             # Confirmation prompt appeared, send second Ctrl+C
             child.sendcontrol("c")
             return
-        except pexpect.TIMEOUT:
-            # First Ctrl+C may have interrupted something, try again
-            continue
-    rendered_tail = strip_ansi(captured.getvalue())[-1200:]
+        # First Ctrl+C may have interrupted something, try again
     raise AssertionError(
-        f"Timed out waiting for quit confirmation prompt.\n\nRendered tail:\n{rendered_tail}"
+        "Timed out waiting for quit confirmation prompt.\n\n"
+        f"Rendered screen:\n{rendered_screen(captured)}"
     )

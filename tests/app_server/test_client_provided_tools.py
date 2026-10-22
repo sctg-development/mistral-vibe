@@ -33,6 +33,7 @@ from tests.stubs.local_sandbox import EXECUTE_COMPLETION, build_trusted_project
 from vibe.app_server._client_provided_tools import (
     ClientProvidedTools,
     ClientToolCall,
+    ClientToolCaller,
     ClientToolDeclarationError,
     ClientToolDefinition,
     ClientToolError,
@@ -52,7 +53,6 @@ from vibe.app_server.protocol import (
     SessionMCPStdioServer,
     SessionOptions,
 )
-from vibe.app_server.run_export import HeadlessUsageError
 from vibe.app_server.session import AppServerSession
 from vibe.core.agents.models import BuiltinAgentName
 
@@ -164,9 +164,7 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return build_trusted_project(tmp_path / "project", monkeypatch)
 
 
-def _options(
-    project: Path, client_tools: ClientTools, *, legacy_harness: bool = False
-) -> LocalHarnessOptions:
+def _options(project: Path, client_tools: ClientTools) -> LocalHarnessOptions:
     return LocalHarnessOptions(
         session_options=SessionOptions(
             cwd=str(project),
@@ -174,8 +172,6 @@ def _options(
             trust_workspace=True,
             headless=True,
         ),
-        experimental_harness=not legacy_harness,
-        legacy_harness=legacy_harness,
         client_tools=client_tools,
     )
 
@@ -228,7 +224,8 @@ async def test_a_program_calls_a_client_tool_and_reads_its_output(
     """*Prepare*: A client tool `kb.lookup`, programmatic by default.
     *Do*: Run a program that calls it.
     *Assert*: The tool is not offered to the model directly, the runner gets
-    its name and input, and the program reads the output.
+    its name, input and caller, the root session, and the program reads the
+    output.
     """
     # Prepare
     model = _ToolCallingModel("run_typescript", {"code": _PROGRAM})
@@ -236,7 +233,7 @@ async def test_a_program_calls_a_client_tool_and_reads_its_output(
     runner = _Runner(_found)
 
     # Do
-    await _run(project, runner)
+    session, _ = await _run(project, runner)
 
     # Assert
     assert not any("lookup" in name for name in model.offered[0])
@@ -246,6 +243,9 @@ async def test_a_program_calls_a_client_tool_and_reads_its_output(
     assert call.input == {"term": "harness"}
     assert call.call_id
     assert call.tool_call_id
+    assert call.caller == ClientToolCaller(
+        session_id=session.session_id, root_session_id=session.session_id
+    )
     assert "the thing that runs the agent" in model.final_input
 
 
@@ -374,20 +374,6 @@ async def test_a_call_is_one_tool_entry(
     assert len(effects) == 1
     assert not any(isinstance(entry, PublicCallbackEntry) for entry in session.history)
     assert not any("client_tool" in entry_id for entry_id in added)
-
-
-@pytest.mark.asyncio
-async def test_the_legacy_harness_refuses_client_tools(project: Path) -> None:
-    """*Do*: Start a legacy-harness session with a client tool.
-    *Assert*: The start is refused as a usage error.
-    """
-    host = LocalHarnessHost()
-    client_tools = ClientTools(definitions=[_LOOKUP], runner=_Runner(_found))
-    try:
-        with pytest.raises(HeadlessUsageError, match="Unified Harness"):
-            await host.start(_options(project, client_tools, legacy_harness=True))
-    finally:
-        await host.close()
 
 
 @pytest.mark.parametrize(

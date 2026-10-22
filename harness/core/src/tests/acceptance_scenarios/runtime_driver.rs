@@ -19,6 +19,36 @@ pub(super) enum ExpectedDirective {
     Refresh { action: Value },
 }
 
+/// Replaces the `stack` of each uncaught `run_typescript` error with
+/// [`PROGRAM_ERROR_STACK`]. V8 stack frames carry evaluator line numbers, so
+/// scenarios check that a stack is present, not its frames.
+fn without_program_error_stacks(observations: &Value) -> Value {
+    let mut observations = observations.clone();
+    for observation in observations.as_array_mut().into_iter().flatten() {
+        let Some(blocks) = observation
+            .pointer_mut("/result/content")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for block in blocks {
+            let Some(mut error) = block
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|text| text.strip_prefix("run_typescript failed: "))
+                .and_then(|error| serde_json::from_str::<Value>(error).ok())
+            else {
+                continue;
+            };
+            if error.get("stack").is_some_and(Value::is_string) {
+                error["stack"] = json!(PROGRAM_ERROR_STACK);
+                block["text"] = json!(format!("run_typescript failed: {error}"));
+            }
+        }
+    }
+    observations
+}
+
 /// Returns the stable fields of an agent completion Action.
 pub(super) fn llm_call(iteration: u64) -> Value {
     json!({
@@ -28,11 +58,24 @@ pub(super) fn llm_call(iteration: u64) -> Value {
     })
 }
 
-/// Returns the stable fields of a compaction completion Action.
+/// Returns the stable fields of an in-context compaction completion Action,
+/// which omits `request`.
 pub(super) fn compaction_call(trigger: &str, iteration: u64, attempt: u64) -> Value {
     json!({
         "type": "llm_call",
         "purpose": "compaction",
+        "trigger": trigger,
+        "attempt": attempt,
+        "iteration": iteration,
+    })
+}
+
+/// Returns the stable fields of a standalone compaction completion Action.
+pub(super) fn standalone_compaction_call(trigger: &str, iteration: u64, attempt: u64) -> Value {
+    json!({
+        "type": "llm_call",
+        "purpose": "compaction",
+        "request": "standalone",
         "trigger": trigger,
         "attempt": attempt,
         "iteration": iteration,
@@ -290,6 +333,53 @@ impl SynchronousRuntime {
             .expect("Core checkpoint serializes")
     }
 
+    pub(super) fn export_conversation(&self, fork_turns: &str) -> Value {
+        serde_json::to_value(
+            self.session
+                .export_conversation(fork_turns)
+                .expect("conversation exports"),
+        )
+        .expect("conversation serializes")
+    }
+
+    pub(super) fn new_with_conversation(config: HarnessConfig, seed: Value) -> Self {
+        let mut runtime = Self::new(config.clone());
+        runtime.session = HarnessSession::create_with_conversation(
+            config,
+            Vec::new(),
+            Some(serde_json::from_value(seed).expect("conversation seed decodes")),
+        )
+        .expect("conversation imports");
+        runtime
+    }
+
+    /// Loads a frozen checkpoint and adopts its already-issued Actions as a Host would.
+    pub(super) fn from_checkpoint(
+        config: HarnessConfig,
+        encoded: &str,
+        saved_actions: Vec<Value>,
+    ) -> Self {
+        let checkpoint =
+            crate::core::decode_checkpoint(encoded).expect("frozen checkpoint decodes");
+        let session = HarnessSession::restore(config.clone(), checkpoint, 0)
+            .expect("frozen checkpoint restores");
+        let pending_actions = saved_actions
+            .into_iter()
+            .map(|action| (action_id(&action).to_string(), action))
+            .collect();
+        let runtime = Self {
+            hook_bindings: configured_hook_bindings(&config),
+            config,
+            session,
+            next_input_id: 1,
+            pending_actions,
+            model_input: ModelInputCache::default(),
+            model_requests: Vec::new(),
+        };
+        runtime.assert_pending_actions_match_inspection();
+        runtime
+    }
+
     pub(super) fn inspection_value(&self) -> Value {
         serde_json::to_value(self.session.inspect()).expect("Core inspection serializes")
     }
@@ -301,7 +391,13 @@ impl SynchronousRuntime {
 
     /// Restores Core with the Host's current configuration.
     pub(super) fn restart_from_checkpoint_with_config(&mut self, config: HarnessConfig) {
-        let checkpoint = self.session.checkpoint().expect("Core checkpoints");
+        self.restore_checkpoint_value(self.checkpoint_value(), config);
+    }
+
+    /// Restores a serialized checkpoint, including accepted earlier V1 shapes.
+    pub(super) fn restore_checkpoint_value(&mut self, checkpoint: Value, config: HarnessConfig) {
+        let checkpoint = crate::core::decode_checkpoint(&checkpoint.to_string())
+            .expect("valid serialized checkpoint");
         self.hook_bindings = configured_hook_bindings(&config);
         self.session = HarnessSession::restore(config.clone(), checkpoint, 0)
             .expect("Core restores its checkpoint with current configuration");
@@ -310,6 +406,13 @@ impl SynchronousRuntime {
         self.model_input = ModelInputCache::default();
         self.model_requests.clear();
         self.assert_pending_actions_match_inspection();
+    }
+
+    /// Returns the error from restoring the current checkpoint with `config`,
+    /// or `None` when the restore succeeds. The runtime stays unchanged.
+    pub(super) fn checkpoint_restore_error(&self, config: HarnessConfig) -> Option<String> {
+        let checkpoint = self.session.checkpoint().expect("Core checkpoints");
+        HarnessSession::restore(config, checkpoint, 0).err()
     }
 
     /// Replaces complete Core settings and retains them for later restoration.
@@ -451,16 +554,33 @@ impl SynchronousRuntime {
         command: Value,
         expected: ExpectedTransition,
     ) -> AppliedTransition {
+        self.apply_at(command, 1_700_000_000_000 + self.next_input_id, expected)
+    }
+
+    /// Supplies Host time explicitly while checking the same complete transition.
+    pub(super) fn apply_at(
+        &mut self,
+        command: Value,
+        time_unix_ms: u64,
+        expected: ExpectedTransition,
+    ) -> AppliedTransition {
         self.assert_result_correlation(&command);
         let input_id = self.next_input_id;
-        let result = accepted_value(self.session.apply(input(input_id, command)));
+        let input = serde_json::from_value(json!({
+            "protocol_version": 1,
+            "input_id": input_id,
+            "determinism": {"time_unix_ms": time_unix_ms, "random_seed": input_id},
+            "command": command,
+        }))
+        .expect("timed Runtime input validates");
+        let result = accepted_value(self.session.apply(input));
         self.next_input_id += 1;
 
         let transition = result["transition"].clone();
         assert_eq!(transition["protocol_version"], 1);
         assert_eq!(transition["input_id"], input_id);
         assert_eq!(
-            transition["observations"],
+            without_program_error_stacks(&transition["observations"]),
             Value::Array(expected.observations),
             "transition observations differ"
         );

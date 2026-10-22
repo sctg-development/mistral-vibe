@@ -74,6 +74,7 @@ from mistralai_vibe_local_harness.vibe._hook_config import (
 )
 from mistralai_vibe_local_harness.vibe._hook_matcher import tool_catalog_for_config
 from mistralai_vibe_local_harness.vibe._host import (
+    ExternalCommittedHistory,
     HarnessSessionDeleteResult,
     HarnessSessionForkResult,
     HarnessSessionListItem,
@@ -88,6 +89,7 @@ from mistralai_vibe_local_harness.vibe._host import (
 )
 from mistralai_vibe_local_harness.vibe._local_actions import (
     CLASSIFICATION_EVENT_TYPE,
+    AcceptOrRetryPostAgentHandler,
     ApprovalGrant,
     HookApprovalCallback,
     HookContext,
@@ -119,6 +121,7 @@ from mistralai_vibe_local_harness.vibe._runtime_config import (
     LocalProviderRoute,
     LocalRuntimeAdapterConfig,
     LocalRuntimeAdapterPorts,
+    MalformedToolCallsTelemetry,
     PathSpace,
     RequestSentTelemetry,
     SessionConfig,
@@ -164,6 +167,7 @@ __all__ = [
     "INVALID_API_KEY_MESSAGE",
     "SANDBOX_FAILURES",
     "SANDBOX_UNAVAILABLE_CODE",
+    "AcceptOrRetryPostAgentHandler",
     "ApprovalGrant",
     "ClassificationTier",
     "ClassificationVerdict",
@@ -180,6 +184,7 @@ __all__ = [
     "DeferredTurnStartCapability",
     "DeferredTurnStartParams",
     "DeferredTurnStartResult",
+    "ExternalCommittedHistory",
     "FailedWorktreeHistoryEntry",
     "ForeignHookDefinition",
     "HarnessCallbackClosedError",
@@ -233,6 +238,7 @@ __all__ = [
     "MCPRouteSnapshot",
     "MCPSourceState",
     "MCPToolFilter",
+    "MalformedToolCallsTelemetry",
     "ModelRiskClassifier",
     "PathSpace",
     "PostAgentTurnHookHandler",

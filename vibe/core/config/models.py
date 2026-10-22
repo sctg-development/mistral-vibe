@@ -33,15 +33,23 @@ from vibe.core.config._defaults import (
 )
 from vibe.core.paths import SESSION_LOG_DIR
 from vibe.core.types import Backend
+from vibe.utils.platform import is_windows
 
 logger = logging.getLogger(__name__)
 
 
 class MissingAPIKeyError(RuntimeError):
-    def __init__(self, env_key: str, provider_name: str) -> None:
-        super().__init__(
-            f"Missing {env_key} environment variable for {provider_name} provider"
-        )
+    def __init__(
+        self, env_key: str, provider_name: str, *, keyring_error: str | None = None
+    ) -> None:
+        message = f"Missing {env_key} environment variable for {provider_name} provider"
+        if keyring_error:
+            message = (
+                f"Can't read {env_key} from the system keyring for {provider_name} "
+                f"provider ({keyring_error}). Approve the keyring prompt or set "
+                f"the {env_key} environment variable"
+            )
+        super().__init__(message)
         self.env_key = env_key
         self.provider_name = provider_name
 
@@ -107,8 +115,8 @@ class SessionLoggingConfig(BaseSettings):
     session_prefix: str = "session"
     enabled: bool = True
     # Background LLM-generated session titles (shown in --resume and the
-    # terminal tab) for CLI and Desktop clients. False falls back to the
-    # first-message preview.
+    # terminal tab) for CLI, Desktop, and ACP (VS Code extension) clients.
+    # False falls back to the first-message preview.
     generate_titles: bool = True
 
     @field_validator("save_dir", mode="before")
@@ -179,6 +187,15 @@ class ProviderConfig(BaseModel):
             and bool(self.browser_auth_base_url)
             and bool(self.browser_auth_api_base_url)
         )
+
+    @property
+    def uses_vertex(self) -> bool:
+        """Whether this provider authenticates through Google ADC.
+
+        ``MistralBackend`` ignores ``api_style`` entirely, so the backend
+        choice decides first, exactly as ``create_backend`` does.
+        """
+        return self.backend != Backend.MISTRAL and self.api_style == "vertex-anthropic"
 
 
 class TranscribeClient(StrEnum):
@@ -434,11 +451,23 @@ class MCPStdio(_MCPBase):
 
     def argv(self) -> list[str]:
         base = (
-            shlex.split(self.command)
+            _split_command(self.command)
             if isinstance(self.command, str)
             else list(self.command or [])
         )
         return [*base, *self.args] if self.args else base
+
+
+def _split_command(command: str) -> list[str]:
+    if not is_windows():
+        return shlex.split(command)
+    # Backslash is the Windows path separator, not an escape: keep it literal and
+    # let quotes alone group a path that contains spaces.
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    return list(lexer)
 
 
 MCPServer = Annotated[
@@ -588,28 +617,6 @@ def _serialize_model_entry(model: Any) -> Any:
     return entry
 
 
-def normalize_model_configs_with_defaults(value: Any, defaults: Any) -> Any:
-    """Normalize models and fill sparse default-model overrides when required."""
-    normalized = normalize_model_configs(value)
-    if not isinstance(normalized, Mapping):
-        return normalized
-
-    default_models = normalize_model_configs(defaults)
-    if not isinstance(default_models, Mapping):
-        return normalized
-
-    if not _needs_default_model_payloads(normalized, default_models):
-        return normalized
-
-    return merge_model_payloads(
-        {
-            alias: _model_payload_for_merge(model)
-            for alias, model in default_models.items()
-        },
-        normalized,
-    )
-
-
 def _model_alias_from_payload(payload: Any) -> str:
     if isinstance(payload, ModelConfig):
         return payload.alias
@@ -648,27 +655,6 @@ def _model_payload_with_alias(alias: Any, payload: Any) -> Any:
             f"Model key '{alias}' does not match model alias '{existing_alias}'."
         )
     return model_payload
-
-
-def _needs_default_model_payloads(
-    models: Mapping[str, Any], defaults: Mapping[str, Any]
-) -> bool:
-    """Return whether a known default model is missing required identity fields."""
-    for alias, payload in models.items():
-        if alias not in defaults or not isinstance(payload, Mapping):
-            continue
-        if "name" not in payload or "provider" not in payload:
-            return True
-    return False
-
-
-def _model_payload_for_merge(model: Any) -> dict[str, Any]:
-    """Convert a default model entry into a plain mapping for deep merge."""
-    if isinstance(model, ModelConfig):
-        return model.model_dump(mode="json")
-    if isinstance(model, Mapping):
-        return dict(model)
-    return {}
 
 
 def merge_model_payloads(

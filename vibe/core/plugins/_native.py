@@ -80,7 +80,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_RESERVED_NAMESPACES = {"file_system", "self", "process", "skill", "subagent", "vibe"}
+# Tool namespaces a plugin cannot claim: Harness built-ins, the live `agents`
+# namespace, the retired `agent`, `subagent` and `collaboration` namespaces (which
+# hold replay-only functions), and `vibe`.
+_RESERVED_NAMESPACES = frozenset({
+    "agent",
+    "agents",
+    "collaboration",
+    "file_system",
+    "process",
+    "self",
+    "skill",
+    "subagent",
+    "vibe",
+})
 _VIBE_EXTENSION = "ai.mistral.vibe"
 _TYPESCRIPT_IDENTIFIER_PATTERN = r"^[A-Za-z_$][A-Za-z0-9_$]*$"
 _PLUGIN_PLACEHOLDER_PATTERN = re.compile(r"\$\{PLUGIN_(?:ROOT|DATA)\}")
@@ -153,6 +166,9 @@ class _VibePluginExtension(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, populate_by_name=True)
 
     schema_version: Literal[1] = Field(alias="schemaVersion")
+    display_name: str | None = Field(
+        default=None, alias="displayName", min_length=1, max_length=100
+    )
     tool_namespace: str | None = Field(
         default=None, alias="toolNamespace", pattern=_TYPESCRIPT_IDENTIFIER_PATTERN
     )
@@ -374,6 +390,8 @@ class PluginDescriptor:
     manifest_digest: str
     content_digest: str
     author: str | None = None
+    # Presentation only (ai.mistral.vibe extension); `name` stays the identity.
+    display_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,6 +872,7 @@ class PluginResolver:
             author=author_display_name(
                 manifest.author.name if manifest.author is not None else None
             ),
+            display_name=extension.display_name if extension is not None else None,
         )
         skills = self._load_skills(descriptor)
         mcp_servers = self._load_mcp_servers(descriptor)

@@ -95,8 +95,9 @@ fn provided_tool_name_collisions_reject_session_creation() {
             "exposure": exposure,
         })
     };
-    let reserved_configs =
-        crate::core::tools::resolved::RESERVED_TOOL_NAMESPACES.map(|namespace| {
+    let reserved_configs = crate::core::tools::resolved::RESERVED_TOOL_NAMESPACES
+        .into_iter()
+        .map(|namespace| {
             let mut config = config();
             config.settings.tools.background_processes = BackgroundProcessMode::Disabled;
             config.settings.tools.subagents = SubagentMode::Disabled;
@@ -106,7 +107,8 @@ fn provided_tool_name_collisions_reject_session_creation() {
             }]))
             .expect("reserved group remains structurally valid");
             config
-        });
+        })
+        .collect::<Vec<_>>();
     let mut duplicate_stable_id = config();
     duplicate_stable_id.capabilities.tool_groups = serde_json::from_value(json!([{
         "name": "calendar",
@@ -127,13 +129,16 @@ fn provided_tool_name_collisions_reject_session_creation() {
     .expect("duplicate direct tools remain structurally valid");
 
     // Do
-    let reserved_errors = reserved_configs.map(|config| {
-        let namespace = config.capabilities.tool_groups[0].name.clone();
-        let error = HarnessSession::create(config)
-            .err()
-            .expect("reserved namespace rejects session creation");
-        (namespace, error)
-    });
+    let reserved_errors = reserved_configs
+        .into_iter()
+        .map(|config| {
+            let namespace = config.capabilities.tool_groups[0].name.clone();
+            let error = HarnessSession::create(config)
+                .err()
+                .expect("reserved namespace rejects session creation");
+            (namespace, error)
+        })
+        .collect::<Vec<_>>();
     let duplicate_stable_error = HarnessSession::create(duplicate_stable_id)
         .err()
         .expect("duplicate stable ID rejects session creation");
@@ -296,6 +301,7 @@ fn direct_tool_hooks_commit_only_the_transformed_result() {
     assert_eq!(post_hook_pending["transition"]["observations"], json!([]));
     let committed = &transformed["transition"]["observations"][0];
     assert_eq!(committed["type"], "tool_result_committed");
+    assert_eq!(committed["call"], tool_action["call"]);
     assert_eq!(
         committed["result"]["content"][0]["text"],
         "transformed public result"

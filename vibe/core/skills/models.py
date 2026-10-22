@@ -57,7 +57,6 @@ class SkillMetadata(BaseModel):
     )
     compatibility: str | None = Field(
         default=None,
-        max_length=500,
         description="Environment requirements (intended product, system packages, etc.).",
     )
     metadata: dict[str, str] = Field(
@@ -158,9 +157,3 @@ class SkillInfo(BaseModel):
 class SkillConfigIssue(BaseModel):
     file: Path
     message: str
-
-
-class ParsedSkillCommand(BaseModel):
-    name: str
-    content: str
-    extra_instructions: str | None = None

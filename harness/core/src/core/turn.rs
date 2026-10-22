@@ -2,7 +2,7 @@ mod completion;
 mod lifecycle_hooks;
 mod outcome;
 
-pub(crate) use lifecycle_hooks::{PendingLifecycleHook, SuspendedTurn};
+pub(crate) use lifecycle_hooks::PendingLifecycleHook;
 pub(crate) use outcome::TurnOutcome;
 
 use crate::core::error::CoreError;
@@ -19,11 +19,11 @@ use self::lifecycle_hooks::{
 use crate::core::features::compaction::{
     CompactionAttemptResolution, CompactionBudget, CompactionBudgets, CompactionRequest,
     CompactionResolution, CompactionStartResolution, PendingCompaction, fail_compaction,
-    finish_compaction, start_compaction,
+    fail_compaction_or_fall_back, finish_compaction, start_compaction,
 };
-use crate::core::features::notifications::notification_message;
+use crate::core::features::notifications::notification_messages;
 use crate::core::features::permissions::{ApprovalFailureReason, ApprovalOutcome};
-use crate::core::hooks::{HookPoint, HookResult, KeyedContextMessage};
+use crate::core::hooks::{HookCall, HookPoint, HookResult};
 use crate::core::model_input_budget::estimate_model_input_tokens;
 use crate::core::state::hook_binding_ids;
 use crate::core::state::{
@@ -139,7 +139,7 @@ pub(crate) fn dispatch(
         TurnEvent::Interrupt {
             expected_turn_id,
             reason,
-        } if state.active().is_some() => interrupt(state, expected_turn_id, reason),
+        } if state.active().is_some() => interrupt(state, expected_turn_id, reason, determinism),
         TurnEvent::Interrupt {
             expected_turn_id, ..
         } if state.is_idempotent_late_interrupt(&expected_turn_id) => Ok(Outcome::quiet()),
@@ -149,7 +149,9 @@ pub(crate) fn dispatch(
             expected_turn_id,
             action_id,
             error,
-        } if state.active().is_some() => fail_turn(state, expected_turn_id, action_id, error),
+        } if state.active().is_some() => {
+            fail_turn(state, expected_turn_id, action_id, error, determinism)
+        }
         TurnEvent::FailTurn { .. } => Err(invalid_state(state)),
 
         TurnEvent::Completion { action_id, result } => {
@@ -218,12 +220,27 @@ fn finish_pending_completion(
                 CompactionBudget {
                     token_threshold,
                     image_delivery: state.config.settings.context.image_delivery.agent,
+                    image_cost: state.config.settings.context.image_token_cost,
                 },
+                state.config.settings.context.compaction_fallback,
             )?;
             apply_compaction_attempt_resolution(state, resolution)
         }
         (PendingCompletion::Compaction(pending), Err(error)) => {
-            apply_compaction_resolution(state, fail_compaction(pending, error))
+            let fallback = state.config.settings.context.compaction_fallback;
+            if fallback.is_resend() {
+                // Resending a request the provider just failed would not help.
+                return apply_compaction_resolution(state, fail_compaction(pending, error));
+            }
+            let token_threshold = state.config.settings.context.compaction.token_threshold();
+            let resolution = fail_compaction_or_fall_back(
+                &mut state.context,
+                pending,
+                fallback,
+                token_threshold,
+                error,
+            )?;
+            apply_compaction_attempt_resolution(state, resolution)
         }
     }
 }
@@ -246,8 +263,8 @@ fn apply_compaction_resolution(
 ) -> Result<Outcome, CoreError> {
     match resolution {
         CompactionResolution::ContinueTurn { outcome } => {
-            // Compaction just ran, so resume the agent completion. Its pre-LLM
-            // hook runs again, and the dispatch seam checks the threshold.
+            // Compaction just ran, so resume with an agent completion without
+            // checking the automatic threshold again.
             state.mark_model_input_ready()?;
             let action = continue_after_compaction(state)?;
             Ok(outcome.after(outcome_for_action(state, action)?))
@@ -399,6 +416,7 @@ fn model_input_reaches_compaction_threshold(state: &HarnessState) -> Result<bool
         state.context.messages(),
         state.resolved_tools.top_level_tools(),
         state.config.settings.context.image_delivery.agent,
+        state.config.settings.context.image_token_cost,
     )?;
     let reported = state.last_reported_context_tokens.unwrap_or(0);
     Ok(estimate.max(reported) >= token_threshold)
@@ -408,7 +426,6 @@ fn start_automatic_compaction(
     state: &mut HarnessState,
     turn_id: &str,
     iterations: u32,
-    context_keys: &[String],
 ) -> Result<CompactionStartResolution, CoreError> {
     let task_id = state.config.task_id.clone();
     let generated_system = state.generated_system_message();
@@ -419,16 +436,18 @@ fn start_automatic_compaction(
         &mut state.compaction_count,
         generated_system,
         &task_id,
-        CompactionRequest::automatic(turn_id, iterations, context_keys),
+        CompactionRequest::automatic(turn_id, iterations),
         &tools,
         CompactionBudgets {
             request: CompactionBudget {
                 token_threshold,
                 image_delivery: state.config.settings.context.image_delivery.compaction,
+                image_cost: state.config.settings.context.image_token_cost,
             },
             replacement: CompactionBudget {
                 token_threshold,
                 image_delivery: state.config.settings.context.image_delivery.agent,
+                image_cost: state.config.settings.context.image_token_cost,
             },
         },
     )
@@ -494,10 +513,12 @@ fn start_manual_compaction(
             request: CompactionBudget {
                 token_threshold,
                 image_delivery: state.config.settings.context.image_delivery.compaction,
+                image_cost: state.config.settings.context.image_token_cost,
             },
             replacement: CompactionBudget {
                 token_threshold,
                 image_delivery: state.config.settings.context.image_delivery.agent,
+                image_cost: state.config.settings.context.image_token_cost,
             },
         },
     )? {
@@ -536,17 +557,47 @@ fn apply_lifecycle_hook_resolution(
     determinism: crate::core::step_protocol::DeterminismContext,
 ) -> Result<Outcome, CoreError> {
     match resolution {
-        HookResolution::RestoreTurn { suspended } => {
-            restore_suspended_turn(state, suspended);
-            Ok(Outcome::quiet())
-        }
-        HookResolution::CommitPreAgentTurn {
-            suspended,
+        HookResolution::PreAgentSkip {
             turn_id,
-            message,
+            content,
+            reason,
         } => {
-            restore_suspended_turn(state, suspended);
-            commit_turn(state, turn_id, vec![message])
+            let mut outcome = Outcome::quiet();
+            outcome.observe(Observation::TurnStarted { turn_id, content });
+            Ok(outcome.after(finish_completed_turn(
+                state,
+                reason,
+                Some(TurnStopReason::Skipped),
+            )?))
+        }
+        HookResolution::PreAgentFailed {
+            turn_id,
+            content,
+            error,
+        } => {
+            let mut outcome = Outcome::quiet();
+            outcome.observe(Observation::TurnStarted { turn_id, content });
+            let completed_turn_id = state.finish_turn(TurnOutcome::Failed {
+                error: error.clone(),
+            })?;
+            outcome.observe(Observation::TurnFailed {
+                turn_id: completed_turn_id.clone(),
+                error: error.clone(),
+            });
+            outcome.complete_turn(completed_turn_id, TurnOutcome::Failed { error });
+            Ok(outcome)
+        }
+        HookResolution::CommitPreAgentTurn { turn_id, message } => {
+            // A follow-up queued while the hook was pending belongs to the committed turn.
+            let queued = match std::mem::replace(&mut state.turn, TurnState::Idle) {
+                TurnState::Active(active) => active.queued,
+                _ => {
+                    return Err(CoreError::invariant(
+                        "a pre-agent hook resolved without an active turn",
+                    ));
+                }
+            };
+            commit_turn(state, turn_id, vec![message], queued)
         }
         HookResolution::ResolveCompletion(resolution) => {
             apply_completion_event(state, CompletionEvent::Hook(resolution), determinism)
@@ -572,7 +623,12 @@ fn apply_completion_event(
         );
         resolve_completion(
             CandidateContext::new(
-                CandidateTurn::new(active.iterations, state.config.settings.turn.max_iterations),
+                CandidateTurn::new(
+                    active.iterations,
+                    state.config.settings.turn.max_iterations,
+                    state.config.settings.turn.output_limit_recovery,
+                    active.output_limit_retries,
+                ),
                 CandidateHooks::new(post_llm_hook_binding_ids, post_agent_hook_binding_ids),
                 tools,
                 determinism,
@@ -589,27 +645,20 @@ fn apply_completion_transition(
 ) -> Result<Outcome, CoreError> {
     match transition.resolution {
         CompletionResolution::Wait(wait) => {
-            let CompletionWait::LifecycleHook(pending) = *wait;
-            let action =
-                install_active_phase(state, ActivePhase::AwaitingHook { pending: *pending })?;
+            let phase = match *wait {
+                CompletionWait::Completion(plan) => active_phase_for_agent_completion(plan),
+                CompletionWait::LifecycleHook(pending) => {
+                    ActivePhase::AwaitingHook { pending: *pending }
+                }
+            };
+            let action = install_active_phase(state, phase)?;
             outcome_for_action(state, action)
-        }
-        CompletionResolution::ContinueWithContext {
-            context_messages,
-            plan,
-        } => {
-            let context_keys: Vec<String> = context_messages
-                .iter()
-                .map(|message| message.key.clone())
-                .collect();
-            deliver_keyed_context(state, context_messages);
-            let action = install_active_phase(state, active_phase_for_agent_completion(plan))?;
-            outcome_for_agent_dispatch(state, action, &context_keys)
         }
         CompletionResolution::Retry {
             action_id,
             next_iteration,
             feedback,
+            output_limit,
         } => {
             let mut outcome = Outcome::quiet();
             outcome.observe(Observation::AgentCompletionCandidateDiscarded {
@@ -617,26 +666,17 @@ fn apply_completion_transition(
                 action_id,
                 cause: CandidateDiscardCause::Retry,
             });
-            state.require_active_mut()?.iterations = next_iteration;
-            state.context.push(feedback);
+            let active = state.require_active_mut()?;
+            active.iterations = next_iteration;
+            if output_limit {
+                active.output_limit_retries += 1;
+            }
+            state.context.push_in_current_turn(feedback);
             let action = continue_active_turn(state)?;
             Ok(outcome.after(outcome_for_action(state, action)?))
         }
         CompletionResolution::Finish(finish) => apply_completion_finish(state, finish),
         CompletionResolution::Accept(accepted) => apply_accepted_completion(state, accepted),
-    }
-}
-
-/// Appends each keyed hook context whose content changed since its latest delivery.
-fn deliver_keyed_context(state: &mut HarnessState, context_messages: Vec<KeyedContextMessage>) {
-    for KeyedContextMessage { key, content } in context_messages {
-        let message = Message::user(content);
-        if state.context.latest_keyed_message(&key) == Some(&message) {
-            continue;
-        }
-        state
-            .context
-            .push(StoredMessage::keyed_injection(key, message));
     }
 }
 
@@ -715,7 +755,7 @@ fn apply_accepted_completion(
         continuation,
     } = accepted;
     state.require_active_mut()?.iterations = next_iteration;
-    state.context.push(message);
+    state.context.push_in_current_turn(message);
     if let Some(tokens) = context_tokens {
         state.last_reported_context_tokens = Some(tokens);
     }
@@ -758,12 +798,15 @@ fn apply_tool_batch_transition(
         ToolBatchResolution::ContinueTurn { messages } => {
             state
                 .context
-                .extend(messages.into_iter().map(StoredMessage::visible));
+                .extend_current_turn(messages.into_iter().map(StoredMessage::visible));
             state.mark_model_input_ready()?;
             let max_iterations = state.config.settings.turn.max_iterations;
             let iterations = state.require_active()?.iterations;
             if max_iterations.is_some_and(|max_iterations| iterations >= max_iterations) {
-                finish_completed_turn(state, Vec::new(), Some(TurnStopReason::IterationLimit))?
+                // The partial output is what a final answer would hold: the latest
+                // assistant message's content, never tool results.
+                let output = state.context.latest_assistant_content_in_current_turn();
+                finish_completed_turn(state, output, Some(TurnStopReason::IterationLimit))?
             } else {
                 let action = continue_active_turn(state)?;
                 outcome_for_action(state, action)?
@@ -803,7 +846,7 @@ fn handle_context_message(
     }
     let message = StoredMessage::injected(content_to_user_message(content)?);
     state.ensure_system_prompt();
-    state.context.push(message);
+    state.context.push_before_next_turn(message)?;
     // Injecting context clears the previous turn's result: the session is idle
     // again, not sitting on a finished turn.
     state.turn = TurnState::Idle;
@@ -851,17 +894,6 @@ fn content_to_user_message(content: Vec<ContentBlock>) -> Result<Message, CoreEr
 }
 
 fn outcome_for_action(state: &mut HarnessState, action: Action) -> Result<Outcome, CoreError> {
-    outcome_for_agent_dispatch(state, action, &[])
-}
-
-/// Dispatches an agent completion after its late model input, or the automatic
-/// compaction that the model input reaches. `context_keys` names the entries of
-/// the current pre-LLM hook result.
-fn outcome_for_agent_dispatch(
-    state: &mut HarnessState,
-    action: Action,
-    context_keys: &[String],
-) -> Result<Outcome, CoreError> {
     let delivers_model_input = matches!(
         &action,
         Action::Completion {
@@ -869,24 +901,70 @@ fn outcome_for_agent_dispatch(
             ..
         }
     );
-    if !delivers_model_input {
+    let precedes_agent_provider_call = delivers_model_input
+        || matches!(
+            &action,
+            Action::Hook {
+                call: HookCall::PreLlmCall,
+                ..
+            }
+        );
+    if !precedes_agent_provider_call {
         return Ok(Outcome::action(action));
     }
-    let mut outcome = Outcome::quiet();
-    let (turn_id, ready, steering) = {
-        let active = state.require_active_mut()?;
-        (
-            active.turn_id.clone(),
-            active.take_model_input_ready(),
-            active.take_pending_steer(),
-        )
-    };
-    if !ready {
-        if !steering.is_empty() {
-            state.require_active_mut()?.pending_steer = steering;
-        }
+    let outcome = if delivers_model_input {
+        commit_pending_model_input(state)?
     } else {
-        for message in &steering {
+        Outcome::quiet()
+    };
+    Ok(outcome.after(preflight_agent_action(state, action)?))
+}
+
+fn commit_pending_model_input(state: &mut HarnessState) -> Result<Outcome, CoreError> {
+    let active = state.require_active_mut()?;
+    if !active.take_model_input_ready() {
+        return Ok(Outcome::quiet());
+    }
+    let turn_id = active.turn_id.clone();
+    let steering = active.take_pending_steer();
+    let steering_count = steering.len();
+    let mut steering = steering.into_iter();
+    let mut notifications = state
+        .notifications
+        .take_ready(state.config.settings.context.notifications.recent_ids)
+        .into_iter()
+        .peekable();
+    let mut outcome = Outcome::quiet();
+    for position in 0..=steering_count {
+        let mut group = Vec::new();
+        while notifications
+            .peek()
+            .is_some_and(|entry| entry.preceding_steers.min(steering_count) <= position)
+        {
+            group.push(
+                notifications
+                    .next()
+                    .expect("notification was inspected")
+                    .notification,
+            );
+        }
+        state.context.extend_current_turn(notification_messages(
+            &group,
+            &state.config.settings.prompts.agent_messages,
+            state
+                .config
+                .settings
+                .tools
+                .subagents
+                .messages_resume_idle_children(),
+        )?);
+        for notification in group {
+            outcome.observe(Observation::NotificationDelivered {
+                turn_id: turn_id.clone(),
+                notification,
+            });
+        }
+        if let Some(message) = steering.next() {
             let Message::User { content } = &message.message else {
                 return Err(CoreError::invariant(
                     "pending steering must contain visible user messages",
@@ -896,35 +974,20 @@ fn outcome_for_agent_dispatch(
                 turn_id: turn_id.clone(),
                 content: content.clone(),
             });
-        }
-        state.context.extend(steering);
-
-        let notifications = state.notifications.take_ready();
-        if let Some(message) = notification_message(&notifications) {
-            state.context.push(message);
-        }
-        for notification in notifications {
-            outcome.observe(Observation::NotificationDelivered {
-                turn_id: turn_id.clone(),
-                notification,
-            });
+            state.context.push_in_current_turn(message);
         }
     }
-    Ok(outcome.after(preflight_agent_action(state, action, context_keys)?))
+    Ok(outcome)
 }
 
-fn preflight_agent_action(
-    state: &mut HarnessState,
-    action: Action,
-    context_keys: &[String],
-) -> Result<Outcome, CoreError> {
+fn preflight_agent_action(state: &mut HarnessState, action: Action) -> Result<Outcome, CoreError> {
     if !model_input_reaches_compaction_threshold(state)? {
         return Ok(Outcome::action(action));
     }
     let active = state.require_active()?;
     let turn_id = active.turn_id.clone();
     let iterations = active.iterations;
-    match start_automatic_compaction(state, &turn_id, iterations, context_keys)? {
+    match start_automatic_compaction(state, &turn_id, iterations)? {
         CompactionStartResolution::Pending(pending) => {
             let action = install_active_phase(state, ActivePhase::AwaitingCompaction { pending })?;
             Ok(Outcome::action(action))
@@ -967,51 +1030,27 @@ fn start_turn(
             })
             .collect::<Vec<_>>();
         validate_non_empty_content(&user_content, "pre-agent user content")?;
-        // The hook can still skip the turn, so remember where to go back to.
-        let suspended = suspend_inactive_turn(&state.turn)?;
-        let pending = PendingLifecycleHook::pre_agent_turn(
-            turn_id.clone(),
-            user_content,
-            suspended,
-            hook_binding_ids,
-        )?;
+        let pending =
+            PendingLifecycleHook::pre_agent_turn(turn_id.clone(), user_content, hook_binding_ids)?;
         state.turn = TurnState::Active(ActiveTurn {
             turn_id: turn_id.clone(),
             iterations: 0,
             phase: ActivePhase::AwaitingHook { pending },
             pending_steer: Vec::new(),
             model_input_ready: false,
+            output_limit_retries: 0,
             queued: QueuedTurn::Empty,
         });
         return Ok(Outcome::action(pending_single_action(state)?));
     }
-    commit_turn(state, turn_id, turn_messages)
-}
-
-fn suspend_inactive_turn(turn: &TurnState) -> Result<SuspendedTurn, CoreError> {
-    match turn {
-        TurnState::Idle => Ok(SuspendedTurn::Idle),
-        TurnState::Terminal { turn_id, outcome } => Ok(SuspendedTurn::Terminal {
-            turn_id: turn_id.clone(),
-            outcome: outcome.clone(),
-        }),
-        TurnState::Active(_) | TurnState::Compacting { .. } => Err(CoreError::invariant(
-            "cannot suspend an active or compacting turn for a pre-agent hook",
-        )),
-    }
-}
-
-fn restore_suspended_turn(state: &mut HarnessState, suspended: SuspendedTurn) {
-    state.turn = match suspended {
-        SuspendedTurn::Idle => TurnState::Idle,
-        SuspendedTurn::Terminal { turn_id, outcome } => TurnState::Terminal { turn_id, outcome },
-    };
+    commit_turn(state, turn_id, turn_messages, QueuedTurn::Empty)
 }
 
 fn commit_turn(
     state: &mut HarnessState,
     turn_id: String,
     turn_messages: Vec<StoredMessage>,
+    queued: QueuedTurn,
 ) -> Result<Outcome, CoreError> {
     let content = turn_messages
         .iter()
@@ -1026,7 +1065,33 @@ fn commit_turn(
         content,
     });
     state.ensure_system_prompt();
-    state.context.extend(turn_messages);
+    // Inputs retained while idle precede the command that starts this Turn.
+    state.notifications.mark_ready();
+    let pending = state
+        .notifications
+        .take_ready(state.config.settings.context.notifications.recent_ids);
+    let notifications = pending
+        .into_iter()
+        .map(|entry| entry.notification)
+        .collect::<Vec<_>>();
+    let mut messages = notification_messages(
+        &notifications,
+        &state.config.settings.prompts.agent_messages,
+        state
+            .config
+            .settings
+            .tools
+            .subagents
+            .messages_resume_idle_children(),
+    )?;
+    for notification in notifications {
+        outcome.observe(Observation::NotificationDelivered {
+            turn_id: turn_id.clone(),
+            notification,
+        });
+    }
+    messages.extend(turn_messages);
+    state.context.extend_new_turn(messages)?;
     let phase = next_completion(state)?;
     state.turn = TurnState::Active(ActiveTurn {
         turn_id,
@@ -1034,7 +1099,8 @@ fn commit_turn(
         phase,
         pending_steer: Vec::new(),
         model_input_ready: true,
-        queued: QueuedTurn::Empty,
+        output_limit_retries: 0,
+        queued,
     });
     let action = pending_single_action(state)?;
     outcome.absorb(outcome_for_action(state, action)?);
@@ -1045,6 +1111,7 @@ fn interrupt(
     state: &mut HarnessState,
     expected_turn_id: String,
     reason: Option<String>,
+    determinism: DeterminismContext,
 ) -> Result<Outcome, CoreError> {
     let mut outcome = Outcome::quiet();
     validate_turn_id(&expected_turn_id, "interrupt expected_turn_id")?;
@@ -1060,7 +1127,7 @@ fn interrupt(
             CoreError::invalid_command("cannot interrupt a session without an active turn")
         })?
         .phase
-        .interrupt(interruption_message)?;
+        .interrupt(&state.tool_context()?, interruption_message, determinism)?;
     match resolution {
         InterruptionResolution::Quiet => {}
         InterruptionResolution::DiscardCompletion { action_id } => {
@@ -1073,13 +1140,14 @@ fn interrupt(
         InterruptionResolution::CommitToolMessages { messages } => {
             state
                 .context
-                .extend(messages.into_iter().map(StoredMessage::visible));
+                .extend_current_turn(messages.into_iter().map(StoredMessage::visible));
         }
     }
     let reason = reason.filter(|reason| !reason.trim().is_empty());
     outcome.observe(Observation::TurnInterrupted {
         turn_id: expected_turn_id.clone(),
         reason: reason.clone(),
+        output: state.context.latest_assistant_content_in_current_turn(),
     });
     let turn_id = state.finish_turn(TurnOutcome::Interrupted {
         reason: reason.clone(),
@@ -1100,6 +1168,7 @@ fn fail_turn(
     expected_turn_id: String,
     action_id: String,
     error: ProtocolError,
+    determinism: DeterminismContext,
 ) -> Result<Outcome, CoreError> {
     validate_turn_id(&expected_turn_id, "fail_turn expected_turn_id")?;
     require_active_turn_id(state, &expected_turn_id, "fail_turn")?;
@@ -1119,7 +1188,7 @@ fn fail_turn(
         .active()
         .ok_or_else(|| CoreError::invalid_command("cannot fail a session without an active turn"))?
         .phase
-        .interrupt(&error.message)?;
+        .interrupt(&state.tool_context()?, &error.message, determinism)?;
     let mut outcome = Outcome::quiet();
     match resolution {
         InterruptionResolution::Quiet => {}
@@ -1135,7 +1204,7 @@ fn fail_turn(
         InterruptionResolution::CommitToolMessages { messages } => {
             state
                 .context
-                .extend(messages.into_iter().map(StoredMessage::visible));
+                .extend_current_turn(messages.into_iter().map(StoredMessage::visible));
         }
     }
     outcome.observe(Observation::TurnFailed {
@@ -1313,6 +1382,73 @@ mod tests {
 
         assert!(matches!(next.effect, Some(Action::Completion { .. })));
         assert_eq!(next.state.active_turn_id(), Some("turn-2"));
+    }
+
+    /// A queue command can arrive while the pre-agent hook is pending; the
+    /// skip completes its turn and must start the queued turn, not drop it.
+    #[test]
+    fn a_pre_agent_skip_starts_the_queued_follow_up() {
+        let mut config = config();
+        add_always_hook(&mut config, HookPoint::PreAgentTurn);
+        let state = started_with(config);
+        let hook_action_id = awaiting_action_id(&state);
+
+        let queued = advance(
+            state,
+            user_message_for("turn-2", "queued work", UserMessageMode::Queue),
+        )
+        .unwrap();
+        assert_eq!(awaiting_action_id(&queued.state), hook_action_id);
+        assert_eq!(queued_messages(&queued.state).len(), 1);
+
+        let skipped = advance(
+            queued.state,
+            HarnessCommand::HookCompleted {
+                action_id: hook_action_id,
+                result: HookResult::PreAgentTurn(PreAgentTurnOutput::Skip {
+                    reason: vec![ContentBlock::text("disabled by policy".to_string())],
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            skipped.output(),
+            Some(vec![ContentBlock::text("disabled by policy".to_string())])
+        );
+        assert_eq!(skipped.state.active_turn_id(), Some("turn-2"));
+        assert!(queued_messages(&skipped.state).is_empty());
+    }
+
+    /// A queue command can arrive while the pre-agent hook is pending; the
+    /// continue commits its turn and must keep the queued follow-up.
+    #[test]
+    fn a_pre_agent_continue_keeps_the_queued_follow_up() {
+        let mut config = config();
+        add_always_hook(&mut config, HookPoint::PreAgentTurn);
+        let state = started_with(config);
+        let hook_action_id = awaiting_action_id(&state);
+
+        let queued = advance(
+            state,
+            user_message_for("turn-2", "queued work", UserMessageMode::Queue),
+        )
+        .unwrap();
+        assert_eq!(queued_messages(&queued.state).len(), 1);
+
+        let continued = advance(
+            queued.state,
+            HarnessCommand::HookCompleted {
+                action_id: hook_action_id,
+                result: HookResult::PreAgentTurn(PreAgentTurnOutput::Continue {
+                    user_content: vec![ContentBlock::text("start work".to_string())],
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(continued.state.active_turn_id(), Some("turn-1"));
+        assert_eq!(queued_messages(&continued.state).len(), 1);
     }
 
     #[test]

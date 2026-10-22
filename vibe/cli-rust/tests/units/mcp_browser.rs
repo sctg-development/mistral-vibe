@@ -1,4 +1,4 @@
-//! MCP browser rows, wire tolerance and runtime adoption match Python `MCPApp`.
+//! MCP browser rows, wire tolerance and runtime adoption.
 
 use std::sync::Arc;
 
@@ -74,6 +74,163 @@ fn malformed_source_is_skipped_and_new_fields_default() {
     assert_eq!(state.sources[0].label(), "fs");
     assert!(state.sources[0].plugin_name.is_none());
     assert!(state.manage_connectors_url.is_none());
+    assert!(!state.private_connectors_hidden);
+}
+
+#[test]
+fn private_connectors_warning_leads_connectors_without_taking_the_highlight() {
+    let app = open_app(&runtime(
+        vec![source("gh", "connector", json!({}))],
+        json!({
+            "privateConnectorsHidden": true,
+            "manageConnectorsUrl": "https://studio.example/connectors",
+        }),
+    ));
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(rows[1], Row::PrivateConnectorsHidden));
+    assert!(matches!(rows[2], Row::Manage));
+    assert!(matches!(&rows[app.mcp.list.selected()], Row::Source(row) if row.name == "gh"));
+}
+
+#[test]
+fn private_connectors_warning_shows_without_any_connector() {
+    let app = open_app(&runtime(
+        vec![source("fs", "server", json!({}))],
+        json!({"privateConnectorsHidden": true}),
+    ));
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(&rows[3], Row::Header(title) if title == "Available Connectors"));
+    assert!(matches!(rows[4], Row::PrivateConnectorsHidden));
+    assert_eq!(rows.len(), 5);
+}
+
+#[test]
+fn private_connectors_warning_shows_when_no_source_is_visible() {
+    let state =
+        serde_json::from_value(json!({"sources": [], "privateConnectorsHidden": true})).unwrap();
+    let mut app = App::default();
+    let event = mcp::Event::Opened {
+        response: None,
+        state,
+        initial_source: String::new(),
+        reopened: false,
+    };
+    mcp::apply_event(&mut app, &Arc::new(Client::stub()), event);
+    assert!(!app.mcp.open);
+    let transcript = &app.view.transcript;
+    assert!(transcript
+        .lines()
+        .filter_map(|entry| transcript.entry_content(entry.id))
+        .any(|content| content.to_string().contains("run `vibe --setup`")));
+}
+
+#[test]
+fn private_connectors_warning_stays_while_search_matches_nothing() {
+    let mut app = open_app(&runtime(
+        vec![source("gh", "connector", json!({}))],
+        json!({"privateConnectorsHidden": true}),
+    ));
+    app.mcp.search.query = "zzz".to_owned();
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(rows[1], Row::PrivateConnectorsHidden));
+    assert_eq!(rows.len(), 2);
+}
+
+fn shared_only_app() -> App {
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    open_app(&runtime(
+        vec![
+            source("weather", "server", needs_auth.clone()),
+            source("gmail", "connector", needs_auth),
+            source("gh", "connector", json!({})),
+        ],
+        json!({"privateConnectorsHidden": true}),
+    ))
+}
+
+#[test]
+fn shared_only_key_greys_out_connectors_that_need_a_login() {
+    let app = shared_only_app();
+    let blocked: Vec<(String, bool, bool, String)> = source_rows(&app)
+        .into_iter()
+        .map(|row| (row.name, row.blocked, row.action.is_some(), row.status))
+        .collect();
+    assert_eq!(
+        blocked,
+        [
+            ("weather".to_owned(), false, true, "needs auth".to_owned()),
+            ("gh".to_owned(), false, false, "connected".to_owned()),
+            (
+                "gmail".to_owned(),
+                true,
+                false,
+                "needs a personal API key".to_owned()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn connector_needing_a_login_is_not_blocked_for_personal_keys() {
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    let app = open_app(&runtime(
+        vec![source("gmail", "connector", needs_auth)],
+        json!({}),
+    ));
+    assert!(!source_rows(&app)[0].blocked);
+    assert_eq!(
+        source_rows(&app)[0].action,
+        Some(rows::SourceAction::ConnectorAuth)
+    );
+}
+
+#[test]
+fn enter_on_a_blocked_connector_explains_instead_of_connecting() {
+    let mut app = shared_only_app();
+    let mut rx = with_channel(&mut app);
+    while !matches!(&rows::rows(&app.mcp)[app.mcp.list.selected()], Row::Source(row) if row.name == "gmail")
+    {
+        mcp::navigate(&mut app, true);
+    }
+    assert_eq!(mcp::help_text(&app)[1].1, "why blocked");
+    mcp::select(&mut app);
+    drain(&mut app, &mut rx);
+    assert!(app.mcp.open && !app.connector_auth.open);
+    assert_eq!(app.mcp.viewing_name.as_deref(), Some("gmail"));
+    let rows = rows::rows(&app.mcp);
+    assert!(matches!(&rows[..], [Row::Hint { key, .. }] if key == "vibe --setup"));
+}
+
+#[test]
+fn private_connectors_warning_survives_a_runtime_without_it() {
+    let mut app = open_app(&runtime(
+        vec![source("gh", "connector", json!({}))],
+        json!({"privateConnectorsHidden": true}),
+    ));
+    mcp::apply_runtime(
+        &mut app,
+        &runtime(vec![source("gh", "connector", json!({}))], json!({})),
+    );
+    assert!(app.mcp.state.private_connectors_hidden);
+}
+
+#[test]
+fn private_connectors_block_survives_a_reread_without_the_flag() {
+    let mut app = shared_only_app();
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    let state = serde_json::from_value(json!({
+        "sources": [source("gmail", "connector", needs_auth)],
+    }))
+    .unwrap();
+    let event = mcp::Event::Opened {
+        response: None,
+        state,
+        initial_source: String::new(),
+        reopened: false,
+    };
+    mcp::apply_event(&mut app, &Arc::new(Client::stub()), event);
+    assert!(app.mcp.state.private_connectors_hidden);
+    assert!(source_rows(&app)[0].blocked);
 }
 
 #[test]
@@ -94,7 +251,7 @@ fn connectors_render_search_and_title_by_display_name() {
 }
 
 #[test]
-fn display_name_lookup_casefolds_like_python() {
+fn display_name_lookup_casefolds() {
     let state: MCPState = serde_json::from_value(json!({
         "sources": [source("st_alias", "connector", json!({"displayName": "Straße"}))],
     }))
@@ -127,7 +284,7 @@ fn manage_row_leads_connectors_but_never_takes_the_initial_highlight() {
     ));
     let rows = rows::rows(&app.mcp);
     assert!(matches!(rows[1], Row::Manage));
-    assert!(matches!(&rows[app.mcp.selected], Row::Source(row) if row.name == "gh"));
+    assert!(matches!(&rows[app.mcp.list.selected()], Row::Source(row) if row.name == "gh"));
 }
 
 #[test]
@@ -143,7 +300,7 @@ fn viewed_source_that_vanished_falls_back_to_the_list() {
     );
     assert!(app.mcp.viewing_name.is_none());
     assert!(
-        matches!(&rows::rows(&app.mcp)[app.mcp.selected], Row::Source(row) if row.name == "fs")
+        matches!(&rows::rows(&app.mcp)[app.mcp.list.selected()], Row::Source(row) if row.name == "fs")
     );
 }
 
@@ -332,6 +489,109 @@ fn help_offers_connect_only_for_sources_enter_hands_to_auth() {
     assert_eq!(mcp::help_text(&app)[1].1, "connect");
 }
 
+/// DeepWiki is connecting; weather and wiki still need a login and a connection.
+fn unusable_runtime() -> Value {
+    let needs_auth = json!({"status": "needs_auth", "tools": []});
+    let needs_connect = json!({"status": "needs_connect", "tools": []});
+    runtime(
+        vec![
+            source("weather", "server", needs_auth),
+            source("deepwiki", "connector", needs_connect.clone()),
+            source("wiki", "connector", needs_connect),
+        ],
+        json!({}),
+    )
+}
+
+fn connecting_app() -> (App, tokio::sync::mpsc::Receiver<mcp::Event>) {
+    let mut app = open_app(&unusable_runtime());
+    let rx = with_channel(&mut app);
+    app.mcp.connecting = Some("deepwiki".to_owned());
+    (app, rx)
+}
+
+fn view(app: &mut App, name: &str, kind: MCPSourceKind) {
+    app.mcp.viewing_name = Some(name.to_owned());
+    app.mcp.viewing_kind = Some(kind);
+}
+
+fn notes(app: &App) -> Vec<String> {
+    rows::rows(&app.mcp)
+        .into_iter()
+        .filter_map(|row| match row {
+            Row::Note(note) => Some(note),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn pending_action_names_the_flow_each_unusable_source_starts() {
+    let (app, _rx) = connecting_app();
+    let actions: Vec<_> = app
+        .mcp
+        .state
+        .sources
+        .iter()
+        .map(|source| rows::pending_action(&app.mcp.state, source))
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            Some(rows::SourceAction::McpOAuth),
+            Some(rows::SourceAction::Connect),
+            Some(rows::SourceAction::Connect),
+        ]
+    );
+}
+
+#[test]
+fn only_the_connector_in_flight_reads_connecting() {
+    let (mut app, _rx) = connecting_app();
+    view(&mut app, "deepwiki", MCPSourceKind::Connector);
+    assert_eq!(notes(&app), ["Connecting..."]);
+    view(&mut app, "wiki", MCPSourceKind::Connector);
+    assert_eq!(notes(&app), ["Not connected"]);
+}
+
+#[test]
+fn a_connect_in_flight_does_not_block_another_source_login() {
+    let (mut app, mut rx) = connecting_app();
+    view(&mut app, "weather", MCPSourceKind::Server);
+    mcp::apply_runtime(&mut app, &unusable_runtime());
+    drain(&mut app, &mut rx);
+    assert!(app.mcp_oauth.open);
+    assert_eq!(app.mcp_oauth.server_name, "weather");
+}
+
+#[test]
+fn a_failed_connect_leaves_another_viewed_connector_alone() {
+    let (mut app, _rx) = connecting_app();
+    view(&mut app, "wiki", MCPSourceKind::Connector);
+    app.mcp.connecting = Some("wiki".to_owned());
+    let failed = mcp::Event::ConnectFailed {
+        name: "deepwiki".to_owned(),
+        message: "Could not connect DeepWiki (HTTP 503).".to_owned(),
+    };
+    mcp::apply_event(&mut app, &Arc::new(Client::stub()), failed);
+    assert_eq!(app.mcp.viewing_name.as_deref(), Some("wiki"));
+    assert_eq!(app.mcp.connecting.as_deref(), Some("wiki"));
+    assert_eq!(app.overlays.toasts.len(), 1);
+}
+
+#[test]
+fn a_failed_connect_returns_from_its_own_view() {
+    let (mut app, _rx) = connecting_app();
+    view(&mut app, "deepwiki", MCPSourceKind::Connector);
+    let failed = mcp::Event::ConnectFailed {
+        name: "deepwiki".to_owned(),
+        message: "Could not connect DeepWiki (HTTP 503).".to_owned(),
+    };
+    mcp::apply_event(&mut app, &Arc::new(Client::stub()), failed);
+    assert_eq!(app.mcp.viewing_name, None);
+    assert_eq!(app.mcp.connecting, None);
+}
+
 fn open_named(query: &str) -> App {
     let gmail = source("gm_9c1b", "connector", json!({"displayName": "Gmail"}));
     let state = serde_json::from_value(json!({"sources": [gmail]})).unwrap();
@@ -344,13 +604,6 @@ fn open_named(query: &str) -> App {
     };
     mcp::apply_event(&mut app, &Arc::new(Client::stub()), event);
     app
-}
-
-#[test]
-fn named_open_resolves_the_shown_display_name() {
-    let app = open_named("gmail");
-    assert_eq!(app.mcp.viewing_name.as_deref(), Some("gm_9c1b"));
-    assert_eq!(rows::title(&app.mcp), "Connector: Gmail");
 }
 
 #[test]

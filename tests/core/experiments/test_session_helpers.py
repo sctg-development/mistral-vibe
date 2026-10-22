@@ -10,11 +10,8 @@ from vibe.core.experiments.active import ExperimentSurface
 from vibe.core.experiments.client import RemoteEvalClient
 from vibe.core.experiments.manager import ExperimentManager
 from vibe.core.experiments.models import EvalResponse, ExperimentAttributes
-from vibe.core.experiments.session import (
-    hydrate_experiments_from_session,
-    initialize_experiments,
-    resolve_plan_attributes,
-)
+from vibe.core.experiments.session import initialize_experiments
+from vibe.core.experiments.wait import experiments_eval_failed
 from vibe.core.identity import IdentityResult
 from vibe.core.paths import EXPERIMENT_EVAL_CACHE_FILE
 from vibe.core.telemetry.types import LaunchContext, TerminalEmulator
@@ -312,6 +309,7 @@ async def test_initialize_returns_false_when_remote_eval_fails(
     # this is the "tried but failed" case, distinct from "NO_PLAN_DATA".
     assert result[1] is None
     persist.assert_not_called()
+    assert experiments_eval_failed() is True
 
 
 @pytest.mark.asyncio
@@ -350,6 +348,36 @@ async def test_initialize_returns_true_and_persists_when_remote_eval_succeeds(
 
     assert result[0] is True
     persist.assert_awaited_once()
+    assert experiments_eval_failed() is False
+
+
+@pytest.mark.asyncio
+async def test_an_eval_without_a_user_id_stops_later_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No hash attribute: the response assigns nothing and is not cached, so a
+    # later session would wait for another eval that cannot route it either.
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
+        lambda _config: (MagicMock(), "fake-key"),
+    )
+    response = EvalResponse.model_validate({
+        "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
+    })
+    session_logger = MagicMock()
+    session_logger.persist_experiments = AsyncMock()
+
+    result = await initialize_experiments(
+        harness=ExperimentSurface.UNIFIED,
+        config=_make_config(),
+        manager=ExperimentManager(client=_StubClient(response)),
+        session_logger=session_logger,
+        launch_context=None,
+    )
+
+    assert result[0] is True
+    assert experiments_eval_failed() is True
+    assert not EXPERIMENT_EVAL_CACHE_FILE.path.exists()
 
 
 @pytest.mark.asyncio
@@ -457,25 +485,6 @@ async def test_initialize_omits_organization_id_when_identity_unavailable(
     assert client.attributes is not None
     assert client.attributes.organizationId is None
     assert client.attributes.userId is None
-
-
-@pytest.mark.asyncio
-async def test_hydrate_returns_false_when_telemetry_disabled() -> None:
-    session_logger = MagicMock()
-    response = EvalResponse.model_validate({
-        "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
-    })
-    session_logger.session_metadata.experiments = response
-    manager = ExperimentManager(client=_StubClient(None))
-
-    result = await hydrate_experiments_from_session(
-        config=_make_config(enable_telemetry=False),
-        manager=manager,
-        session_logger=session_logger,
-    )
-
-    assert result is False
-    assert manager.export_state() is None
 
 
 @pytest.mark.asyncio
@@ -694,166 +703,6 @@ async def test_initialize_uses_resolve_whoami_override(
     resolve_whoami.assert_awaited_once()
     assert client.attributes is not None
     assert client.attributes.organizationKind == "P"
-
-
-@pytest.mark.asyncio
-async def test_hydrate_returns_false_when_experiments_disabled() -> None:
-    # Regression: without this gate, a user who flipped experiments.enable
-    # to False between sessions would still resume into a hydrated variant.
-    session_logger = MagicMock()
-    response = EvalResponse.model_validate({
-        "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
-    })
-    session_logger.session_metadata.experiments = response
-    manager = ExperimentManager(client=_StubClient(None))
-
-    result = await hydrate_experiments_from_session(
-        config=_make_config(enable_experiments=False),
-        manager=manager,
-        session_logger=session_logger,
-    )
-
-    assert result is False
-    assert manager.export_state() is None
-
-
-@pytest.mark.asyncio
-async def test_hydrate_restores_only_the_sticky_variant_not_attributes() -> None:
-    # Resume restores ONLY the frozen variant assignment from meta.json. Plan/org
-    # attributes are user-scoped and rebuilt from the whoami/identity cache by
-    # resolve_plan_attributes, so hydrate must NOT read them from meta.json.
-    session_logger = MagicMock()
-    response = EvalResponse.model_validate({
-        "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
-    })
-    session_logger.session_metadata.experiments = response
-    manager = ExperimentManager(client=_StubClient(None))
-
-    result = await hydrate_experiments_from_session(
-        config=_make_config(), manager=manager, session_logger=session_logger
-    )
-
-    assert result is True
-    # Variant assignment restored ...
-    assert manager.export_state() is not None
-    # ... but attributes are NOT sourced from meta.json.
-    assert manager.attributes() is None
-
-
-@pytest.mark.asyncio
-async def test_hydrate_returns_false_when_no_persisted_experiments() -> None:
-    session_logger = MagicMock()
-    session_logger.session_metadata.experiments = None
-    manager = ExperimentManager(client=_StubClient(None))
-
-    result = await hydrate_experiments_from_session(
-        config=_make_config(), manager=manager, session_logger=session_logger
-    )
-
-    assert result is False
-    assert manager.export_state() is None
-
-
-@pytest.mark.asyncio
-async def test_resolve_plan_attributes_fetches_whoami_without_rebucketing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The resume plan-resolution path must NOT re-bucket (never call
-    # manager.initialize). It fetches identity + whoami, sets the attribute
-    # snapshot + user_plan, and leaves any hydrated EvalResponse intact.
-    monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
-    )
-    monkeypatch.setattr(
-        "vibe.core.experiments.session.fetch_whoami",
-        AsyncMock(
-            return_value=WhoAmIResult(
-                plan_type=AccountPlanKind.MISTRAL_CODE,
-                plan_name="E",
-                organization_kind="S",
-                prompt_switching_to_pro_plan=False,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        "vibe.core.experiments.session.fetch_identity", AsyncMock(return_value=None)
-    )
-    manager = ExperimentManager(client=_StubClient(None))
-
-    user_plan = await resolve_plan_attributes(
-        harness=ExperimentSurface.LEGACY,
-        config=_make_config(),
-        manager=manager,
-        launch_context=None,
-    )
-
-    assert user_plan == "Code Enterprise"
-    attrs = manager.attributes()
-    assert attrs is not None
-    assert attrs.planType == "mistral_code"
-    assert attrs.planName == "E"
-    # No re-bucketing — the EvalResponse is untouched.
-    assert manager.export_state() is None
-
-
-@pytest.mark.asyncio
-async def test_resolve_plan_attributes_returns_sentinel_when_no_mistral_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _make_config()
-    config.get_mistral_provider = lambda: None
-    monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: None,
-    )
-    manager = ExperimentManager(client=_StubClient(None))
-
-    user_plan = await resolve_plan_attributes(
-        harness=ExperimentSurface.LEGACY,
-        config=config,
-        manager=manager,
-        launch_context=None,
-    )
-
-    assert user_plan == "NO_PLAN_DATA"
-    attrs = manager.attributes()
-    assert attrs is not None
-    assert attrs.planType == "NO_PLAN_DATA"
-    assert attrs.planName == "NO_PLAN_DATA"
-
-
-@pytest.mark.asyncio
-async def test_resolve_plan_attributes_null_on_whoami_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Mistral key present but whoami fails (returns None): user_plan is null
-    # (the failure signal). The snapshot is still stamped (entrypoint/os) with
-    # null plan fields.
-    monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
-    )
-    monkeypatch.setattr(
-        "vibe.core.experiments.session.fetch_whoami", AsyncMock(return_value=None)
-    )
-    monkeypatch.setattr(
-        "vibe.core.experiments.session.fetch_identity", AsyncMock(return_value=None)
-    )
-    manager = ExperimentManager(client=_StubClient(None))
-
-    user_plan = await resolve_plan_attributes(
-        harness=ExperimentSurface.LEGACY,
-        config=_make_config(),
-        manager=manager,
-        launch_context=None,
-    )
-
-    assert user_plan is None
-    attrs = manager.attributes()
-    assert attrs is not None
-    assert attrs.planName is None
-    assert attrs.planType is None
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-//! `/clear`: reset the transcript, then adopt the session the server hands back.
+//! `/clear`: once the server confirms, reset the transcript and adopt its new session.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,18 +30,6 @@ pub fn seed(app: &App, value: &str) -> Option<QueuedPrompt> {
 
 pub(super) fn clear_history(app: &mut App, client: &Arc<Client>, value: &str) {
     let seed = seed(app, value);
-    app.view.transcript.clear();
-    app.todo_tracker.clear();
-    app.queue.clear();
-    app.view.transcript_cache.invalidate_layouts();
-    app.view.scroll = 0;
-    app.view.scroll_target = 0;
-    local::add_message(
-        &mut app.view.transcript,
-        &new_message_id(),
-        "command",
-        "clear",
-    );
     let Some((session_id, tx)) = dispatch(app) else {
         return;
     };
@@ -55,9 +43,14 @@ pub(super) fn clear_history(app: &mut App, client: &Arc<Client>, value: &str) {
         let Ok(value) = serde_json::to_value(params) else {
             return;
         };
-        let event = match client.request(method::SESSION_HISTORY_CLEAR, value).await {
+        let event = match client
+            .request_err(method::SESSION_HISTORY_CLEAR, value)
+            .await
+        {
             Ok(result) => cleared(result, previous_session_id, seed),
-            Err(error) => CommandEvent::Error(format!("Failed to clear history: {error}")),
+            Err(error) => {
+                CommandEvent::Error(format!("Failed to clear history: {}", error.message))
+            }
         };
         let _ = tx.try_send(event);
     });
@@ -86,6 +79,22 @@ pub fn cleared(
     }
 }
 
+/// Wipe the screen once the server confirmed: a failed clear keeps its history.
+fn reset_transcript(app: &mut App) {
+    app.view.transcript.clear();
+    app.todo_tracker.clear();
+    app.queue.clear();
+    app.view.transcript_cache.invalidate_layouts();
+    app.view.scroll = 0;
+    app.view.scroll_target = 0;
+    local::add_message(
+        &mut app.view.transcript,
+        &new_message_id(),
+        "command",
+        "clear",
+    );
+}
+
 /// Adopt the session `session/history/clear` created, on the main thread.
 pub fn apply_cleared(
     app: &mut App,
@@ -93,15 +102,16 @@ pub fn apply_cleared(
     usage: Option<TokenUsage>,
     child_sessions: Vec<crate::server::PublicChildSession>,
 ) {
+    reset_transcript(app);
     app.terminal_notifier.set_default_title("");
     app.set_session_id(session_id);
     app.session.active_turn_id = None;
-    // The cleared replacement owns its own child sessions (Python `replace_state`).
+    // The cleared replacement owns its own child sessions.
     app.subagents.seed_snapshot(child_sessions);
-    // Python `SessionContextCleared` -> `_reset_subagent_views`.
+    // A cleared context drops the previous session's subagent views.
     crate::subagents::reset_views(app);
     crate::subagents::refresh(app);
-    // Python `reset_usage_baseline` on the clear adopt, falling back to the
+    // Reset the usage baseline on the clear adopt, falling back to the
     // stats still held when the fresh state carries no usage.
     let baseline = usage.unwrap_or_else(|| crate::session_exit::current_usage(app));
     app.session.usage_baseline = Some(baseline);
@@ -109,7 +119,7 @@ pub fn apply_cleared(
     app.subagents.main_tokens = app.session.tokens;
 }
 
-/// Python `_clear_history`'s notice, naming the previous session when it can be resumed.
+/// The `/clear` notice, naming the previous session when it can be resumed.
 pub fn new_conversation_text(previous_session_id: Option<&str>) -> String {
     let Some(previous) = previous_session_id else {
         return "New conversation started.".to_owned();

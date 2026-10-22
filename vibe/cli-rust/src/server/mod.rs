@@ -6,22 +6,30 @@
 
 pub mod callback;
 pub mod child;
+pub mod connect;
 pub mod connector_web;
 pub mod effect;
 pub mod effect_output;
+pub mod frames;
 pub mod images;
+pub mod lines;
+pub mod multiplex;
+mod pending;
 pub mod process;
 pub mod proto_agents;
 pub mod proto_approval;
 pub mod proto_children;
+pub mod proto_fork;
 pub mod proto_mcp;
 pub mod proto_plugins;
 pub mod proto_projects;
 pub mod proto_proxy;
 pub mod proto_questions;
+pub mod proto_subagents;
 pub mod proto_teleport;
 pub mod proto_trust;
 pub mod reader;
+pub mod request_error;
 pub mod signal;
 pub mod stderr;
 pub mod types;
@@ -30,18 +38,23 @@ pub mod web_output;
 mod windows_job;
 
 pub use child::{ChildHandle, SHUTDOWN_GRACE};
+pub use connect::{Connect, Connected, Connection};
 pub use effect::*;
 pub use effect_output::*;
 pub use images::*;
+pub use multiplex::{ChannelCloser, ChannelGuard, MuxClient};
 pub use process::{
     ActiveSession, Client, Launch, Notification, Pending, RequestFailure, DEFAULT_APP_SERVER_ARGS,
+    UV_PYTHON_REQUEST,
 };
 pub use proto_agents::*;
 pub use proto_approval::*;
 pub use proto_children::*;
+pub use proto_fork::*;
 pub use proto_mcp::*;
 pub use proto_plugins::*;
 pub use proto_questions::*;
+pub use proto_subagents::*;
 pub use proto_trust::*;
 pub use types::*;
 

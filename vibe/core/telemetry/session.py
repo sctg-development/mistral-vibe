@@ -82,6 +82,31 @@ class SessionTelemetry:
             attachment_counts=attachment_counts,
         )
 
+    def record_tool_call_detected(
+        self,
+        *,
+        model: str,
+        backend: str,
+        api_style: str,
+        call_type: TelemetryCallType,
+        reasons: list[str],
+        nb_unusable_attempts: int,
+        nb_dropped_tool_calls: int,
+        status: Literal["success", "error"],
+        message_id: str | None = None,
+    ) -> None:
+        self._client.send_tool_call_detected(
+            model=model,
+            backend=backend,
+            api_style=api_style,
+            call_type=call_type,
+            reasons=reasons,
+            nb_unusable_attempts=nb_unusable_attempts,
+            nb_dropped_tool_calls=nb_dropped_tool_calls,
+            status=status,
+            message_id=message_id,
+        )
+
     def record_tool_call_finished(
         self,
         *,
@@ -118,6 +143,7 @@ class SessionTelemetry:
         operation: SubagentOperation,
         outcome: SubagentOutcome,
         profile_source: SubagentProfileSource | None,
+        caller_agent_path: str,
         message_id: str | None = None,
     ) -> None:
         send_unified_subagent_tool_call_finished(
@@ -125,6 +151,7 @@ class SessionTelemetry:
             operation=operation,
             outcome=outcome,
             model=self._model,
+            caller_agent_path=caller_agent_path,
             profile_source=profile_source,
             message_id=message_id,
         )

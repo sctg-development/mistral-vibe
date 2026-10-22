@@ -15,7 +15,7 @@ export VIBE_APP_SERVER_CWD = .
 # VIBE_APP_SERVER_CWD); the guard only activates when that checkout exists.
 HARNESS_SRC ?=
 HARNESS_EDITABLE = $(if $(HARNESS_SRC),$(if $(wildcard $(HARNESS_SRC)/pyproject.toml),--with-editable $(HARNESS_SRC) ,),)
-start run release profile-stress: export VIBE_APP_SERVER_CMD = uv run --quiet $(HARNESS_EDITABLE)vibe-app-server --experimental-harness
+start run release profile-stress: export VIBE_APP_SERVER_CMD = uv run --quiet --python cpython>=3.12+gil $(HARNESS_EDITABLE)vibe-app-server
 
 # Set QUIET=1 for quiet test output: nextest prints only failures and the
 # summary, and the golden pytest run gets -q.
@@ -25,7 +25,7 @@ NEXTEST_QUIET = $(if $(QUIET),--status-level none --final-status-level fail,)
 
 .PHONY: start run build build_test release fmt fmt_check lint lint_test check clean sweep test test_rust test_golden store_golden profile-stress view-stress
 
-# The golden snapshot pytest run (Rust-only), shared by `test` and `test_golden`.
+# The golden snapshot pytest run, shared by `test` and `test_golden`.
 GOLDEN_CMD = uv run --no-project --with "pyte==0.8.2" --with "rich==15.0.0" --with pytest --with pytest-timeout --with pytest-xdist \
 	python -m pytest client-e2e/test_golden.py -n $(E2E_JOBS) --dist loadgroup --timeout 60 $(QUIET_FLAGS)
 # Parallel workers (override with E2E_JOBS=N; loadgroup keeps a scenario's steps on one worker).
@@ -73,19 +73,20 @@ clean:
 sweep:          ## Delete incremental sessions older than 7 days
 	[ ! -d vibe/cli-rust/target/debug/incremental ] || find vibe/cli-rust/target/debug/incremental -maxdepth 1 -mindepth 1 -type d -mtime +7 -exec rm -rf {} +
 
-test_rust:      ## Rust tests via cargo-nextest, fast gate before client-e2e
+test_rust:      ## Rust tests: pure `units` in one libtest process, the rest via cargo-nextest
 	@cargo nextest --version >/dev/null 2>&1 || { echo "cargo-nextest missing: cargo install cargo-nextest --locked --version 0.9.146"; exit 1; }
-	cargo nextest run $(M) $(TEST_CARGO_FLAGS) $(NEXTEST_QUIET)
+	cargo nextest run $(M) $(TEST_CARGO_FLAGS) -E 'not binary(units)' $(NEXTEST_QUIET)
+	cargo test $(M) $(TEST_CARGO_FLAGS) --test units $(QUIET_FLAGS)
 
 test: build_test test_rust  ## Rust tests, then golden snapshots
 	rm -rf client-e2e/goldens/_live
 	$(GOLDEN_CMD)
 
-test_golden: build_test ## Rust golden snapshot tests (Rust-only, no Python CLI needed)
+test_golden: build_test ## Golden snapshot tests
 	rm -rf client-e2e/goldens/_live
 	$(GOLDEN_CMD)
 
-store_golden: build_test ## Regenerate Rust golden snapshots (all scenarios)
+store_golden: build_test ## Regenerate golden snapshots (all scenarios)
 	uv run --no-project --with "pyte==0.8.2" --with "rich==15.0.0" python client-e2e/store_golden.py --all
 
 STRESS_OUT ?= profile.stress.json

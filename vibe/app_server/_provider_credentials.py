@@ -23,10 +23,16 @@ from mistralai_vibe_local_harness.vibe import (
     ProviderCredentialResult,
     ProviderCredentialSnapshot,
 )
+from vibe.core.config.models import MissingAPIKeyError
 from vibe.core.llm.key_pool import note_active_key
 from vibe.core.types import Backend
 from vibe.observability.logging import logger
-from vibe.utils.api_keys import pooled_keys, resolve_api_key_with_origin
+from vibe.utils.api_keys import (
+    pooled_keys,
+    resolve_api_key_with_origin,
+    session_credentials,
+)
+from vibe.utils.keyring import keyring_read_failure
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -60,8 +66,12 @@ class ProviderCredentialService:
         orchestrator: ConfigOrchestrator[VibeConfigSchema],
         *,
         select_provider: ProviderSelector | None = None,
+        credentials: Mapping[str, str] | None = None,
     ) -> None:
         self._orchestrator = orchestrator
+        # The session's own keys, by environment variable name, ahead of the
+        # process's: one process may serve runs that each bring a key.
+        self._credentials = credentials
         # Which provider a resolution targets. Defaults to the session's active
         # provider; a caller can bind a second service to a different provider
         # (e.g. the Mistral utility provider for background title generation).
@@ -92,19 +102,19 @@ class ProviderCredentialService:
         except ValueError as exc:
             return ProviderAuthRequired(reason="missing", provider="", message=str(exc))
 
-        if not provider.api_key_env_var and not _uses_vertex(provider):
+        if not provider.api_key_env_var and not provider.uses_vertex:
             return _snapshot(provider, None, {}, api_key_source=None)
 
-        snapshot = await asyncio.to_thread(_resolve_snapshot, provider)
+        snapshot = await asyncio.to_thread(
+            _resolve_snapshot, provider, self._credentials
+        )
         if snapshot is None:
             env_var = provider.api_key_env_var or "VIBE_API_KEY"
+            error = MissingAPIKeyError(
+                env_var, provider.name, keyring_error=keyring_read_failure(env_var)
+            )
             return ProviderAuthRequired(
-                reason="missing",
-                provider=provider.name,
-                message=(
-                    f"Missing {env_var} environment variable "
-                    f"for {provider.name} provider"
-                ),
+                reason="missing", provider=provider.name, message=str(error)
             )
 
         async with self._lock:
@@ -131,7 +141,9 @@ class ProviderCredentialService:
         except ValueError:
             return
 
-        current = await asyncio.to_thread(_resolve_snapshot, provider)
+        current = await asyncio.to_thread(
+            _resolve_snapshot, provider, self._credentials
+        )
         if current is not None and current.revision != observed_revision:
             # A refresh already replaced the material this rejection names.
             # Discarding the new credential would force a re-authentication
@@ -139,7 +151,7 @@ class ProviderCredentialService:
             # expire between resolution and send.
             return
 
-        if _uses_vertex(provider):
+        if provider.uses_vertex:
             # Vertex mints its own tokens, so recovery is a fresh mint rather
             # than a new configuration. Clearing the shared credentials makes
             # the next resolution produce a different revision on its own,
@@ -164,21 +176,20 @@ def _active_provider(config: VibeConfigSchema) -> ProviderConfig:
     return config.get_provider_for_model(config.get_active_model())
 
 
-def _uses_vertex(provider: ProviderConfig) -> bool:
-    # ``MistralBackend`` ignores ``api_style`` entirely, so the backend choice
-    # decides first, exactly as ``create_backend`` does.
-    return (
-        provider.backend != Backend.MISTRAL and provider.api_style == "vertex-anthropic"
-    )
-
-
-def _resolve_snapshot(provider: ProviderConfig) -> ProviderCredentialSnapshot | None:
+def _resolve_snapshot(
+    provider: ProviderConfig, credentials: Mapping[str, str] | None = None
+) -> ProviderCredentialSnapshot | None:
     """Resolve one credential for ``provider``, or ``None`` when none exists.
+
+    ``credentials``, when given, resolve before the process's own keys.
 
     Runs in a thread: key resolution touches the keyring and the filesystem,
     and the Vertex path performs a blocking token refresh.
     """
-    if _uses_vertex(provider):
+    if credentials:
+        with session_credentials(credentials):
+            return _resolve_snapshot(provider)
+    if provider.uses_vertex:
         # Vertex ignores the configured key and mints a Google ADC token,
         # refreshed process-wide, so "no key configured" is never the answer
         # here — a failure to mint raises and becomes ``ProviderAuthRequired``.

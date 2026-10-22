@@ -9,7 +9,7 @@ use crate::app::App;
 use crate::server::{method, Client, PublicSessionState};
 
 /// Ask whether rewinding to `messages[index]` would restore files; the panel
-/// opens on the answer (Python `_select_rewind_widget`).
+/// opens on the answer.
 pub(super) fn select(
     app: &mut App,
     client: &Arc<Client>,
@@ -27,7 +27,10 @@ pub(super) fn select(
     let pending = app.commit_started();
     tokio::spawn(async move {
         let params = serde_json::json!({"sessionId": session_id, "entryId": entry_id});
-        let event = match client.request(method::SESSION_REWIND_READ, params).await {
+        let event = match client
+            .request_err(method::SESSION_REWIND_READ, params)
+            .await
+        {
             Ok(result) => Event::Selected {
                 entry_index,
                 entry_id,
@@ -37,13 +40,13 @@ pub(super) fn select(
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             },
-            Err(error) => Event::Failed(error.to_string()),
+            Err(error) => Event::Failed(error.message),
         };
         crate::input::deliver(Some(tx), event, &pending).await;
     });
 }
 
-/// Send the rewind itself (Python `_execute_rewind`).
+/// Send the rewind itself.
 pub(super) fn confirm(app: &mut App, client: &Arc<Client>, inplace: bool) {
     let (Some(session_id), Some(entry_id), Some(tx)) = (
         app.session.session_id.clone(),
@@ -62,9 +65,9 @@ pub(super) fn confirm(app: &mut App, client: &Arc<Client>, inplace: bool) {
             "restoreFiles": restore_files,
             "inplace": inplace,
         });
-        let event = match client.request(method::SESSION_REWIND, params).await {
+        let event = match client.request_err(method::SESSION_REWIND, params).await {
             Ok(result) => done(result, session_id, inplace),
-            Err(error) => Event::Failed(error.to_string()),
+            Err(error) => Event::Failed(error.message),
         };
         crate::input::deliver(Some(tx), event, &pending).await;
     });

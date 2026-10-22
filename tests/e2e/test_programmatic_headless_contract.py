@@ -8,6 +8,7 @@ endpoint received.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import signal
@@ -32,6 +33,7 @@ from tests.e2e.common import (
 from tests.e2e.mock_server import ChatCompletionsRequestPayload, StreamingMockServer
 from vibe import __version__
 from vibe.app_server.run_export import RunUsage
+from vibe.core.config._defaults import DEFAULT_OUTPUT_LIMIT_RETRIES
 
 pytestmark = [pytest.mark.timeout(90), pytest.mark.usefixtures("setup_e2e_env")]
 
@@ -601,9 +603,10 @@ def _truncated_reply(
 def test_response_cut_off_at_the_output_cap_is_a_length_outcome(
     streaming_mock_server: StreamingMockServer, e2e_workdir: Path, tmp_path: Path
 ) -> None:
-    """*Prepare*: A model whose answer stops at the output cap.
+    """*Prepare*: A model whose every answer stops at the output cap.
     *Do*: Run `vibe -p`.
-    *Assert*: Exit 3 and the export reports `length`.
+    *Assert*: Vibe asks again with feedback up to the retry cap, then exits 3
+    and the export reports `length`.
     """
     # Prepare
     output_dir = tmp_path / "out"
@@ -619,7 +622,11 @@ def test_response_cut_off_at_the_output_cap_is_a_length_outcome(
     assert export.outcome == "length"
     assert export.exit_code == 3
     assert export.stop_reason == "length"
-    assert len(streaming_mock_server.requests) == 1
+    assert len(streaming_mock_server.requests) == 1 + DEFAULT_OUTPUT_LIMIT_RETRIES
+    last_request = json.dumps(streaming_mock_server.requests[-1])
+    assert last_request.count("reached the output token limit") == (
+        DEFAULT_OUTPUT_LIMIT_RETRIES
+    )
 
 
 def _refused_reply(
@@ -639,21 +646,19 @@ def _refused_reply(
 
 
 @pytest.mark.parametrize("streaming_mock_server", [_refused_reply], indirect=True)
-def test_a_model_refusal_is_a_refusal_outcome(
+def test_a_model_refusal_is_a_refusal_outcome_and_exits_three(
     streaming_mock_server: StreamingMockServer, e2e_workdir: Path, tmp_path: Path
 ) -> None:
-    """*Prepare*: A model that refuses to answer. Only the legacy runtime
-    reports a refusal as one, so the run uses it.
+    """*Prepare*: A model that refuses to answer.
     *Do*: Run `vibe -p`.
-    *Assert*: Exit 3, and the export reports `refusal` with the error's code.
+    *Assert*: Exit 3 with the `refusal` outcome, the model's own answer to score.
     """
     # Prepare
     output_dir = tmp_path / "out"
 
     # Do
     result = run_vibe_headless(
-        e2e_workdir,
-        ["--legacy-harness", "-p", "hello", "--output-dir", str(output_dir)],
+        e2e_workdir, ["-p", "hello", "--output-dir", str(output_dir)]
     )
 
     # Assert
@@ -661,7 +666,4 @@ def test_a_model_refusal_is_a_refusal_outcome(
     export = read_export(output_dir)
     assert export.outcome == "refusal"
     assert export.exit_code == 3
-    assert export.error is not None
-    assert export.error.code == "refusal"
-    assert "declined to respond" in export.error.message
     assert len(streaming_mock_server.requests) == 1

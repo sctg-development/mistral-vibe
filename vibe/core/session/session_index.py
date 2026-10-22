@@ -318,20 +318,6 @@ def session_index_for(config: SessionLoggingConfig) -> SessionIndex:
         return index
 
 
-def warm_session_index(config: SessionLoggingConfig) -> None:
-    """Launch a background thread to warm the persisted session index"""
-    index = session_index_for(config)
-
-    def _warm() -> None:
-        """Prime the index off-thread, swallowing errors."""
-        try:
-            index.list()
-        except Exception:
-            logger.exception("Failed to warm session index")
-
-    threading.Thread(target=_warm, name="session-index-warm", daemon=True).start()
-
-
 def clear_session_index_registry() -> None:
     """Reset the persisted index"""
     with _REGISTRY_LOCK:

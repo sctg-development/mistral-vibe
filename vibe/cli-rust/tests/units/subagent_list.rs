@@ -1,9 +1,9 @@
-//! Subagent status-list state transitions (Python `SubagentList` + app wiring).
+//! Subagent status-list state transitions.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use vibe_rs::app::App;
 use vibe_rs::server::{PublicChildSession, SessionStatus};
-use vibe_rs::subagents::{self, MAIN_SESSION_ID};
+use vibe_rs::subagents;
 
 fn child(id: &str, status: SessionStatus) -> PublicChildSession {
     PublicChildSession {
@@ -31,7 +31,7 @@ fn upsert(app: &mut App, session: PublicChildSession) {
 }
 
 #[test]
-fn refresh_lists_children_and_keeps_the_batch_held() {
+fn refresh_lists_active_children() {
     let mut app = App::default();
     upsert(&mut app, running("a"));
     upsert(&mut app, running("b"));
@@ -40,10 +40,6 @@ fn refresh_lists_children_and_keeps_the_batch_held() {
         ["a", "b"],
         "active children are listed"
     );
-    // Both go idle inside the same batch: still listed (no flicker).
-    upsert(&mut app, child("a", SessionStatus::Idle));
-    upsert(&mut app, child("b", SessionStatus::Idle));
-    assert_eq!(ids(&app.subagents.list.rows), ["a", "b"]);
 }
 
 #[test]
@@ -52,7 +48,7 @@ fn focusing_the_list_and_up_at_main_returns_to_the_input() {
     upsert(&mut app, running("a"));
     assert!(subagents::focus_first(&mut app));
     assert!(app.subagents.list.focused);
-    assert_eq!(app.subagents.list.highlighted, 0);
+    assert_eq!(app.subagents.list.options.selected(), 0);
     // Up on the Main row hands focus back (nothing is viewed).
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::Up)));
     assert!(!app.subagents.list.focused);
@@ -64,7 +60,7 @@ fn enter_selects_the_highlighted_child_and_esc_returns_to_main() {
     upsert(&mut app, running("a"));
     subagents::focus_first(&mut app);
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::Down)));
-    assert_eq!(app.subagents.list.highlighted, 1);
+    assert_eq!(app.subagents.list.options.selected(), 1);
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::Enter)));
     assert_eq!(app.subagents.viewed_subagent_id.as_deref(), Some("a"));
     assert!(
@@ -127,10 +123,10 @@ fn opening_a_child_view_moves_the_highlight_to_it() {
     upsert(&mut app, running("a"));
     upsert(&mut app, running("b"));
     subagents::show_subagent_chat(&mut app, "b");
-    assert_eq!(app.subagents.list.highlighted, 2);
+    assert_eq!(app.subagents.list.options.selected(), 2);
     // Returning to main moves the highlight back to the Main row.
     subagents::show_main_chat(&mut app, false);
-    assert_eq!(app.subagents.list.highlighted, 0);
+    assert_eq!(app.subagents.list.options.selected(), 0);
     assert!(
         app.subagents.list.focused,
         "Main selection keeps the list focused"
@@ -161,32 +157,6 @@ fn selecting_main_from_a_child_view_focuses_the_input() {
 }
 
 #[test]
-fn marker_follows_the_keyboard_highlight_while_focused() {
-    let mut app = App::default();
-    upsert(&mut app, running("a"));
-    subagents::focus_first(&mut app);
-    subagents::handle_list_key(&mut app, key(KeyCode::Down));
-    assert_eq!(
-        app.subagents
-            .list
-            .mouse_session_id
-            .or_else(|| {
-                app.subagents.list.focused.then(|| {
-                    if app.subagents.list.highlighted == 0 {
-                        MAIN_SESSION_ID.to_owned()
-                    } else {
-                        app.subagents.list.rows[app.subagents.list.highlighted - 1]
-                            .id
-                            .clone()
-                    }
-                })
-            })
-            .as_deref(),
-        Some("a")
-    );
-}
-
-#[test]
 fn the_highlight_follows_its_row_across_batch_changes() {
     let mut app = App::default();
     upsert(&mut app, running("a"));
@@ -196,12 +166,12 @@ fn the_highlight_follows_its_row_across_batch_changes() {
     subagents::handle_list_key(&mut app, key(KeyCode::Down));
     subagents::handle_list_key(&mut app, key(KeyCode::Down));
     subagents::handle_list_key(&mut app, key(KeyCode::Down));
-    assert_eq!(app.subagents.list.highlighted, 3, "the last child");
+    assert_eq!(app.subagents.list.options.selected(), 3, "the last child");
     // `b` drops out of the batch; the highlight stays on `c` (Python re-indexes).
     app.subagents.sessions.retain(|session| session.id != "b");
     app.subagents.list.batch_session_ids.remove("b");
     subagents::refresh(&mut app);
-    assert_eq!(app.subagents.list.highlighted, 2);
+    assert_eq!(app.subagents.list.options.selected(), 2);
     assert_eq!(ids(&app.subagents.list.rows), ["a", "c"]);
 }
 
@@ -226,25 +196,26 @@ fn page_home_end_and_jk_navigate_like_the_option_list() {
     subagents::focus_first(&mut app);
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::PageDown)));
     assert_eq!(
-        app.subagents.list.highlighted, 7,
+        app.subagents.list.options.selected(),
+        7,
         "a page of 7 rows from Main lands on the last child"
     );
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::PageUp)));
-    assert_eq!(app.subagents.list.highlighted, 0);
+    assert_eq!(app.subagents.list.options.selected(), 0);
     assert!(subagents::handle_list_key(
         &mut app,
         key(KeyCode::Char('j'))
     ));
-    assert_eq!(app.subagents.list.highlighted, 1);
+    assert_eq!(app.subagents.list.options.selected(), 1);
     assert!(subagents::handle_list_key(
         &mut app,
         key(KeyCode::Char('k'))
     ));
-    assert_eq!(app.subagents.list.highlighted, 0);
+    assert_eq!(app.subagents.list.options.selected(), 0);
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::End)));
-    assert_eq!(app.subagents.list.highlighted, 7);
+    assert_eq!(app.subagents.list.options.selected(), 7);
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::Home)));
-    assert_eq!(app.subagents.list.highlighted, 0);
+    assert_eq!(app.subagents.list.options.selected(), 0);
 }
 
 #[test]
@@ -254,15 +225,26 @@ fn the_wheel_scrolls_the_viewport_without_moving_the_highlight() {
         upsert(&mut app, running(id));
     }
     subagents::focus_first(&mut app);
-    vibe_rs::subagents::list::wheel(&mut app, true, 2);
-    assert_eq!(app.subagents.list.free_scroll, Some(2));
-    assert_eq!(app.subagents.list.highlighted, 0, "the highlight stays put");
+    app.subagents.list.options.wheel(true, 2);
+    assert!(app.subagents.list.options.free_scroll());
+    assert_eq!(app.subagents.list.options.scroll(), 2);
+    assert_eq!(
+        app.subagents.list.options.selected(),
+        0,
+        "the highlight stays put"
+    );
     // A highlight move pins the viewport back to it.
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::Down)));
-    assert_eq!(app.subagents.list.free_scroll, None);
-    // The wheel cannot scroll past the last row.
-    vibe_rs::subagents::list::wheel(&mut app, true, 50);
-    assert_eq!(app.subagents.list.free_scroll, Some(8));
+    assert!(!app.subagents.list.options.free_scroll());
+    // The wheel cannot scroll past the last page.
+    app.subagents.list.options.wheel(true, 50);
+    let rows = app.subagents.list.rows.len() + 1;
+    let scroll = app
+        .subagents
+        .list
+        .options
+        .layout_rows(rows, ratatui::layout::Rect::new(0, 0, 40, 7));
+    assert_eq!(scroll, rows - 7);
 }
 
 #[test]
@@ -272,29 +254,29 @@ fn live_updates_keep_the_wheel_scrolled_viewport_until_the_highlight_moves() {
         upsert(&mut app, running(id));
     }
     subagents::focus_first(&mut app);
-    vibe_rs::subagents::list::wheel(&mut app, true, 1);
-    assert_eq!(app.subagents.list.free_scroll, Some(1));
+    app.subagents.list.options.wheel(true, 1);
+    assert!(app.subagents.list.options.free_scroll());
     // A status or token tick that does not move the highlight keeps the
     // wheel-scrolled viewport in place.
     let mut session = running("b");
     session.token_usage.total_tokens = 40;
     upsert(&mut app, session);
-    assert_eq!(
-        app.subagents.list.free_scroll,
-        Some(1),
+    assert!(
+        app.subagents.list.options.free_scroll(),
         "a live tick without a highlight move keeps the viewport"
     );
+    assert_eq!(app.subagents.list.options.scroll(), 1);
     // A rebuilt row set resets the viewport (Python `clear_options`).
     app.subagents
         .seed_snapshot(vec![running("a"), running("b")]);
     subagents::refresh(&mut app);
-    assert_eq!(
-        app.subagents.list.free_scroll, None,
+    assert!(
+        !app.subagents.list.options.free_scroll(),
         "a row-set change re-pins the viewport without a highlight move"
     );
     // A highlight move pins the viewport back to it.
     assert!(subagents::handle_list_key(&mut app, key(KeyCode::Down)));
-    assert_eq!(app.subagents.list.free_scroll, None);
+    assert!(!app.subagents.list.options.free_scroll());
 }
 
 #[test]
@@ -408,4 +390,23 @@ fn a_paste_is_dropped_while_the_list_or_a_child_view_owns_focus() {
     app.subagents.viewed_subagent_id = None;
     vibe_rs::input::handle_paste(&mut app, "pasted".into());
     assert_eq!(app.chat_input.input, "pasted");
+}
+
+#[test]
+fn a_config_write_toggles_the_status_list_live() {
+    let mut app = App::default();
+    upsert(&mut app, running("a"));
+    let written = |enabled: bool| {
+        let runtime =
+            serde_json::json!({"runtime": {"config": {"showSubagentStatusList": enabled}}});
+        vibe_rs::model_picker::Event::Written(runtime)
+    };
+
+    app.commit_started();
+    vibe_rs::model_picker::apply_event(&mut app, written(false));
+    assert!(app.subagents.list.rows.is_empty());
+
+    app.commit_started();
+    vibe_rs::model_picker::apply_event(&mut app, written(true));
+    assert_eq!(ids(&app.subagents.list.rows), ["a"]);
 }

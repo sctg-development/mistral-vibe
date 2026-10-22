@@ -97,7 +97,7 @@ displayed_workdir = "user-only"
     project_config_path.parent.mkdir(parents=True)
     project_config_path.write_text(
         """\
-default_agent = "plan"
+default_agent = "smart-approve"
 context_warnings = true
 ask_confirmation_on_exit = true
 """,
@@ -397,9 +397,9 @@ async def test_tool_defaults_can_be_written_to_discovered_layer() -> None:
 
     assert result == []
     assert orchestrator.config.tools["bash"]["permission"] == ToolPermission.ASK
-    assert orchestrator.config.tools["bash"]["default_timeout"] == 300
+    assert "default_timeout" not in orchestrator.config.tools["bash"]
     assert orchestrator.config.tools["read_file"]["permission"] == ToolPermission.ALWAYS
-    assert orchestrator.config.tools["read_file"]["max_read_bytes"] == 51200
+    assert orchestrator.config.tools["read_file"]["max_read_bytes"] == 64_000
 
 
 @pytest.mark.asyncio
@@ -438,27 +438,33 @@ async def test_agent_profile_layer_overrides_runtime_overrides() -> None:
 async def test_agent_manager_switch_profile_updates_agent_profile_layer() -> None:
     orchestrator = await build_default_orchestrator()
 
-    manager = AgentManager(orchestrator)
+    manager = AgentManager(orchestrator, initial_agent=BuiltinAgentName.ASK)
 
-    await _switch_profile_with_agent_layer(manager, orchestrator, BuiltinAgentName.PLAN)
+    await _switch_profile_with_agent_layer(
+        manager, orchestrator, BuiltinAgentName.ACCEPT_EDITS
+    )
 
-    assert manager.active_profile.name == BuiltinAgentName.PLAN
-    assert orchestrator.config.tools["write_file"]["permission"] == "never"
-    assert manager.config.tools["write_file"]["permission"] == "never"
+    assert manager.active_profile.name == BuiltinAgentName.ACCEPT_EDITS
+    assert orchestrator.config.tools["write_file"]["permission"] == "always"
+    assert manager.config.tools["write_file"]["permission"] == "always"
 
     tool_manager = ToolManager(lambda: orchestrator.config)
 
-    assert tool_manager.get_tool_config("write_file").permission == ToolPermission.NEVER
+    assert (
+        tool_manager.get_tool_config("write_file").permission == ToolPermission.ALWAYS
+    )
 
 
 @pytest.mark.asyncio
 async def test_agent_manager_switch_profile_replaces_agent_profile_layer() -> None:
     orchestrator = await build_default_orchestrator()
-    manager = AgentManager(orchestrator)
+    manager = AgentManager(orchestrator, initial_agent=BuiltinAgentName.ASK)
 
-    await _switch_profile_with_agent_layer(manager, orchestrator, BuiltinAgentName.PLAN)
+    await _switch_profile_with_agent_layer(
+        manager, orchestrator, BuiltinAgentName.ACCEPT_EDITS
+    )
 
-    assert orchestrator.config.tools["write_file"]["permission"] == "never"
+    assert orchestrator.config.tools["write_file"]["permission"] == "always"
 
     await _switch_profile_with_agent_layer(manager, orchestrator, BuiltinAgentName.ASK)
 

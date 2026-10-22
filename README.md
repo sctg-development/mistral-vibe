@@ -48,6 +48,13 @@ Then, use uv command below.
 uv tool install mistral-vibe
 ```
 
+Vibe needs a GIL-enabled build of Python 3.12 or later. If you have a free-threaded (no-GIL) Python installed and the install fails, force the GIL build of Python 3.14:
+
+```bash
+uv python install cpython-3.14
+uv tool install --python cpython-3.14+gil mistral-vibe
+```
+
 ### Using pip
 
 ```bash
@@ -66,7 +73,6 @@ pip install mistral-vibe
   - [Interactive Mode](#interactive-mode)
   - [Trust Folder System](#trust-folder-system)
   - [Programmatic Mode](#programmatic-mode)
-  - [TUI Implementations](#tui-implementations)
 - [Voice Mode](#voice-mode)
 - [Slash Commands](#slash-commands)
   - [Built-in Slash Commands](#built-in-slash-commands)
@@ -96,7 +102,7 @@ pip install mistral-vibe
 - **Interactive Chat**: A conversational AI agent that understands your requests and breaks down complex tasks.
 - **Powerful Toolset**: A suite of tools for file manipulation, code searching, version control, and command execution, right from the chat prompt.
   - Read, write, and patch files (`read`, `write_file`, `edit`).
-  - Execute shell commands, with managed shell sessions, polling, and stdin helpers available during rollout.
+  - Execute shell commands, with managed shell sessions, polling, and stdin helpers.
   - Recursively search code with `grep` (with `ripgrep` support).
   - Manage a `todo` list to track the agent's work.
   - Ask interactive questions to gather user input (`ask_user_question`).
@@ -116,24 +122,23 @@ pip install mistral-vibe
 Vibe comes with several built-in agent profiles, each designed for different use cases:
 
 - **`ask`**: Requires approval for tool executions.
-- **`plan`**: Read-only agent for exploration and planning. Auto-approves safe tools like `grep` and `read`.
 - **`accept-edits`**: The default agent. Auto-approves file edits only (`write_file`, `edit`). Useful for code refactoring.
 - **`auto-approve`**: Auto-approves all tool executions. Use with caution.
 
 Use the `--agent` flag to select a different agent:
 
 ```bash
-vibe --agent plan
+vibe --agent ask
 ```
 
 To change the default agent used when `--agent` is not passed, set
 `default_agent` in your `config.toml`:
 
 ```toml
-default_agent = "plan"
+default_agent = "ask"
 ```
 
-Valid values are `ask`, `plan`, `accept-edits`, `auto-approve`,
+Valid values are `ask`, `accept-edits`, `auto-approve`,
 `lean` (only when listed in `installed_agents`), or the name of any
 custom agent file in `~/.vibe/agents/` or the project's `.vibe/agents/`
 directory. Subagents such as `explore` are not accepted.
@@ -158,8 +163,8 @@ The `task` tool allows the agent to delegate work to subagents:
 
 Create custom subagents by adding `agent_type = "subagent"` to your agent configuration. Vibe comes with a built-in subagent called `explore`, a read-only subagent for codebase exploration and skill loading used internally for delegation.
 
-When the Unified Harness is active, the interactive prompt shows each known
-subagent's name, type, live status, and latest measured context size. Opening a
+The interactive prompt shows each known subagent's name, type, live status, and
+latest measured context size. Opening a
 subagent also shows its active status above the prompt and its context use in the
 bottom-right gauge. With an empty or locally edited prompt, press Down from its
 last line to focus the list;
@@ -250,18 +255,19 @@ Most modern terminals should work, but older or minimal terminal emulators may h
 
 ### Interactive Mode
 
-Simply run `vibe` to enter the interactive chat loop.
+Simply run `vibe` to enter the interactive chat loop. The terminal UI is a native
+Rust binary (`vibe-rs`) bundled with the package.
 
 - **Multi-line Input**: Press `Ctrl+J` or `Shift+Enter` for select terminals to insert a newline.
-- **Input Cursor**: The main input cursor blinks by default. Set `cursor_blink = false` in `config.toml` for a steady cursor. Changes apply without restarting through `/config` or `/reload` in both Python and Rust terminals.
+- **Input Cursor**: The main input cursor blinks by default. Set `cursor_blink = false` in `config.toml` for a steady cursor. Changes apply without restarting through `/config` or `/reload`.
 - **File Paths**: Reference files in your prompt using the `@` symbol for smart autocompletion (e.g., `> Read the file @src/agent.py`). A bare `@` quickly lists immediate non-hidden entries; after a path character, Git workspaces suggest tracked and non-ignored files. Pasting a standalone existing absolute or home-relative file or folder also creates a mention.
 - **Shell Commands**: Prefix any command with `!` to execute it directly in your shell, bypassing the agent (e.g., `> !ls -l`).
 - **External Editor**: Press `Ctrl+G` to edit your current input in an external editor.
 - **Tool Output Toggle**: Press `Ctrl+O` to toggle the tool output view.
 - **Todo View Toggle**: Press `Ctrl+T` to toggle the todo list view.
 - **Debug Console**: Press `Ctrl+\` to toggle the debug console.
-- **Agent Selection**: Press `Shift+Tab` to cycle through agents (ask, plan, ...).
-- **Queueing**: Prompts submitted while the agent is working are queued by the app server. Empty `Enter` or `Ctrl+Enter` steers the queued prompts into the active turn; on Unified Harness sessions, this atomically consumes the stored queue item. `Ctrl+C` removes the newest queued prompt. `Escape` interrupts the active turn and pauses remaining prompts, and `Enter` resumes a paused queue. Shell commands and non-side-channel slash commands require an idle session.
+- **Agent Selection**: Press `Shift+Tab` to cycle through agents (ask, accept-edits, ...).
+- **Queueing**: Prompts submitted while the agent is working are queued by the app server. Empty `Enter` or `Ctrl+Enter` atomically consumes the stored queue item and steers it into the active turn. `Ctrl+C` removes the newest queued prompt. `Escape` interrupts the active turn and pauses remaining prompts, and `Enter` resumes a paused queue. Shell commands and non-side-channel slash commands require an idle session.
 - **Exit**: Type `/exit`, `exit`, `quit`, `:q`, or `:quit` in the input box, or press `Ctrl+C` / `Ctrl+D` twice within ~1 second. Set `ask_confirmation_on_exit = false` (or toggle it in `/config`) to make `Ctrl+D` quit on the first press; `Ctrl+C` always requires confirmation.
 
 ### Copying & Text Selection
@@ -334,10 +340,14 @@ vibe --prompt-file task.md --auto-approve --time-limit 1800 --output-dir out/
 | `0` | `finished` | The agent finished. |
 | `1` | `usage_error`, `config_error` | The run could not start as asked. |
 | `2` | `infrastructure_failure` | The model API (after retries) or the runtime failed. |
-| `3` | `turn_limit`, `token_limit`, `price_limit`, `deadline`, `terminated`, `length`, `refusal` | The agent stopped without finishing: a limit or a model refusal; score what it left. `length` means the conversation or the last answer hit a model token limit: the context window, or the output-token cap (`max_output_tokens` on the model). |
+| `3` | `turn_limit`, `token_limit`, `price_limit`, `deadline`, `terminated`, `length`, `refusal` | The agent stopped without finishing; score what it left. `length` means the conversation or the last answer hit a model token limit: the context window, or the output-token cap (`max_output_tokens` on the model). An answer cut off at the output cap is first discarded and asked for again, up to `output_limit_retries` times (6 by default). `refusal` means the model declined to answer. |
 | `4` | `aborted` | The `--agent-socket` server aborted the run (experimental, see below); `error.message` in `export.json` is the server's message. |
 
-A model refusal ends the run as `refusal`, exit `3`; `error` in `export.json` has the code `refusal`, and its message gives the refusal's category and explanation when the model sends them. Only the legacy runtime (`--legacy-harness`) reports a refusal as one.
+`vibe -p` exits only after its app-server process has, however the run ends.
+Killed outright (SIGKILL, the OOM killer), it takes its app-server with it: at
+once on Linux and Windows, and on macOS as soon as the app-server sees its
+input close, normally within a second. `vibe run-server`'s app-servers do the
+same.
 
 #### Agent Socket (`--agent-socket`, experimental)
 
@@ -511,27 +521,107 @@ stops the run as SIGTERM does and exits 4, with the outcome `aborted` and the
 server's message as `error.message` in `export.json`. Vibe gives the abort no
 meaning of its own; the message is for whoever reads the export.
 
-### TUI Implementations
+#### Many runs in one process (`vibe run-server`, experimental)
 
-The `vibe` command starts through a small launcher that picks the terminal
-client from the `VIBE_CLI` environment variable:
+Experimental: the command is hidden from `--help`, and it and its protocol may
+change or go away without notice. It is not supported on Windows (exit 1).
 
-- `VIBE_CLI=rust vibe` starts the Rust TUI.
-- `VIBE_CLI=python vibe` runs the legacy Python (Textual) TUI.
-- With `VIBE_CLI` unset (or set to any other value), `vibe` runs the legacy
-  Python TUI.
+`vibe run-server` serves many runs at once, each what
+`vibe -p --agent-socket PATH --output-dir DIR` does, with the same outcomes,
+exit codes, limits and export. Every run must use an agent socket that serves a
+sandbox.
 
-The commands above use POSIX shell syntax, where the assignment only applies
-to that command. On Windows, set the variable for the session instead:
+Runs share app-server processes rather than starting one each. An app-server
+serves at most `--runs-per-app-server K` runs (default 16). A run goes to the
+app-server with the most runs that still has room, so that a spare one drains;
+when none has room, another starts. An app-server exits once its last run has
+gone, and a later run starts another. One that exits early fails only its own runs, as
+`infrastructure_failure`. One that has not let a run go 15 seconds after it
+ended takes no new run.
 
-- PowerShell: `$env:VIBE_CLI = "python"; vibe` (unset with
-  `Remove-Item Env:VIBE_CLI`)
-- cmd: `set VIBE_CLI=python`, then run `vibe` (unset with `set VIBE_CLI=`)
+It speaks JSON-RPC 2.0 on stdin and stdout, framed as the agent socket is: one
+compact JSON message with camelCase fields per line. Only the protocol is
+written to stdout. Errors are `{"code": str, "message": str, "data": any}`,
+where `code` is `invalid_request`, `invalid_params`, `not_initialized`,
+`not_found`, `conflict`, `method_not_found` or `internal_error`; an
+`invalid_params` error names the fields at fault, never their values.
+`--max-runs N` caps the live runs.
 
-When the `VIBE_CLI` environment variable is set to `rust`, every `vibe`
-invocation selects the Rust client. To run a nested command (e.g.
-`vibe mcp add ...`) with the legacy Python client instead, set `VIBE_CLI` to
-`python` for that invocation.
+| Method | Params | Result |
+| --- | --- | --- |
+| `initialize` | `{"protocolVersion": 1, "clientInfo": {"name": str, "version": str}}` | `{"protocolVersion": 1, "serverInfo": {"name": "vibe-run-server", "version": str}, "maxRuns": int \| null}` |
+| `run/start` | `{"runId": str, "prompt": str, "agentSocket": str, "outputDir"?: str, "resumeSessionId"?: str, "agent"?: str, "autoApprove"?: bool, "enabledTools"?: [str], "disabledTools"?: [str], "maxTurns"?: int, "maxTokens"?: int, "maxPrice"?: float, "timeLimit"?: float, "config"?: object, "credentials"?: {str: str}}` | `{}` |
+| `run/stop` | `{"runId": str}` | `{}` |
+| `ping` | `{}` | `{}` |
+
+- `initialize` comes first, once. Any other protocol version is refused with
+  `invalid_request`, whose `data` is `{"protocolVersion": 1}`; any other
+  request before it, with `not_initialized`.
+- `run/start` answers at once, and the run goes on in the background. `runId`
+  is the caller's name for the run, unique among live runs; a live one is a
+  `conflict` with `data` `{"reason": "duplicate_run"}`, and `maxRuns` live runs
+  a `conflict` with `{"reason": "at_capacity", "maxRuns": int}`. The options
+  and limits are those of `vibe -p`; `timeLimit` counts from the request.
+  Relative `agentSocket` and `outputDir` paths name paths under the directory
+  the server started in.
+- `config` is the run's user config, the document `config.toml` would hold as
+  parsed TOML. It replaces the server's own `config.toml` for the run, except
+  for what applies to the whole app-server process (see below).
+- `credentials` maps environment variable names to values. A provider whose
+  `api_key_env_var` names one sends that value. The values stay in memory:
+  they are not put in the environment, and are redacted from exports, logs,
+  error messages and `run/ended`.
+- `run/stop` ends a live run as `terminated`, as SIGTERM ends `vibe -p`;
+  `not_found` when no live run has that `runId`. A stopped run that has not
+  wound down 15 seconds after the stop is cancelled, and still ends with
+  `run/ended`: `terminated`, with an `error` saying it was cancelled, whose
+  `code` is `stop_timed_out`. If its export then takes more than 5 more
+  seconds, `run/ended` is sent without it, with an `exportError` and an
+  `exportErrorCode` of `export_timed_out`.
+- `ping` is answered at any time, before `initialize` too. A ping with no
+  answer means the server is wedged.
+
+Each run that started ends with one notification, after its export is
+written:
+
+```json
+{"jsonrpc": "2.0", "method": "run/ended", "params": {"runId": str, "outcome": str, "exitCode": int, "sessionId": str | null, "error": {"message": str, "code": str | null} | null, "exportPath": str | null, "exportError": str | null, "exportErrorCode": str | null, "warnings": [{"message": str, "source": str | null}] | null}}
+```
+
+`outcome` and `exitCode` are those of `vibe -p` (see Exit Codes above),
+`aborted` and 4 included. `error.code`, when set, is a stable name for the
+failure, so failures can be counted without matching messages. `exportError`
+says why the export could not be written, and `exportErrorCode`, when set,
+names that reason. `warnings` are the export's. The `runId` is free again once
+the notification is sent.
+
+On end of input, SIGTERM or SIGINT, the server ends every live run as
+`terminated`, as `run/stop` does, writes its export, sends its `run/ended`,
+stops its app-servers and exits 0. A message that is not a request ends it the
+same way, with exit 1, without repeating the message. A run that has no
+`run/ended` when the server's output closes, or the process exits, is lost:
+treat it as an infrastructure failure. It has no `export.json` (the export is
+written once, at the end, and renamed into place, so a `.export.json.tmp` may
+be left), and its session's journal stops at its last saved message in the
+session log directory. Its sandbox is left as it was.
+
+The runs share `VIBE_HOME` and `HOME` (session logs, trusted folders, the
+user's agents, prompts, skills and tools), the `.env` file, the environment and
+the log file. The server's log lines for a run name it as `run{run=<runId>}`.
+The server does not report errors to Sentry.
+
+Two settings apply to a whole app-server process, so to each of its runs. It
+takes them from the server's own `config.toml` when its first run starts. A run
+whose `config` sets `enable_system_trust_store` otherwise ends as a
+`config_error`. A run whose `config` sets another `log_level` goes on at the
+app-server's level, with a warning in its `warnings` and in the log. The
+app-server sets up no process-wide tracer, so no run's API key serves another
+run's traces.
+
+Each app-server starts with `MALLOC_ARENA_MAX=2` unless the server's
+environment sets it. Its runs use many threads, and on Linux with glibc's
+default of up to eight memory arenas per core, a busy app-server's memory grows
+by about 45 KiB per run; with two arenas it stays flat.
 
 ## Voice Mode
 
@@ -577,8 +667,8 @@ Use `/mcp` or `/connectors` to browse configured MCP servers and workspace
 connectors. The browser starts on the first item; press Up or Left to focus its
 fuzzy search bar, then Up again to wrap to the last item.
 
-With the Unified Harness, `/loop every two minutes check the build` asks the
-model to schedule a recurring prompt. Calendar requests such as `/loop weekdays
+`/loop every two minutes check the build` asks the model to schedule a recurring
+prompt. Calendar requests such as `/loop weekdays
 at 9am review CI` work too, using the machine's local timezone. Ask the model to
 list or cancel schedules; `/loop` has no TUI management subcommands. Requests
 submitted while busy join the normal prompt queue. Schedules survive resume,
@@ -623,7 +713,7 @@ Skills are defined in directories with a `SKILL.md` file containing metadata in 
 name: code-review
 description: Perform automated code reviews
 license: MIT
-compatibility: Python 3.12+
+compatibility: Python 3.14+
 user-invocable: true
 allowed-tools:
   - read
@@ -683,6 +773,11 @@ disabled_skills = ["experimental-*"]
 Skills support the same pattern matching as tools (exact names, glob patterns, and regex).
 
 ## Configuration
+
+`displayed_workdir`, `context_warnings` and `raise_on_compaction_failure` are
+deprecated. Existing configuration files still load these fields, but they have
+no effect on Unified execution. Remove them from user, project and managed
+configuration.
 
 ### Configuration File Location
 
@@ -803,6 +898,28 @@ Any extra instructions passed to `/compact ...` are appended after the configure
 
 Compaction keeps the same session and visible conversation. Later model requests
 use the latest compacted context followed by newer messages.
+
+### Compaction and Output Limits
+
+These settings apply to the Unified Harness:
+
+```toml
+compaction_max_output_tokens = 80000       # Output cap for compaction requests; 0: same cap as other requests
+# compaction_thinking = "low"              # Thinking for the first compaction request; unset keeps the compaction model's level
+compaction_reasoning_limit_tokens = 32000  # Reasoning after which compaction falls back; 0 disables
+output_limit_retries = 6                   # Cut-off answers a turn retries with feedback; 0 ends the turn on the first
+output_token_reserve = 4096                # Tokens kept free when the output cap is clipped to the context window
+```
+
+The first compaction request reuses the conversation's prompt prefix, so the
+provider can serve most of it from its cache. If it fails, returns an invalid
+summary, or reasons past `compaction_reasoning_limit_tokens`, Vibe sends one
+fallback request instead: a summarizer prompt over a text transcript of the
+conversation, without tools and without reasoning. It differs from the first
+request, so a provider's response cache cannot hand back the same failed answer.
+
+When a model declares `max_context_length`, each request's output cap is clipped
+to the room its input leaves in that window, less `output_token_reserve`.
 
 ### Custom Title Prompts
 
@@ -948,13 +1065,11 @@ for the complete command reference. `vibe mcp remove <name>` removes the server
 from the user configuration. Removing an OAuth server also deletes its stored
 tokens, client information, and configuration fingerprint when available.
 
-With `VIBE_CLI` set to `rust`, shell `mcp add` uses the OAuth-only
-`/mcp add` syntax: `vibe mcp add https://mcp.linear.app/mcp --name linear
---no-login`. It accepts `--scope` (repeatable), `--transport`, and
-`--allow-insecure-http`; without `--no-login`, it starts browser login. Both
-`add` and `remove NAME` update the user configuration without opening a chat
-session. For stdio or static-auth additions, set `VIBE_CLI` to `python` and run
-`vibe mcp add` with the flags above.
+Add local stdio servers with `vibe mcp add NAME --transport stdio --command
+COMMAND`, repeatable `--arg VALUE` (use `--arg=-y` for flags), and
+`--env NAME=VALUE`. The legacy `vibe mcp add URL --name NAME` form is also
+accepted. Both `add` and
+`remove NAME` update the user configuration without opening a chat session.
 
 Hosted OAuth MCP servers can also be added from inside Vibe:
 
@@ -1150,6 +1265,10 @@ vibe --resume abc123
 ```
 
 Session logging must be enabled in your configuration for these features to work.
+
+Historical imports support Vibe 2.0+ session folders containing `meta.json` and
+`messages.jsonl`. Vibe 1.x sessions saved as a single JSON file are no longer
+supported.
 
 The first user message pins the resolved model to that session. Resuming keeps
 the pinned model even if your configured default changes. `/model` uses the

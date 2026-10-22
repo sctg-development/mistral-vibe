@@ -55,6 +55,8 @@ from vibe.app_server.protocol import (
     SessionPinResponse,
     SessionReadParams,
     SessionReadResponse,
+    SessionRelocateParams,
+    SessionRelocateResponse,
     SessionResumeParams,
     SessionRewindParams,
     SessionRewindResponse,
@@ -66,6 +68,14 @@ from vibe.app_server.protocol import (
     TurnEnqueueResponse,
     TurnInterruptParams,
     TurnInterruptResponse,
+    TurnQueueEditAbandonParams,
+    TurnQueueEditAbandonResponse,
+    TurnQueueEditCancelParams,
+    TurnQueueEditCancelResponse,
+    TurnQueueEditSaveParams,
+    TurnQueueEditSaveResponse,
+    TurnQueueEditStartParams,
+    TurnQueueEditStartResponse,
     TurnQueueReadParams,
     TurnQueueReadResponse,
     TurnQueueRemoveParams,
@@ -84,7 +94,9 @@ from vibe.app_server.protocol import (
 
 type SessionBackendKind = Literal["legacy", "unified"]
 type MCPAuthorizationReason = Literal["missing", "expired", "rejected", "invalid"]
-type ConnectorAuthAction = Literal["none", "oauth", "credentials_setup", "unknown"]
+type ConnectorAuthAction = Literal[
+    "none", "oauth", "credentials_setup", "no_auth_connect", "unknown"
+]
 type MCPCatalogOwner = Literal["config", "plugin"]
 
 
@@ -211,7 +223,14 @@ class SessionConnectorSourceState:
     raw_id: str
     alias: str
     display_name: str
-    status: Literal["disabled", "connected", "needs_auth", "needs_setup", "unavailable"]
+    status: Literal[
+        "disabled",
+        "connected",
+        "needs_auth",
+        "needs_setup",
+        "needs_connect",
+        "unavailable",
+    ]
     tools: tuple[SessionConnectorToolDescriptor, ...] = ()
     error: str | None = None
 
@@ -235,6 +254,14 @@ class ConnectorAuthRequest:
     reason: Literal["needs_auth", "needs_setup", "gateway_rejected"]
 
 
+@dataclass(frozen=True, slots=True)
+class ConnectorConnectRequest:
+    session_id: str
+    raw_connector_id: str
+    alias: str
+    display_name: str
+
+
 @runtime_checkable
 class SessionConnectorControl(Protocol):
     async def read_connectors(self) -> SessionConnectorState: ...
@@ -256,6 +283,10 @@ class SessionConnectorControl(Protocol):
     ) -> SessionConnectorState: ...
 
     async def request_connector_auth(self, *, alias: str) -> ConnectorAuthRequest: ...
+
+    async def request_connector_connect(
+        self, *, alias: str
+    ) -> ConnectorConnectRequest: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,6 +502,29 @@ class SessionBackend(Protocol):
 
 
 @runtime_checkable
+class SessionBackendQueuedTurnEditing(Protocol):
+    """Optional hold-and-replace lifecycle for editing an accepted queued Turn."""
+
+    async def start_queued_turn_edit(
+        self, params: TurnQueueEditStartParams
+    ) -> SessionBackendResult[TurnQueueEditStartResponse]: ...
+
+    async def save_queued_turn_edit(
+        self, params: TurnQueueEditSaveParams
+    ) -> SessionBackendResult[TurnQueueEditSaveResponse]: ...
+
+    async def cancel_queued_turn_edit(
+        self, params: TurnQueueEditCancelParams
+    ) -> SessionBackendResult[TurnQueueEditCancelResponse]: ...
+
+    async def abandon_queued_turn_edit(
+        self, params: TurnQueueEditAbandonParams
+    ) -> SessionBackendResult[TurnQueueEditAbandonResponse]: ...
+
+    async def abandon_active_queued_turn_edit(self) -> None: ...
+
+
+@runtime_checkable
 class SessionBackendQueuedTurnSteering(Protocol):
     """Optional atomic transfer of an accepted queued Turn into the active Turn."""
 
@@ -570,9 +624,7 @@ class SessionBackendHostPin(Protocol):
 
 @runtime_checkable
 class SessionBackendHostLeaseWatch(Protocol):
-    def watch_leases(
-        self,
-    ) -> AsyncGenerator[dict[str, SessionLeaseHolder | None], None]: ...
+    def watch_leases(self) -> AsyncGenerator[dict[str, SessionLeaseHolder | None]]: ...
 
 
 @runtime_checkable
@@ -610,6 +662,15 @@ class SessionBackendHostDelete(Protocol):
     """Optional selected-backend ownership of durable session deletion."""
 
     async def delete(self, params: SessionDeleteParams) -> EmptyResponse: ...
+
+
+@runtime_checkable
+class SessionBackendHostRelocate(Protocol):
+    """Optional selected-backend ownership of attached or stored relocation."""
+
+    async def relocate(
+        self, params: SessionRelocateParams, attached: SessionBackend | None
+    ) -> SessionRelocateResponse: ...
 
 
 @runtime_checkable

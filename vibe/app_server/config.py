@@ -13,6 +13,11 @@ from vibe.config_values import (
     TranscriptionEncoding,
 )
 
+# Where a model comes from, as the pickers group it: `project` covers project
+# config, agent profile, env and session overrides; `local` the user config and
+# built-ins.
+ModelSource = Literal["admin", "growthbook", "catalog", "project", "local"]
+
 
 class ModelConfigView(ProtocolModel):
     name: str
@@ -23,6 +28,7 @@ class ModelConfigView(ProtocolModel):
     # None when the model's window is unknown; defaulted so older clients
     # tolerate the field's absence (ADR 0014).
     max_context_length: int | None = None
+    auto_compact_threshold: int | None = None
     # The levels the active model offers; defaulted so a client against an
     # older server still renders the five (ADR 0014).
     thinking_levels: list[ThinkingLevel] = Field(
@@ -31,6 +37,10 @@ class ModelConfigView(ProtocolModel):
     # Expected delivery of file-backed images; None means the runtime has not
     # advertised a delivery mode. Native model support alone is not a fallback policy.
     image_delivery: Literal["native", "resource_link"] | None = None
+    # The group the model is listed under, from the highest-priority layer that
+    # defines it; None from an older server (ADR 0014) or when no known layer
+    # defines it.
+    source: ModelSource | None = None
 
 
 class TranscribeModelConfigView(ProtocolModel):

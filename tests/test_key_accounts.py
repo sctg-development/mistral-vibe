@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-from vibe import _experimental_harness as harness
 from vibe.utils import api_keys
 
 
@@ -47,16 +46,3 @@ def test_environment_accounts_come_before_saved_ones(
     monkeypatch.setenv("VIBE_API_KEYS", "mstrl_a, mstrl_b")
 
     assert api_keys.pooled_keys("VIBE_API_KEY") == ["mstrl_a", "mstrl_b"]
-
-
-def test_key_pool_keeps_the_legacy_harness_even_when_unified_is_requested() -> None:
-    pooled = harness.resolve_harness_selection(
-        experimental_harness=False, legacy_harness=False, key_pool_active=True
-    )
-    # The Rust TUI always starts its app-server with --experimental-harness.
-    requested = harness.resolve_harness_selection(
-        experimental_harness=True, legacy_harness=False, key_pool_active=True
-    )
-
-    assert (pooled.use_unified, pooled.source) == (False, "key-pool")
-    assert (requested.use_unified, requested.source) == (False, "key-pool")

@@ -126,6 +126,8 @@ async def fetch_whoami(
 
 
 _WHOAMI_CACHE_TTL_SECONDS: Final = 6 * 60 * 60
+# Bump when WhoAmIResult gains a field that older entries would silently default.
+_WHOAMI_CACHE_FORMAT: Final = 2
 
 
 def load_cached_whoami(api_key: str) -> WhoAmIResult | None:
@@ -138,7 +140,7 @@ def load_cached_whoami(api_key: str) -> WhoAmIResult | None:
     refetches.
     """
     entry = _read_whoami_entries().get(_whoami_cache_key(api_key))
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or entry.get("format") != _WHOAMI_CACHE_FORMAT:
         return None
     stored_at = entry.get("stored_at_timestamp")
     payload = entry.get("payload")
@@ -156,6 +158,7 @@ def store_cached_whoami(api_key: str, result: WhoAmIResult) -> None:
     """Persist a /whoami result under the hashed ``api_key``. Best-effort."""
     entries = _read_whoami_entries()
     entries[_whoami_cache_key(api_key)] = {
+        "format": _WHOAMI_CACHE_FORMAT,
         "stored_at_timestamp": int(time.time()),
         "payload": result.model_dump(mode="json"),
     }

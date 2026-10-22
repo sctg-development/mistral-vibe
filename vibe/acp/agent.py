@@ -153,6 +153,7 @@ from vibe.app_server.models import (
     ApprovalDecision,
     ApprovalDecisionType,
     ImageAttachment,
+    MCPState,
     MentionStats,
     PathGrantScope,
     PublicCallbackEntry,
@@ -188,10 +189,7 @@ from vibe.observability.sentry import capture_sentry_exception
 from vibe.questions import UserAnswer, UserQuestionRequest, UserQuestionResult
 from vibe.user_content import UserDisplayContent, UserResource
 
-NON_INTERACTIVE_DISABLED_TOOLS: tuple[str, ...] = (
-    "ask_user_question",
-    "exit_plan_mode",
-)
+NON_INTERACTIVE_DISABLED_TOOLS: tuple[str, ...] = ("ask_user_question",)
 
 
 def _session_agent_changed(event: SessionUpdated) -> bool:
@@ -431,14 +429,10 @@ class VibeAcpAgent(AcpAgent):
         credentials_persister: CredentialsPersister | None = None,
         tenant_domain_resolver: TenantDomainResolver | None = None,
         environ_before_dotenv_load: Mapping[str, str] | None = None,
-        experimental_harness: bool = False,
-        legacy_harness: bool = False,
     ) -> None:
         self.sessions: dict[str, AcpSession] = {}
         self.client_capabilities: ClientCapabilities | None = None
         self.client_info: Implementation | None = None
-        self._experimental_harness = experimental_harness
-        self._legacy_harness = legacy_harness
         self._harness_host = LocalHarnessHost()
         self._start_session = session_starter or self._harness_host.start
         self._passive_host: AppServerHost | None = None
@@ -473,20 +467,11 @@ class VibeAcpAgent(AcpAgent):
         del protocol_version, kwargs
         self.client_capabilities = client_capabilities
         self.client_info = client_info
-        delegated = bool(
-            client_capabilities
-            and client_capabilities.field_meta
-            and client_capabilities.field_meta.get("browser-auth-delegated") is True
-        )
+        delegated = self._client_meta_flag("browser-auth-delegated")
         auth_methods: list[EnvVarAuthMethod | TerminalAuthMethod | Any] = [
             *self._auth.browser_methods(delegated=delegated)
         ]
-        supports_terminal = bool(
-            client_capabilities
-            and client_capabilities.field_meta
-            and client_capabilities.field_meta.get("terminal-auth") is True
-        )
-        if supports_terminal:
+        if self._client_meta_flag("terminal-auth"):
             command = sys.executable
             args = (
                 ["--setup"]
@@ -623,8 +608,6 @@ class VibeAcpAgent(AcpAgent):
                     ),
                     session=intent,
                     client_tool_handler=client_tool_handler,
-                    experimental_harness=self._experimental_harness,
-                    legacy_harness=self._legacy_harness,
                 )
             )
         except AppServerResponseError as exc:
@@ -666,6 +649,15 @@ class VibeAcpAgent(AcpAgent):
             )
             if not page.data:
                 raise RuntimeError("History pagination did not advance")
+
+    # Opt-ins a client sends in its initialize `_meta`.
+    def _client_meta_flag(self, name: str) -> bool:
+        capabilities = self.client_capabilities
+        return bool(
+            capabilities
+            and capabilities.field_meta
+            and capabilities.field_meta.get(name) is True
+        )
 
     def _supports_user_input(self) -> bool:
         capabilities = self.client_capabilities
@@ -736,10 +728,10 @@ class VibeAcpAgent(AcpAgent):
         if isinstance(event, TurnRetrying):
             await self._send_retrying(session, event)
             return
-        # An autonomous profile switch (e.g. exit_plan_mode accepting the plan)
-        # patches the session's `agent`. The mode is otherwise only carried on the
-        # load/new session response, so external ACP clients would keep showing
-        # the stale mode. `SessionUpdated` is processed after the client state's
+        # A profile switch the client did not request (e.g. `/unleanstall` moving
+        # off the active Lean agent) patches the session's `agent`. The mode is
+        # otherwise only carried on the load/new session response, so external
+        # ACP clients would keep showing the stale mode. `SessionUpdated` is processed after the client state's
         # active agent is flipped, so re-pushing the full config options here
         # reflects the new profile (mode + model + thinking) on the selector.
         if isinstance(event, SessionUpdated) and _session_agent_changed(event):
@@ -778,6 +770,18 @@ class VibeAcpAgent(AcpAgent):
             resources=content.resources,
             user_display_content=display,
             mention_stats=prepared.mentions,
+        )
+
+    def _client_connection_closed(self) -> bool:
+        """Whether the ACP connection to the client is closed or disconnected.
+
+        The SDK sets both flags before ``Connection.close()`` cancels in-flight
+        handlers, distinguishing connection teardown from a turn-level cancel.
+        """
+        connection = getattr(self.client, "_conn", None)
+        return bool(
+            getattr(connection, "_closed", False)
+            or getattr(connection, "_disconnected", False)
         )
 
     @override
@@ -832,7 +836,14 @@ class VibeAcpAgent(AcpAgent):
         try:
             await run_turn()
         except asyncio.CancelledError:
+            if self._client_connection_closed():
+                # Connection teardown: the client is gone and the sender is
+                # closed, so neither a usage update nor a response would get
+                # out — re-raise so shutdown is not held up.
+                raise
             self._send_usage_update(session)
+            # Turn-level cancel: the client still waits for the prompt request
+            # to settle, so the "cancelled" response must be delivered.
             return PromptResponse(stop_reason="cancelled", usage=self._usage(session))
         except AppServerTurnError as exc:
             if exc.error.code == TurnErrorCode.RESPONSE_TOO_LONG:
@@ -1482,8 +1493,6 @@ class VibeAcpAgent(AcpAgent):
                     LocalHarnessOptions(
                         client=self._client_descriptor(),
                         session_options=SessionOptions(cwd=str(Path.cwd())),
-                        experimental_harness=self._experimental_harness,
-                        legacy_harness=self._legacy_harness,
                     )
                 )
         return self._passive_host
@@ -1661,7 +1670,7 @@ class VibeAcpAgent(AcpAgent):
             match method:
                 case "connectors/list":
                     listing = self._connectors_request(ConnectorsListRequest, params)
-                    response = ConnectorsListResponse.from_state(
+                    response = self._connector_list(
                         await self._connectors_resource(listing.session_id).read()
                     )
                 case "connectors/authUrl":
@@ -1670,6 +1679,13 @@ class VibeAcpAgent(AcpAgent):
                         url=await self._connectors_resource(
                             auth.session_id
                         ).connector_auth_url(auth.name)
+                    )
+                case "connectors/connect":
+                    connect = self._connectors_request(ConnectorRequest, params)
+                    response = self._connector_list(
+                        await self._connectors_resource(
+                            connect.session_id
+                        ).connect_connector(connect.name)
                     )
                 case "connectors/refresh":
                     refresh = self._connectors_request(ConnectorsRefreshRequest, params)
@@ -1683,10 +1699,10 @@ class VibeAcpAgent(AcpAgent):
                             failures.append(exc)
                     if len(failures) == len(refresh.names):
                         raise failures[0]
-                    response = ConnectorsListResponse.from_state(resource.state)
+                    response = self._connector_list(resource.state)
                 case "connectors/toggle":
                     toggle = self._connectors_request(ConnectorsToggleRequest, params)
-                    response = ConnectorsListResponse.from_state(
+                    response = self._connector_list(
                         await self._connectors_resource(toggle.session_id).toggle(
                             toggle.name,
                             source="connector",
@@ -1699,6 +1715,13 @@ class VibeAcpAgent(AcpAgent):
         except AppServerResponseError as exc:
             raise InvalidRequestError(exc.error.message) from exc
         return response.model_dump(mode="json")
+
+    # Opted into at initialize, like terminal auth: older clients reject the
+    # `needs_connect` reachability they have no action for.
+    def _connector_list(self, state: MCPState) -> ConnectorsListResponse:
+        return ConnectorsListResponse.from_state(
+            state, client_can_connect=self._client_meta_flag("connectors-connect")
+        )
 
     def _connectors_resource(self, session_id: str) -> MCPResource:
         return self._get_session(session_id).app_server.resources.mcp
@@ -1759,6 +1782,7 @@ class VibeAcpAgent(AcpAgent):
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             total_tokens=usage.total_tokens,
+            cached_read_tokens=usage.cached_input_tokens or None,
         )
 
     def _send_usage_update(self, session: AcpSession) -> None:
@@ -1833,16 +1857,9 @@ async def _serve_acp_agent(agent: VibeAcpAgent) -> None:
 
 
 def run_acp_server(
-    *,
-    environ_before_dotenv_load: Mapping[str, str] | None = None,
-    experimental_harness: bool = False,
-    legacy_harness: bool = False,
+    *, environ_before_dotenv_load: Mapping[str, str] | None = None
 ) -> None:
-    agent = VibeAcpAgent(
-        environ_before_dotenv_load=environ_before_dotenv_load,
-        experimental_harness=experimental_harness,
-        legacy_harness=legacy_harness,
-    )
+    agent = VibeAcpAgent(environ_before_dotenv_load=environ_before_dotenv_load)
     previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
     def handle_sigterm(_signum: int, _frame: Any) -> None:

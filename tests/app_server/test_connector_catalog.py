@@ -11,11 +11,14 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import respx
 
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+from vibe.app_server._dispatch import DispatchResult, RequestFailure
 from vibe.app_server._session_backend_port import (
     ConnectorAuthRequest,
+    ConnectorConnectRequest,
     ResolvedConnector,
     ResolvedConnectorCatalog,
     ResolvedConnectorSelection,
@@ -37,9 +40,11 @@ from vibe.app_server.connector_catalog import (
     connector_tool_enabled,
     resolve_connector_selection,
 )
+from vibe.app_server.models import AccountPlanKind
 from vibe.app_server.protocol import ConnectorAuthRequiredParams, ProtocolErrorCode
 from vibe.core.config import ConnectorConfig, VibeConfigSchema
 from vibe.core.identity import IdentityResult
+from vibe.setup.auth.whoami import WhoAmIResult, store_cached_whoami
 
 
 @pytest.mark.asyncio
@@ -107,6 +112,108 @@ async def test_manage_connectors_url_none_when_identity_incomplete(monkeypatch) 
     )
 
     assert await connector_catalog._manage_connectors_url(config) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [("shared_only", True), ("personal_and_shared", False), (None, False)],
+)
+async def test_private_connectors_hidden_only_for_shared_only_keys(
+    monkeypatch, scope: str | None, expected: bool
+) -> None:
+    config = build_test_vibe_config(enable_connectors=True)
+    provider = connector_catalog._ConnectorProvider(
+        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+    )
+    monkeypatch.setattr(
+        connector_catalog, "_resolve_provider", lambda _config: provider
+    )
+    whoami = WhoAmIResult(
+        plan_type=AccountPlanKind.API, plan_name="FREE", primitive_access_scope=scope
+    )
+    resolve = AsyncMock(return_value=whoami)
+    monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
+    monkeypatch.setattr(connector_catalog, "_WHOAMI_FAILED_AT", {})
+
+    assert await connector_catalog._private_connectors_hidden(config) is expected
+    assert resolve.await_args is not None
+    assert resolve.await_args.kwargs["base_url"] == config.console_base_url
+    assert resolve.await_args.kwargs["timeout"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_private_connectors_hidden_retries_whoami_only_after_cooldown(
+    monkeypatch,
+) -> None:
+    config = build_test_vibe_config(enable_connectors=True)
+    provider = connector_catalog._ConnectorProvider(
+        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+    )
+    monkeypatch.setattr(
+        connector_catalog, "_resolve_provider", lambda _config: provider
+    )
+    resolve = AsyncMock(return_value=None)
+    monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
+    failed_at: dict[tuple[str, str], float] = {}
+    monkeypatch.setattr(connector_catalog, "_WHOAMI_FAILED_AT", failed_at)
+
+    assert await connector_catalog._private_connectors_hidden(config) is False
+    assert await connector_catalog._private_connectors_hidden(config) is False
+    assert resolve.await_count == 1
+
+    key = (config.console_base_url, "k")
+    failed_at[key] -= connector_catalog._WHOAMI_RETRY_SECONDS + 1
+    resolve.return_value = WhoAmIResult(
+        plan_type=AccountPlanKind.API,
+        plan_name="FREE",
+        primitive_access_scope="shared_only",
+    )
+
+    assert await connector_catalog._private_connectors_hidden(config) is True
+    assert resolve.await_count == 2
+    assert key not in failed_at
+
+
+@pytest.mark.asyncio
+async def test_private_connectors_hidden_reads_disk_cache_during_cooldown(
+    monkeypatch,
+) -> None:
+    config = build_test_vibe_config(enable_connectors=True)
+    provider = connector_catalog._ConnectorProvider(
+        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+    )
+    monkeypatch.setattr(
+        connector_catalog, "_resolve_provider", lambda _config: provider
+    )
+    resolve = AsyncMock(return_value=None)
+    monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
+    failed_at: dict[tuple[str, str], float] = {}
+    monkeypatch.setattr(connector_catalog, "_WHOAMI_FAILED_AT", failed_at)
+
+    assert await connector_catalog._private_connectors_hidden(config) is False
+    store_cached_whoami(
+        "k",
+        WhoAmIResult(
+            plan_type=AccountPlanKind.API,
+            plan_name="FREE",
+            primitive_access_scope="shared_only",
+        ),
+    )
+
+    assert await connector_catalog._private_connectors_hidden(config) is True
+    assert resolve.await_count == 1
+    assert failed_at == {}
+
+
+@pytest.mark.asyncio
+async def test_private_connectors_hidden_false_without_mistral_provider(
+    monkeypatch,
+) -> None:
+    config = build_test_vibe_config(enable_connectors=True)
+    monkeypatch.setattr(connector_catalog, "_resolve_provider", lambda _config: None)
+
+    assert await connector_catalog._private_connectors_hidden(config) is False
 
 
 def test_resolve_provider_gates_document_library_connector(monkeypatch) -> None:
@@ -472,6 +579,15 @@ class _BusyConnectorControl:
 
     async def request_connector_auth(self, *, alias: str) -> ConnectorAuthRequest:
         raise NotImplementedError(alias)
+
+    async def request_connector_connect(self, *, alias: str) -> ConnectorConnectRequest:
+        source = next(item for item in self.state.sources if item.alias == alias)
+        return ConnectorConnectRequest(
+            session_id=self.session_id,
+            raw_connector_id=source.raw_id,
+            alias=alias,
+            display_name=source.display_name,
+        )
 
 
 @pytest.mark.asyncio
@@ -1528,3 +1644,208 @@ async def test_an_auth_event_for_another_session_is_dropped_not_raised() -> None
 
     # Assert
     assert accepted is None
+
+
+def test_resolve_marks_no_auth_connector_as_needing_a_connection() -> None:
+    """*Prepare*: Bootstrap reports an unready connector with a no-auth connect action.
+    *Do*: Resolve and project the catalog.
+    *Assert*: It needs connecting rather than reading as unavailable.
+    """
+    raw = {**_connector(ready=False), "auth_action": {"type": "no_auth_connect"}}
+
+    catalog = connector_catalog._resolve_catalog({"connectors": [raw]}, "fingerprint")
+
+    connector = catalog.connectors[0]
+    assert connector.auth_action == "no_auth_connect"
+    assert connector_catalog._connector_readiness(connector) == "needs_connect"
+
+
+async def _connect_fixture(
+    tmp_path: Path, connected: list[bool]
+) -> tuple[ConnectorCatalogService, _BusyConnectorControl]:
+    async def fetch(
+        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        if connected[0]:
+            return {"connectors": [_connector()]}
+        no_auth = {
+            **_connector(ready=False),
+            "auth_action": {"type": "no_auth_connect"},
+        }
+        return {"connectors": [no_auth]}
+
+    orchestrator = _orchestrator()
+    service = ConnectorCatalogService(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+    )
+    catalog = await service.resolve_catalog(orchestrator)
+    assert catalog is not None
+    root = _BusyConnectorControl(
+        orchestrator,
+        SessionConnectorState(
+            accepted_catalog_revision=catalog.revision,
+            accepted_selection_revision="selection:1",
+            route_revision="routes:1",
+            sources=(
+                SessionConnectorSourceState(
+                    raw_id="connector-1",
+                    alias="wiki",
+                    display_name="Wiki",
+                    status="needs_connect",
+                ),
+            ),
+            discovery_errors={},
+        ),
+    )
+    root.busy = False
+    return service, root
+
+
+async def _dispatch_connect(
+    service: ConnectorCatalogService, root: _BusyConnectorControl
+) -> DispatchResult:
+    async def notify(*_args: object) -> None:
+        return None
+
+    return await service.dispatch(
+        "connector_catalog/connect",
+        {"sessionId": root.session_id, "alias": "wiki"},
+        root=cast(SessionBackend, root),
+        notify=notify,
+    )
+
+
+@pytest.mark.asyncio
+async def test_connect_creates_the_connection_then_refreshes_the_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A session whose no-auth connector needs connecting.
+    *Do*: Dispatch `connector_catalog/connect` for it.
+    *Assert*: The connection is created for its raw id, then a forced refresh accepts the ready catalog.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    connected = [False]
+    service, root = await _connect_fixture(tmp_path, connected)
+    created: list[str] = []
+
+    async def connect(_provider: object, raw_id: str) -> None:
+        created.append(raw_id)
+        connected[0] = True
+
+    monkeypatch.setattr(connector_catalog, "_connect_without_credentials", connect)
+
+    # Do
+    result = await _dispatch_connect(service, root)
+
+    # Assert
+    assert created == ["connector-1"]
+    assert result.runtime_updated is True
+    accepted, _selection, force = root.attempts[-1]
+    assert force is True
+    assert [connector.ready for connector in accepted.connectors] == [True]
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_names_the_connector_and_skips_the_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: Creating the connection fails.
+    *Do*: Dispatch `connector_catalog/connect`.
+    *Assert*: The error names the connector and no refresh is attempted.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    service, root = await _connect_fixture(tmp_path, [False])
+    monkeypatch.setattr(
+        connector_catalog,
+        "_connect_without_credentials",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    # Do
+    with pytest.raises(RequestFailure) as failure:
+        await _dispatch_connect(service, root)
+
+    # Assert
+    assert failure.value.code is ProtocolErrorCode.INTERNAL_ERROR
+    assert str(failure.value) == "Could not connect Wiki: RuntimeError."
+    assert root.attempts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (
+            403,
+            "Could not connect Wiki: your API key may not create connections "
+            "(HTTP 403). Check your VIBE_API_KEY.",
+        ),
+        (404, "Could not connect Wiki: the connector no longer exists (HTTP 404)."),
+        (
+            503,
+            "Could not connect Wiki (HTTP 503). Try again, "
+            "or enable it in the Mistral dashboard.",
+        ),
+    ],
+)
+@respx.mock
+async def test_connect_http_failure_reads_as_a_sentence_without_the_body(
+    status: int, message: str
+) -> None:
+    """*Prepare*: The credentials endpoint rejects the request with a JSON body.
+    *Do*: Connect, then format the failure.
+    *Assert*: The message explains the status and never echoes the response body.
+    """
+    # Prepare
+    respx.post(
+        "https://api.example.test/v1/connectors/connector-1/user/credentials"
+    ).respond(status, json={"detail": "internal trace id abc123"})
+    provider = connector_catalog._ConnectorProvider(
+        fingerprint="fingerprint",
+        base_url="https://api.example.test",
+        api_key="test-key",
+        builtins=(),
+    )
+
+    # Do
+    with pytest.raises(Exception) as failure:
+        await connector_catalog._connect_without_credentials(provider, "connector-1")
+    formatted = connector_catalog._connect_failure_message(failure.value, "Wiki")
+
+    # Assert
+    assert formatted == message
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_connect_without_credentials_creates_the_default_user_connection() -> (
+    None
+):
+    """*Prepare*: The connector credentials endpoint accepts the request.
+    *Do*: Connect a no-auth connector.
+    *Assert*: It posts an empty default user connection, as the dashboard does.
+    """
+    # Prepare
+    route = respx.post(
+        "https://api.example.test/v1/connectors/connector-1/user/credentials"
+    ).respond(json={"message": "ok"})
+    provider = connector_catalog._ConnectorProvider(
+        fingerprint="fingerprint",
+        base_url="https://api.example.test",
+        api_key="test-key",
+        builtins=(),
+    )
+
+    # Do
+    await connector_catalog._connect_without_credentials(provider, "connector-1")
+
+    # Assert
+    assert json.loads(route.calls.last.request.content) == {
+        "name": "default",
+        "is_default": True,
+        "credentials": {"headers": {}},
+    }

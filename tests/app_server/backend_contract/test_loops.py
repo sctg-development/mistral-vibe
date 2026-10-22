@@ -24,6 +24,8 @@ from vibe.app_server.protocol import (
     ClientCapabilities,
     ProtocolErrorCode,
     SessionOptions,
+    SessionReadParams,
+    SessionReadResponse,
 )
 from vibe.app_server.session import AppServerSession
 
@@ -54,6 +56,57 @@ async def test_loop_resource_supports_crud(
 
 
 @pytest.mark.asyncio
+async def test_session_state_and_catalogue_report_active_loops(
+    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_response: Callable[[str], httpx.Response],
+    backend_contract_persistent_connection: BackendContractConnection,
+) -> None:
+    """*Prepare*: A persisted session with one scheduled loop.
+    *Do*: Read its state while live, then list sessions from a passive Host.
+    *Assert*: The live state and the catalogue row both report the loop with
+    its recurrence and next fire time.
+    """
+    # Prepare
+    backend_contract_mistral_api.mock(
+        return_value=backend_contract_mistral_response("stored")
+    )
+    session = await backend_contract_persistent_connection.host.open_session()
+    try:
+        loop = await session.resources.loops.create("30s", "check the build")
+        _ = [event async for event in session.act("persist the session")]
+
+        # Do
+        session_id = session.session_id
+        live_state = SessionReadResponse.model_validate(
+            await backend_contract_persistent_connection.client.request(
+                "session/read", SessionReadParams(session_id=session_id)
+            )
+        ).state
+    finally:
+        await session.close()
+
+    passive_connection = await connect_backend_contract_host(
+        session_options=SessionOptions(), capabilities=ClientCapabilities()
+    )
+    try:
+        listed = await passive_connection.host.list_sessions()
+    finally:
+        await passive_connection.host.close()
+
+    # Assert
+    assert len(live_state.session.loops) == 1
+    reported = live_state.session.loops[0]
+    assert reported.id == loop.id
+    assert reported.prompt == "check the build"
+    assert reported.interval_seconds == 30
+    assert reported.cron is None
+    assert reported.next_fire_at > 0
+
+    catalogue_row = next(item for item in listed if item.id == session_id)
+    assert catalogue_row.loops == [reported]
+
+
+@pytest.mark.asyncio
 async def test_loop_resource_returns_typed_validation_errors(
     backend_contract_session: AppServerSession,
 ) -> None:
@@ -75,7 +128,6 @@ async def test_loop_schedule_survives_resume_from_a_new_host(
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_connection: BackendContractConnection,
-    experimental_harness: bool,
 ) -> None:
     """*Prepare*: A persisted session with one scheduled loop, then a fresh backend Host.
     *Do*: Resume the session and list its loops.
@@ -91,9 +143,7 @@ async def test_loop_schedule_survives_resume_from_a_new_host(
     session_id = session.session_id
     await session.close()
     resumed_connection = await connect_backend_contract_host(
-        experimental_harness,
-        session_options=SessionOptions(),
-        capabilities=ClientCapabilities(),
+        session_options=SessionOptions(), capabilities=ClientCapabilities()
     )
 
     # Do
@@ -133,15 +183,11 @@ async def test_fork_preserves_loop_schedules(
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_session: AppServerSession,
-    experimental_harness: bool,
 ) -> None:
     """*Prepare*: A persisted session with one scheduled loop.
     *Do*: Fork and attach to a copy of that session.
     *Assert*: The fork has the same loop schedule.
     """
-    if not experimental_harness:
-        pytest.skip("Legacy forks do not preserve scheduled loops")
-
     # Prepare
     backend_contract_mistral_api.mock(
         return_value=backend_contract_mistral_response("stored")
@@ -165,16 +211,12 @@ async def test_unified_due_loop_runs_as_an_unsolicited_turn(
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_connection: BackendContractConnection,
-    experimental_harness: bool,
     tmp_path: Path,
 ) -> None:
     """*Prepare*: A persisted Unified session whose loop is already due.
     *Do*: Resume it and wait for the background scheduler.
     *Assert*: The turn runs, the notice follows its user message, and the loop advances.
     """
-    if not experimental_harness:
-        pytest.skip("Unified scheduler integration")
-
     # Prepare
     session = await backend_contract_persistent_connection.host.open_session()
     loop = await session.resources.loops.create("30s", "scheduled prompt")
@@ -186,7 +228,7 @@ async def test_unified_due_loop_runs_as_an_unsolicited_turn(
         return_value=backend_contract_mistral_response("scheduled response")
     )
     resumed_connection = await connect_backend_contract_host(
-        True, session_options=SessionOptions(), capabilities=ClientCapabilities()
+        session_options=SessionOptions(), capabilities=ClientCapabilities()
     )
 
     # Do
@@ -228,16 +270,12 @@ async def test_unified_fired_loop_prompt_keeps_its_marker_across_fork(
     backend_contract_mistral_api: respx.Route,
     backend_contract_mistral_response: Callable[[str], httpx.Response],
     backend_contract_persistent_connection: BackendContractConnection,
-    experimental_harness: bool,
     tmp_path: Path,
 ) -> None:
     """*Prepare*: A resumed Unified session whose due loop has fired.
     *Do*: Fork the session, then fork that fork.
     *Assert*: Both forked prompts still carry the fired-loop display marker.
     """
-    if not experimental_harness:
-        pytest.skip("Unified scheduler integration")
-
     # Prepare
     session = await backend_contract_persistent_connection.host.open_session()
     loop = await session.resources.loops.create("30s", "scheduled prompt")
@@ -249,7 +287,7 @@ async def test_unified_fired_loop_prompt_keeps_its_marker_across_fork(
         return_value=backend_contract_mistral_response("scheduled response")
     )
     resumed_connection = await connect_backend_contract_host(
-        True, session_options=SessionOptions(), capabilities=ClientCapabilities()
+        session_options=SessionOptions(), capabilities=ClientCapabilities()
     )
     resumed = await resumed_connection.host.resume_session(session_id)
 
@@ -288,16 +326,12 @@ async def test_unified_fired_loop_prompt_keeps_its_marker_across_fork(
 async def test_headless_unified_resume_does_not_fire_due_loops(
     backend_contract_mistral_api: respx.Route,
     backend_contract_persistent_connection: BackendContractConnection,
-    experimental_harness: bool,
     tmp_path: Path,
 ) -> None:
     """*Prepare*: A persisted Unified session with an overdue loop.
     *Do*: Resume the session in headless mode and allow scheduler time to elapse.
     *Assert*: No model request or scheduled turn is started.
     """
-    if not experimental_harness:
-        pytest.skip("Unified scheduler integration")
-
     # Prepare
     session = await backend_contract_persistent_connection.host.open_session()
     await session.resources.loops.create("30s", "must not run")
@@ -306,9 +340,7 @@ async def test_headless_unified_resume_does_not_fire_due_loops(
     await session.close()
     _mark_unified_loop_due(tmp_path, session_id)
     resumed_connection = await connect_backend_contract_host(
-        True,
-        session_options=SessionOptions(headless=True),
-        capabilities=ClientCapabilities(),
+        session_options=SessionOptions(headless=True), capabilities=ClientCapabilities()
     )
 
     # Do

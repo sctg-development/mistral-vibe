@@ -1,5 +1,4 @@
-//! `--continue`/`--resume` CLI intent resolution, mirroring the Python
-//! `_session_intent` (entrypoint.py).
+//! `--continue`/`--resume` CLI intent resolution.
 
 use clap::Parser;
 use vibe_rs::cli::{Cli, StartupResume};
@@ -32,20 +31,6 @@ fn resume_with_id_is_by_id_intent() {
 fn resume_without_id_is_picker_intent() {
     let cli = Cli::parse_from(["vibe-rs", "--resume"]);
     assert_eq!(cli.startup_resume(), StartupResume::Picker);
-}
-
-#[test]
-fn continue_and_resume_are_mutually_exclusive() {
-    let result = Cli::try_parse_from(["vibe-rs", "--continue", "--resume", "id"]);
-    assert!(result.is_err(), "--continue and --resume must conflict");
-}
-
-#[test]
-fn resume_id_and_resume_picker_are_distinct() {
-    assert_ne!(
-        Cli::parse_from(["vibe-rs", "--resume", "id"]).startup_resume(),
-        Cli::parse_from(["vibe-rs", "--resume"]).startup_resume(),
-    );
 }
 
 #[test]

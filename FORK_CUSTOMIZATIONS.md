@@ -1,7 +1,7 @@
 # Fork customizations (sctg-development/mistral-vibe)
 
 What this fork changes on top of upstream, so a sync keeps it. Upstream base:
-`4ae5c595` (v2.26.1, merged in `9a9584e1`). Re-check with `git diff <upstream-tag> --stat -- vibe`.
+`dd2c04ce` (v3.0.1). Re-check with `git diff <upstream-tag> --stat -- vibe`.
 Upstream remote: `upstream` = `https://github.com/mistralai/mistral-vibe.git`.
 
 ## Multi-account key pool (Vibe sign-in keys)
@@ -13,14 +13,14 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 - `vibe/core/llm/key_pool.py` — pool (even spread: least-recent account with room, prompt cache sacrificed on purpose), cooldowns, rate-limit headroom
   (`x-ratelimit-*-minute` headers), in-flight spreading, per-key usage registry.
   State shared across processes in `$VIBE_HOME/key_pool_state.json`.
-- `vibe/cli/list_keys.py` — `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys`.
+- `vibe/cli/list_keys.py` — Python `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` implementation. Since v3.0 `vibe` is the Rust launcher (`vibe/cli/launcher.py`) and `vibe/cli/entrypoint.py` is gone, so only the Rust flags are reachable; this module is currently unwired.
 - `vibe/cli-rust/src/credentials/api_keys.rs` — Rust port of the key management flags (`vibe-rs` is what `vibe` runs
   when `VIBE_CLI=rust` or the rollout selects it). `--list-keys` queries console `/api/vibe/whoami` and API `/v1/users/me`
   per key (identity: 3 concurrent, 3 tries) and shares `$VIBE_HOME/whoami_cache_multi.json` (6 h TTL, key =
   first 32 hex of SHA-256) with the Python implementation. `--import-keys [KEYS]` takes the keys as an argument, or
   reads stdin when omitted or `-` (Python and Rust).
 - `tests/backend/test_key_pool.py`, `tests/test_key_accounts.py`,
-  `tests/cli/test_list_keys.py`.
+  (the Python `tests/cli/test_list_keys.py` was dropped with the Python CLI).
 
 ### Upstream files we touched (re-apply after a sync; keep the hunks small)
 | File | Change |
@@ -29,10 +29,8 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 | `vibe/utils/http.py` | `transport_wrapper` argument on `VibeAsyncHTTPClient` |
 | `vibe/core/llm/backend/mistral.py` | builds the `KeyPool`, wraps the transport, records per-key usage (`_record_pool_usage`) |
 | `vibe/setup/auth/api_key_persistence.py` | every sign-in is appended to the pool (`add_pooled_key`) |
-| `vibe/_experimental_harness.py`, `vibe/app_server/_runtime.py` | `key_pool_active`: several keys force the legacy harness (only it can fail over; the native Unified harness bypasses our transport), even over `--experimental-harness`, which the Rust TUI always passes to its app-server. Everything else follows upstream: Unified is the unconditional default, `--legacy-harness` the escape hatch. The old GrowthBook rollout-cache path (`cached_eval`) is gone: do not reintroduce it, upstream's cutover made it dead and it broke every e2e that needs the Unified harness |
+| `vibe/_experimental_harness.py`, `vibe/app_server/_runtime.py` | back to upstream: v3.0 removed the legacy harness and `--legacy-harness`, so the pool no longer selects an engine. **Open gap:** the Unified (native) harness resolves one key per request via `ProviderCredentialService`, so failover/spreading across pooled keys no longer happens on the main loop; only the key-pool transport on `vibe/core/llm/backend/mistral.py` (utility calls) still rotates |
 | `vibe/app_server/_provider_credentials.py`, `_unified_harness_backend_adapter.py` | per-key usage attribution on the Unified path |
-| `vibe/cli/session_exit.py` | per-key lines under the session total |
-| `vibe/cli/entrypoint.py`, `vibe/cli/cli.py` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` flags |
 | `vibe/cli-rust/src/cli.rs` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` CLI flags |
 | `vibe/cli-rust/src/main.rs` | Key management flag handlers for Rust CLI |
 | `vibe/cli-rust/src/session_exit.rs`, `src/server/process.rs`, `tests/session_exit.rs` | Rust TUI exit summary prints per-key usage under the session total. The app-server child runs in another process, so `key_pool.py` mirrors its usage (masked keys) to `$VIBE_KEY_USAGE_FILE`; the client sets that to `<tmp>/vibe-key-usage-<client pid>.json` at spawn and reads/removes it on exit |

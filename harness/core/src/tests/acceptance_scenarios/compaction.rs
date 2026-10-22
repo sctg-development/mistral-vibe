@@ -15,6 +15,14 @@ fn automatic_compaction_config_with_threshold(token_threshold: u64) -> HarnessCo
     serde_json::from_value(value).expect("automatic compaction config is valid")
 }
 
+fn automatic_compaction_config_with_fixed_image_cost(token_threshold: u64) -> HarnessConfig {
+    let mut value =
+        serde_json::to_value(automatic_compaction_config_with_threshold(token_threshold))
+            .expect("config serializes");
+    value["settings"]["context"]["image_token_cost"] = json!("fixed");
+    serde_json::from_value(value).expect("fixed image token cost config is valid")
+}
+
 fn completion_failed(action: &Value, code: &str, message: &str) -> Value {
     json!({
         "type": "completion_failed",
@@ -30,6 +38,36 @@ fn completion_failed(action: &Value, code: &str, message: &str) -> Value {
 
 fn summary_completion(action: &Value, summary: &str) -> Value {
     text_completion(action, &format!("<summary>{summary}</summary>"))
+}
+
+fn length_completion(action: &Value, text: &str) -> Value {
+    json!({
+        "type": "completion_succeeded",
+        "action_id": action_id(action),
+        "result": {
+            "parts": [{"type": "text", "text": text}],
+            "finish_reason": "length",
+            "usage": null,
+        },
+    })
+}
+
+/// Checks the standalone request shape: a summarizer system prompt and one
+/// user message carrying the transcript, with no agent system prompt.
+fn assert_standalone_request(action: &Value, transcript_text: &str) {
+    let messages = action_messages(action);
+    assert_eq!(messages.len(), 2, "standalone request has two messages");
+    assert_eq!(messages[0]["role"], "system");
+    assert!(
+        message_text(&messages[0])
+            .is_some_and(|text| text.starts_with("You are a dedicated conversation summarizer."))
+    );
+    assert_eq!(messages[1]["role"], "user");
+    let user = message_text(&messages[1]).expect("standalone request has text");
+    assert!(user.starts_with("<conversation_transcript>\n### User\n"));
+    assert!(user.contains(transcript_text));
+    assert!(user.contains("Write the handoff summary for the conversation transcript above."));
+    assert!(!user.contains("CONTEXT CHECKPOINT COMPACTION"));
 }
 
 fn reasoning_only_completion(action: &Value) -> Value {
@@ -134,98 +172,6 @@ fn message_text(message: &Value) -> Option<&str> {
 
 fn large_text(label: &str) -> String {
     format!("{label} {}", "0123456789abcdef".repeat(12_000))
-}
-
-const PRE_LLM_BINDING_IDS: [&str; 1] = ["test-hook-0-PreLlmCall"];
-
-/// Starts a turn whose pre-LLM hook returns `github` context. Checks that the
-/// turn fails before a compaction call because no replacement can hold it.
-fn fail_turn_with_unfittable_context(
-    runtime: &mut SynchronousRuntime,
-    compaction_id: &str,
-    turn_id: &str,
-    context: &str,
-) {
-    let error = json!({
-        "code": "compaction_replacement_too_large",
-        "message": "compaction summary and required continuation context cannot fit the configured token threshold",
-        "retryable": false,
-        "details": null,
-    });
-    let hook = runtime
-        .apply(
-            user_message(turn_id, "inspect the repository", "queue"),
-            running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &PRE_LLM_BINDING_IDS, Value::Null))
-                .observe(turn_started(turn_id, "inspect the repository")),
-        )
-        .only_action();
-    runtime.apply(
-        hook_completed(
-            &hook,
-            "pre_llm_call",
-            pre_llm_continue_with_context(&[("github", context)]),
-        ),
-        failed(turn_id, error.clone())
-            .observe(json!({
-                "type": "context_compaction_failed",
-                "turn_id": turn_id,
-                "action_id": compaction_id,
-                "compaction_id": compaction_id,
-                "attempt": 1,
-                "trigger": "automatic",
-                "error": error.clone(),
-            }))
-            .observe(turn_failed(turn_id, error)),
-    );
-}
-
-/// Starts a turn whose pre-LLM hook returns `output` before and after an
-/// automatic compaction. Returns the agent completion that follows.
-fn compact_turn_after_pre_llm_hook(
-    runtime: &mut SynchronousRuntime,
-    turn_id: &str,
-    output: Value,
-) -> Value {
-    let first_hook = runtime
-        .apply(
-            user_message(turn_id, "inspect it again", "queue"),
-            running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &PRE_LLM_BINDING_IDS, Value::Null))
-                .observe(turn_started(turn_id, "inspect it again")),
-        )
-        .only_action();
-    let compaction = runtime
-        .apply(
-            hook_completed(&first_hook, "pre_llm_call", output.clone()),
-            running(turn_id).dispatch(compaction_call("automatic", 0, 1)),
-        )
-        .only_action();
-    let second_hook = runtime
-        .apply(
-            summary_completion(&compaction, "repository summary"),
-            running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &PRE_LLM_BINDING_IDS, Value::Null))
-                .observe(context_compacted(
-                    turn_id,
-                    &compaction,
-                    "repository summary",
-                )),
-        )
-        .only_action();
-    runtime
-        .apply(
-            hook_completed(&second_hook, "pre_llm_call", output),
-            running(turn_id).dispatch(llm_call(0)),
-        )
-        .only_action()
-}
-
-fn model_texts(action: &Value) -> Vec<&str> {
-    action_messages(action)
-        .iter()
-        .filter_map(message_text)
-        .collect()
 }
 
 fn user_message_with_content(turn_id: &str, content: Value) -> Value {
@@ -413,6 +359,26 @@ fn oversized_agent_input_compacts_before_any_agent_provider_call() {
         .find(|text| text.contains("current request"))
         .expect("replacement context must preserve the latest user request");
     assert!(resumed_request.len() <= 20_000 * 4);
+}
+
+#[test]
+fn oversized_agent_input_compacts_before_a_pre_llm_hook() {
+    let turn_id = "turn-preflight-before-hook";
+    let request = large_text("current request");
+    let mut config = automatic_compaction_config();
+    add_always_hook(&mut config, HookPoint::PreLlmCall);
+    let mut runtime = SynchronousRuntime::new(config);
+
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+
+    assert_eq!(compaction["purpose"], "compaction");
 }
 
 #[test]
@@ -666,11 +632,34 @@ fn keeps_agent_message_cache_when_only_compaction_image_delivery_changes() {
     );
 }
 
+/// *Prepare*: Automatic compaction is enabled with a 20,000-token threshold.
+/// An earlier turn left a large request in history, and the current turn
+/// calls a tool.
+/// *Do*: Complete the tool call with a result that crosses the threshold.
+/// *Assert*: Core compacts before the next agent provider call. The fitted
+/// request drops the earlier request and keeps the tool call with its result.
 #[test]
 fn oversized_tool_result_compacts_before_the_next_agent_provider_call() {
+    let mut runtime = SynchronousRuntime::new_with_history(
+        automatic_compaction_config_with_threshold(20_000),
+        vec![
+            Message::user_text(format!(
+                "earlier request {}",
+                "0123456789abcdef".repeat(2_500)
+            )),
+            assistant_text("earlier answer"),
+        ],
+    );
     let turn_id = "turn-tool-result-preflight-compaction";
-    let mut runtime = SynchronousRuntime::new(automatic_compaction_config_with_threshold(20_000));
-    let first_agent = runtime.start_turn(turn_id, "read the large file");
+    let request = "read the large file";
+    let first_agent = runtime
+        .apply(
+            user_message(turn_id, request, "queue"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(turn_id, request)),
+        )
+        .only_action();
     let arguments = json!({"path": "large.txt"});
     let calls = vec![tool_call("large-read", "read_file", arguments.clone())];
     let tool_action = runtime
@@ -681,7 +670,7 @@ fn oversized_tool_result_compacts_before_the_next_agent_provider_call() {
             [runtime_tool("file_system.read_file", arguments)],
         )
         .only_action();
-    let tool_output = format!("large file contents {}", "0123456789abcdef".repeat(5_000));
+    let tool_output = format!("large file contents {}", "0123456789abcdef".repeat(2_500));
     let tool_result = file_read_success(&tool_action, &tool_output);
 
     let compaction = runtime
@@ -694,6 +683,9 @@ fn oversized_tool_result_compacts_before_the_next_agent_provider_call() {
         .only_action();
 
     assert_eq!(compaction["purpose"], "compaction");
+    let compaction_text = Value::from(action_messages(&compaction).to_vec()).to_string();
+    assert!(compaction_text.contains("large file contents"));
+    assert!(!compaction_text.contains("earlier request"));
     let resumed = runtime
         .apply(
             summary_completion(&compaction, "large file summary"),
@@ -707,6 +699,220 @@ fn oversized_tool_result_compacts_before_the_next_agent_provider_call() {
         )
         .only_action();
     runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+/// *Prepare*: Automatic compaction is enabled with a 20,000-token threshold.
+/// The turn starts with a large request and calls a tool.
+/// *Do*: Complete the tool call with a result that, with the full request,
+/// crosses the threshold.
+/// *Assert*: Core compacts and keeps the tool call with its result. It
+/// truncates the request instead of dropping the result.
+#[test]
+fn large_request_is_truncated_to_keep_the_newest_tool_result() {
+    let turn_id = "turn-large-request-and-tool-result";
+    let mut runtime = SynchronousRuntime::new(automatic_compaction_config_with_threshold(20_000));
+    let request = format!(
+        "request start {} request end",
+        "0123456789abcdef".repeat(3_500)
+    );
+    let first_agent = runtime.start_turn(turn_id, &request);
+    let arguments = json!({"path": "large.txt"});
+    let calls = vec![tool_call("large-read", "read_file", arguments.clone())];
+    let tool_action = runtime
+        .complete_with_tool_calls(
+            turn_id,
+            &first_agent,
+            &calls,
+            [runtime_tool("file_system.read_file", arguments)],
+        )
+        .only_action();
+    let tool_output = format!("large file contents {}", "0123456789abcdef".repeat(2_500));
+    let tool_result = file_read_success(&tool_action, &tool_output);
+
+    let compaction = runtime
+        .apply(
+            tool_result.clone(),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 1, 1))
+                .observe_completed_tool_result(&tool_action, &tool_result),
+        )
+        .only_action();
+
+    assert_eq!(compaction["purpose"], "compaction");
+    let compaction_text = Value::from(action_messages(&compaction).to_vec()).to_string();
+    assert!(compaction_text.contains("large file contents"));
+    assert!(compaction_text.contains("request start"));
+    assert!(compaction_text.contains("tokens truncated…"));
+    assert!(!compaction_text.contains(&request));
+}
+
+/// *Prepare*: Automatic compaction is enabled with a 20,000-token threshold,
+/// and the turn calls a tool.
+/// *Do*: Complete the tool call with a result that alone exceeds the threshold.
+/// *Assert*: Core does not send a compaction request without the result, which
+/// would make the agent call the tool again. The turn fails with
+/// `compaction_tool_result_too_large` and names the tool.
+#[test]
+fn tool_result_larger_than_the_threshold_fails_the_turn() {
+    let turn_id = "turn-tool-result-too-large";
+    let config = automatic_compaction_config_with_threshold(20_000);
+    let compaction_id = compaction_action_id(&config.task_id, 1);
+    let mut runtime = SynchronousRuntime::new(config);
+    let first_agent = runtime.start_turn(turn_id, "read the large file");
+    let arguments = json!({"path": "large.txt"});
+    let calls = vec![tool_call("large-read", "read_file", arguments.clone())];
+    let tool_action = runtime
+        .complete_with_tool_calls(
+            turn_id,
+            &first_agent,
+            &calls,
+            [runtime_tool("file_system.read_file", arguments)],
+        )
+        .only_action();
+    let tool_output = format!("large file contents {}", "0123456789abcdef".repeat(5_000));
+    let tool_result = file_read_success(&tool_action, &tool_output);
+    let error = json!({
+        "code": "compaction_tool_result_too_large",
+        "message": "the newest result of tool read_file cannot fit the configured compaction token threshold; raise the threshold or make the tool return less",
+        "retryable": false,
+        "details": {"tool_names": ["read_file"]},
+    });
+
+    runtime.apply(
+        tool_result.clone(),
+        failed(turn_id, error.clone())
+            .observe_completed_tool_result(&tool_action, &tool_result)
+            .observe(json!({
+                "type": "context_compaction_failed",
+                "turn_id": turn_id,
+                "action_id": compaction_id,
+                "compaction_id": compaction_id,
+                "attempt": 1,
+                "trigger": "automatic",
+                "error": error.clone(),
+            }))
+            .observe(turn_failed(turn_id, error)),
+    );
+}
+
+/// *Prepare*: Automatic compaction is enabled with a 20,000-token threshold
+/// and one iteration per turn. The turn calls a tool, gets a result that alone
+/// exceeds the threshold, and ends at the iteration limit.
+/// *Do*: Request a manual compaction.
+/// *Assert*: The manual compaction starts. It removes the tool call and its
+/// result to fit, because no agent model call follows it within the turn.
+#[test]
+fn manual_compaction_removes_a_tool_result_larger_than_the_threshold() {
+    let turn_id = "turn-manual-after-large-tool-result";
+    let mut config = automatic_compaction_config_with_threshold(20_000);
+    config.settings.turn.max_iterations = Some(1);
+    let mut runtime = SynchronousRuntime::new(config);
+    let first_agent = runtime.start_turn(turn_id, "read the large file");
+    let arguments = json!({"path": "large.txt"});
+    let calls = vec![tool_call("large-read", "read_file", arguments.clone())];
+    let tool_action = runtime
+        .complete_with_tool_calls(
+            turn_id,
+            &first_agent,
+            &calls,
+            [runtime_tool("file_system.read_file", arguments)],
+        )
+        .only_action();
+    let tool_output = format!("large file contents {}", "0123456789abcdef".repeat(5_000));
+    let tool_result = file_read_success(&tool_action, &tool_output);
+    runtime.apply(
+        tool_result.clone(),
+        completed(turn_id, vec![])
+            .observe_completed_tool_result(&tool_action, &tool_result)
+            .observe(turn_completed_at_iteration_limit(turn_id, vec![])),
+    );
+
+    let compaction = runtime
+        .apply(
+            compact("keep going"),
+            compacting("manual").dispatch(compaction_call("manual", 0, 1)),
+        )
+        .only_action();
+
+    let compaction_text = Value::from(action_messages(&compaction).to_vec()).to_string();
+    assert!(compaction_text.contains("read the large file"));
+    assert!(!compaction_text.contains("large file contents"));
+}
+
+/// *Prepare*: Automatic compaction is enabled with a 20,000-token threshold.
+/// An earlier turn called a tool with the ID `large-read` and got a large
+/// result. The new turn calls a tool with the same ID.
+/// *Do*: Complete the new tool call with a result that, with the earlier
+/// exchange, crosses the threshold.
+/// *Assert*: Core keeps only the newest exchange. It removes the earlier
+/// exchange with the reused ID and compacts instead of failing the turn.
+#[test]
+fn earlier_exchange_with_a_reused_tool_call_id_is_removed_to_fit() {
+    let earlier_call = json!({
+        "role": "assistant",
+        "content": [{
+            "type": "tool_call",
+            "id": "large-read",
+            "name": "read_file",
+            "arguments": {"type": "json", "raw": "{}", "value": {}},
+        }],
+    });
+    let earlier_result = json!({
+        "role": "tool",
+        "tool_call_id": "large-read",
+        "name": "read_file",
+        "outcome": "success",
+        "content": [{
+            "type": "text",
+            "text": format!("earlier file contents {}", "0123456789abcdef".repeat(2_500)),
+        }],
+    });
+    let history = [
+        Message::user_text("read the earlier file"),
+        serde_json::from_value(earlier_call).expect("history message is valid"),
+        serde_json::from_value(earlier_result).expect("history message is valid"),
+        assistant_text("earlier answer"),
+    ]
+    .into();
+    let mut runtime = SynchronousRuntime::new_with_history(
+        automatic_compaction_config_with_threshold(20_000),
+        history,
+    );
+    let turn_id = "turn-reused-tool-call-id";
+    let request = "read the large file";
+    let first_agent = runtime
+        .apply(
+            user_message(turn_id, request, "queue"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started(turn_id, request)),
+        )
+        .only_action();
+    let arguments = json!({"path": "large.txt"});
+    let calls = vec![tool_call("large-read", "read_file", arguments.clone())];
+    let tool_action = runtime
+        .complete_with_tool_calls(
+            turn_id,
+            &first_agent,
+            &calls,
+            [runtime_tool("file_system.read_file", arguments)],
+        )
+        .only_action();
+    let tool_output = format!("large file contents {}", "0123456789abcdef".repeat(2_500));
+    let tool_result = file_read_success(&tool_action, &tool_output);
+
+    let compaction = runtime
+        .apply(
+            tool_result.clone(),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 1, 1))
+                .observe_completed_tool_result(&tool_action, &tool_result),
+        )
+        .only_action();
+
+    let compaction_text = Value::from(action_messages(&compaction).to_vec()).to_string();
+    assert!(compaction_text.contains("large file contents"));
+    assert!(!compaction_text.contains("earlier file contents"));
 }
 
 #[test]
@@ -850,12 +1056,18 @@ fn failed_automatic_compaction_keeps_provider_reported_over_budget_signal() {
         "retryable": false,
         "details": null,
     });
+    let fallback = runtime
+        .apply(
+            completion_failed(&compaction, "provider_error", "summary provider failed"),
+            running(failing_turn).dispatch(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
     runtime.apply(
-        completion_failed(&compaction, "provider_error", "summary provider failed"),
+        completion_failed(&fallback, "provider_error", "summary provider failed"),
         failed(failing_turn, error.clone())
             .observe(context_compaction_failed(
                 failing_turn,
-                &compaction,
+                &fallback,
                 error.clone(),
             ))
             .observe(turn_failed(failing_turn, error)),
@@ -1051,7 +1263,7 @@ fn untagged_plain_text_is_accepted_as_the_compaction_summary() {
 }
 
 #[test]
-fn empty_summary_retries_once_then_fails_without_losing_canonical_context() {
+fn empty_summary_falls_back_to_a_standalone_request_then_fails_without_losing_canonical_context() {
     let turn_id = "turn-empty-summary";
     let request = large_text("request retained after empty compaction");
     let mut runtime = SynchronousRuntime::new(automatic_compaction_config());
@@ -1068,13 +1280,14 @@ fn empty_summary_retries_once_then_fails_without_losing_canonical_context() {
     let retry = runtime
         .apply(
             reasoning_only_completion(&compaction),
-            running(turn_id).dispatch(compaction_call("automatic", 0, 2)),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
         )
         .only_action();
 
     assert_eq!(compaction["compaction_id"], retry["compaction_id"]);
     assert_ne!(action_id(&compaction), action_id(&retry));
-    assert_eq!(action_messages(&retry), original_messages);
+    assert_ne!(action_messages(&retry), original_messages);
+    assert_standalone_request(&retry, "request retained after empty compaction");
 
     let error = json!({
         "code": "invalid_compaction_summary",
@@ -1116,7 +1329,7 @@ fn empty_summary_retries_once_then_fails_without_losing_canonical_context() {
 }
 
 #[test]
-fn summary_with_tool_calls_retries_instead_of_compacting() {
+fn summary_with_tool_calls_falls_back_to_a_standalone_request() {
     let turn_id = "turn-summary-tool-call";
     let request = large_text("request requiring compaction");
     let mut runtime = SynchronousRuntime::new(automatic_compaction_config());
@@ -1132,7 +1345,7 @@ fn summary_with_tool_calls_retries_instead_of_compacting() {
     let retry = runtime
         .apply(
             summary_with_tool_call_completion(&compaction, "do not accept this"),
-            running(turn_id).dispatch(compaction_call("automatic", 0, 2)),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
         )
         .only_action();
 
@@ -1143,6 +1356,198 @@ fn summary_with_tool_calls_retries_instead_of_compacting() {
             running(turn_id)
                 .dispatch(llm_call(0))
                 .observe(context_compacted(turn_id, &retry, "valid summary")),
+        )
+        .only_action();
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+/// A provider that serves repeated requests from a response cache returns the
+/// same malformed summary for the same request. The fallback is a different
+/// request, so the replayed failure does not repeat and compaction succeeds.
+#[test]
+fn malformed_summary_is_recovered_by_a_different_standalone_request() {
+    let turn_id = "turn-malformed-summary";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(automatic_compaction_config());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+    let malformed = "<summary>the response stops before its closing tag";
+
+    let fallback = runtime
+        .apply(
+            text_completion(&compaction, malformed),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
+
+    assert_ne!(action_id(&fallback), action_id(&compaction));
+    assert_ne!(action_messages(&fallback), action_messages(&compaction));
+    assert_standalone_request(&fallback, "request requiring compaction");
+    let resumed = runtime
+        .apply(
+            summary_completion(&fallback, "standalone summary"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(context_compacted(turn_id, &fallback, "standalone summary")),
+        )
+        .only_action();
+    assert!(action_messages(&resumed).iter().any(|message| {
+        message_text(message).is_some_and(|text| text.contains("standalone summary"))
+    }));
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+/// A Runtime that stops a compaction call, for example because its reasoning
+/// exceeded a configured limit, reports a completion failure. Core then sends
+/// the standalone request instead of failing the turn.
+#[test]
+fn failed_in_context_request_falls_back_to_a_standalone_request() {
+    let turn_id = "turn-reasoning-limit";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(automatic_compaction_config());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+
+    let fallback = runtime
+        .apply(
+            completion_failed(
+                &compaction,
+                "compaction_reasoning_limit_exceeded",
+                "compaction reasoning exceeded its limit",
+            ),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
+
+    assert_standalone_request(&fallback, "request requiring compaction");
+    let resumed = runtime
+        .apply(
+            summary_completion(&fallback, "standalone summary"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(context_compacted(turn_id, &fallback, "standalone summary")),
+        )
+        .only_action();
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+#[test]
+fn standalone_fallback_survives_checkpoint_restore() {
+    let turn_id = "turn-standalone-restore";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(automatic_compaction_config());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+    let fallback = runtime
+        .apply(
+            reasoning_only_completion(&compaction),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
+    assert_eq!(
+        runtime.checkpoint_value()["turn"]["phase"]["projection"]["request"],
+        "standalone"
+    );
+
+    runtime.restart_from_checkpoint();
+    let restored = runtime
+        .apply(
+            json!({
+                "type": "completion_model_input_resync_requested",
+                "action_id": action_id(&fallback),
+            }),
+            running(turn_id).refresh(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
+
+    assert_eq!(action_id(&restored), action_id(&fallback));
+    assert_eq!(action_messages(&restored), action_messages(&fallback));
+    let resumed = runtime
+        .apply(
+            summary_completion(&restored, "restored summary"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(context_compacted(turn_id, &restored, "restored summary")),
+        )
+        .only_action();
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+/// Bare text is accepted as a summary only when the response ended normally.
+/// Bare text cut off at the output limit is incomplete.
+#[test]
+fn bare_summary_cut_off_at_the_output_limit_falls_back_to_a_standalone_request() {
+    let turn_id = "turn-truncated-summary";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(automatic_compaction_config());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+
+    let fallback = runtime
+        .apply(
+            length_completion(&compaction, "a bare summary that stops mid"),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
+    let error = json!({
+        "code": "invalid_compaction_summary",
+        "message": "compaction response reached the output token limit before a complete summary",
+        "retryable": false,
+        "details": null,
+    });
+
+    runtime.apply(
+        length_completion(&fallback, "<summary>still unfinished"),
+        failed(turn_id, error.clone())
+            .observe(context_compaction_failed(turn_id, &fallback, error.clone()))
+            .observe(turn_failed(turn_id, error)),
+    );
+}
+
+#[test]
+fn delimited_summary_at_the_output_limit_is_accepted() {
+    let turn_id = "turn-complete-summary-at-limit";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(automatic_compaction_config());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+
+    let resumed = runtime
+        .apply(
+            length_completion(&compaction, "<summary>complete summary</summary>"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(context_compacted(turn_id, &compaction, "complete summary")),
         )
         .only_action();
     runtime.finish_turn_with_text(turn_id, &resumed, "done");
@@ -1346,14 +1751,16 @@ fn automatic_compaction_failure_preserves_canonical_history() {
         "details": null,
     });
 
+    let fallback = runtime
+        .apply(
+            completion_failed(&compaction, "provider_error", "summary provider failed"),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
     runtime.apply(
-        completion_failed(&compaction, "provider_error", "summary provider failed"),
+        completion_failed(&fallback, "provider_error", "summary provider failed"),
         failed(turn_id, error.clone())
-            .observe(context_compaction_failed(
-                turn_id,
-                &compaction,
-                error.clone(),
-            ))
+            .observe(context_compaction_failed(turn_id, &fallback, error.clone()))
             .observe(turn_failed(turn_id, error)),
     );
 
@@ -1383,7 +1790,7 @@ fn automatic_compaction_failure_preserves_canonical_history() {
 }
 
 #[test]
-fn manual_compaction_retries_invalid_summary_then_returns_idle() {
+fn manual_compaction_falls_back_after_invalid_summary_then_returns_idle() {
     let mut runtime = SynchronousRuntime::new(config());
     let compaction = runtime
         .apply(
@@ -1394,9 +1801,16 @@ fn manual_compaction_retries_invalid_summary_then_returns_idle() {
     let retry = runtime
         .apply(
             reasoning_only_completion(&compaction),
-            compacting("manual").dispatch(compaction_call("manual", 0, 2)),
+            compacting("manual").dispatch(standalone_compaction_call("manual", 0, 2)),
         )
         .only_action();
+    let standalone_prompt = action_messages(&retry)
+        .last()
+        .and_then(message_text)
+        .expect("standalone request ends with its prompt");
+    assert!(standalone_prompt.ends_with(
+        "<extra_compaction_instructions>\npreserve current work\n</extra_compaction_instructions>"
+    ));
     let error = json!({
         "code": "invalid_compaction_summary",
         "message": "compaction response was empty",
@@ -1410,274 +1824,338 @@ fn manual_compaction_retries_invalid_summary_then_returns_idle() {
     );
 }
 
-///
-/// *Prepare*: A completed turn received keyed context from its pre-LLM hook.
-/// *Do*: Compact manually, then start a turn whose pre-LLM hook returns the same keyed context.
-/// *Assert*: The summary request leaves the keyed context out, and Core delivers it again after the compacted replacement.
-///
+/// *Prepare*: Automatic compaction is enabled with a 40,000-token threshold and
+/// the fixed image token cost, so one native image estimates at the constant
+/// instead of its serialized size.
+/// *Do*: Send one prompt carrying a large native image.
+/// *Assert*: The turn reaches the agent completion with the image delivered
+/// natively, because the fixed cost keeps the input under the threshold. This
+/// turn does not compact; the steered-image scenario covers fitting a
+/// compaction request that carries an image.
 #[test]
-fn keyed_pre_llm_context_is_left_out_of_the_summary_and_delivered_after_compaction() {
-    // Prepare
-    let context = "GitHub is not connected.";
-    let mut config = config();
-    add_always_hook(&mut config, HookPoint::PreLlmCall);
-    let binding_ids = ["test-hook-0-PreLlmCall"];
+fn fixed_image_cost_lets_one_prompt_and_one_image_reach_the_agent() {
+    let turn_id = "turn-fixed-image-cost-single-image";
+    let config = automatic_compaction_config_with_fixed_image_cost(40_000);
+    let content = file_image_content();
     let mut runtime = SynchronousRuntime::new(config);
-    let first_hook = runtime
-        .apply(
-            user_message("turn-before-compaction", "inspect the repository", "queue"),
-            running("turn-before-compaction")
-                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
-                .observe(turn_started(
-                    "turn-before-compaction",
-                    "inspect the repository",
-                )),
-        )
-        .only_action();
-    let first_agent = runtime
-        .apply(
-            hook_completed(
-                &first_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", context)]),
-            ),
-            running("turn-before-compaction").dispatch(llm_call(0)),
-        )
-        .only_action();
-    runtime.finish_turn_with_text("turn-before-compaction", &first_agent, "first answer");
 
-    // Do
-    let compaction = runtime
+    let action = runtime
         .apply(
-            compact(""),
-            compacting("manual").dispatch(compaction_call("manual", 0, 1)),
-        )
-        .only_action();
-    runtime.apply(
-        summary_completion(&compaction, "repository summary"),
-        idle().observe(json!({
-            "type": "context_compacted",
-            "turn_id": null,
-            "action_id": action_id(&compaction),
-            "compaction_id": compaction["compaction_id"],
-            "attempt": compaction["attempt"],
-            "trigger": "manual",
-            "summary": "repository summary",
-            "usage": null,
-        })),
-    );
-    let second_hook = runtime
-        .apply(
-            user_message("turn-after-compaction", "continue", "queue"),
-            running("turn-after-compaction")
-                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
-                .observe(turn_started("turn-after-compaction", "continue")),
-        )
-        .only_action();
-    let resumed = runtime
-        .apply(
-            hook_completed(
-                &second_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", context)]),
-            ),
-            running("turn-after-compaction").dispatch(llm_call(0)),
+            user_message_with_content(turn_id, content.clone()),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(turn_started_with_content(turn_id, content)),
         )
         .only_action();
 
-    // Assert
-    assert!(
-        action_messages(&compaction)
-            .iter()
-            .all(|message| message_text(message) != Some(context))
-    );
-    let delivered = action_messages(&resumed)
-        .iter()
-        .filter(|message| message_text(message) == Some(context))
-        .count();
-    assert_eq!(delivered, 1);
-    assert_eq!(
-        action_messages(&resumed).last().and_then(message_text),
-        Some(context)
-    );
-    runtime.finish_turn_with_text("turn-after-compaction", &resumed, "done");
+    assert_eq!(action["purpose"], "agent");
+    let image = first_action_block_with_type(&action, "image");
+    assert_eq!(image["mimeType"], "image/png");
+    assert!(image["data"].as_str().is_some_and(|data| !data.is_empty()));
 }
 
-///
-/// *Prepare*: A pre-LLM hook returns keyed context that pushes the agent input over the threshold, and compaction starts.
-/// *Do*: Restart Core from its checkpoint, compact, then let the resumed pre-LLM hook return the same keyed context.
-/// *Assert*: The replacement leaves room for the keyed context across the restore, so Core dispatches the agent completion instead of compacting again.
-///
-#[test]
-fn keyed_context_redelivered_after_automatic_compaction_reaches_the_agent() {
-    // Prepare
-    let turn_id = "turn-keyed-context-compaction";
-    let request = format!("current request {}", "0123456789abcdef".repeat(5_000));
-    let context = format!("GitHub state {}", "fedcba9876543210".repeat(6_250));
-    let mut config = automatic_compaction_config();
-    add_always_hook(&mut config, HookPoint::PreLlmCall);
-    let binding_ids = ["test-hook-0-PreLlmCall"];
-    let mut runtime = SynchronousRuntime::new(config);
-    let first_hook = runtime
-        .apply(
-            user_message(turn_id, &request, "queue"),
-            running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
-                .observe(turn_started(turn_id, &request)),
+/// Leaves a steered native image and an oversized tool result pending in an
+/// automatic compaction, and returns its Action.
+fn pending_compaction_with_steered_image(runtime: &mut SynchronousRuntime, turn_id: &str) -> Value {
+    let first_agent = runtime.start_turn(turn_id, "read the file");
+    let arguments = json!({"path": "small.txt"});
+    let calls = vec![tool_call("small-read", "read_file", arguments.clone())];
+    let tool_action = runtime
+        .complete_with_tool_calls(
+            turn_id,
+            &first_agent,
+            &calls,
+            [runtime_tool("file_system.read_file", arguments)],
         )
         .only_action();
-    let compaction = runtime
-        .apply(
-            hook_completed(
-                &first_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", context.as_str())]),
-            ),
-            running(turn_id).dispatch(compaction_call("automatic", 0, 1)),
-        )
-        .only_action();
-    assert_eq!(
-        runtime.checkpoint_value()["turn"]["phase"]["context_keys"],
-        json!(["github"])
+    let steering_content = json!([{
+        "type": "image",
+        "data": "a".repeat(200_000),
+        "mimeType": "image/png",
+    }]);
+
+    runtime.apply(
+        user_message_with_content_and_mode(turn_id, steering_content.clone(), "steer"),
+        running(turn_id).keep(&tool_action).observe(json!({
+            "type": "turn_steering_received",
+            "turn_id": turn_id,
+            "content": steering_content,
+        })),
     );
 
-    // Do
-    runtime.restart_from_checkpoint();
-    let second_hook = runtime
+    let tool_output = format!("file contents {}", "0123456789abcdef".repeat(1_200));
+    let tool_result = file_read_success(&tool_action, &tool_output);
+    let expected = running(turn_id)
+        .dispatch(compaction_call("automatic", 1, 1))
+        .observe_completed_tool_result(&tool_action, &tool_result)
+        .observe(json!({
+            "type": "turn_steered",
+            "turn_id": turn_id,
+            "content": steering_content,
+        }));
+    runtime.apply(tool_result, expected).only_action()
+}
+
+/// *Prepare*: Automatic compaction is enabled with a 12,000-token threshold and
+/// the fixed image token cost. A turn is mid-flight when the user steers it
+/// with a large native image, and its pending tool result carries enough text
+/// to cross the threshold, so the compaction request would be unfittable under
+/// the serialized-byte estimate of the image.
+/// *Do*: Complete the tool call the turn is waiting for.
+/// *Assert*: The turn dispatches the compaction completion instead of failing
+/// with `compaction_request_too_large`, and the resumed agent input still
+/// carries the image natively.
+#[test]
+fn fixed_image_cost_lets_a_steered_image_compact_instead_of_failing() {
+    let turn_id = "turn-fixed-image-cost-steering";
+    let config = automatic_compaction_config_with_fixed_image_cost(12_000);
+    let mut runtime = SynchronousRuntime::new(config);
+    let compaction = pending_compaction_with_steered_image(&mut runtime, turn_id);
+
+    assert_eq!(compaction["purpose"], "compaction");
+    let resumed = runtime
         .apply(
-            summary_completion(&compaction, "repository summary"),
+            summary_completion(&compaction, "the user steered with a screenshot"),
             running(turn_id)
-                .dispatch(hook_call("pre_llm_call", &binding_ids, Value::Null))
+                .dispatch(llm_call(1))
                 .observe(context_compacted(
                     turn_id,
                     &compaction,
-                    "repository summary",
+                    "the user steered with a screenshot",
                 )),
         )
         .only_action();
+    assert_eq!(resumed["purpose"], "agent");
+    assert!(
+        action_messages(&resumed)
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .any(|block| block["type"] == "image")
+    );
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+/// *Prepare*: A compaction is in flight while the context holds a native image,
+/// and Core was checkpointed under the fixed image token cost.
+/// *Do*: Restore the checkpoint with the fixed policy, then complete the summary.
+/// *Assert*: The replacement is budgeted with the fixed cost, so the agent
+/// resumes with the native image.
+#[test]
+fn fixed_image_cost_budgets_an_in_flight_compaction_after_restore() {
+    let turn_id = "turn-fixed-image-cost-restore";
+    let mut runtime =
+        SynchronousRuntime::new(automatic_compaction_config_with_fixed_image_cost(12_000));
+    let compaction = pending_compaction_with_steered_image(&mut runtime, turn_id);
+
+    runtime.restart_from_checkpoint();
+
     let resumed = runtime
         .apply(
-            hook_completed(
-                &second_hook,
-                "pre_llm_call",
-                pre_llm_continue_with_context(&[("github", context.as_str())]),
+            summary_completion(&compaction, "restored with the fixed cost"),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe(context_compacted(
+                    turn_id,
+                    &compaction,
+                    "restored with the fixed cost",
+                )),
+        )
+        .only_action();
+    assert!(
+        action_messages(&resumed)
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .any(|block| block["type"] == "image")
+    );
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+/// *Prepare*: The same in-flight compaction, checkpointed under the fixed cost.
+/// *Do*: Restore the checkpoint under the `serialized_bytes` policy.
+/// *Assert*: The checkpoint does not store the policy, so the restoring
+/// configuration budgets the image by its serialized size and the restore is
+/// rejected as unfittable.
+#[test]
+fn restore_budgets_an_in_flight_compaction_under_the_restoring_image_policy() {
+    let turn_id = "turn-serialized-image-cost-restore";
+    let mut runtime =
+        SynchronousRuntime::new(automatic_compaction_config_with_fixed_image_cost(12_000));
+    pending_compaction_with_steered_image(&mut runtime, turn_id);
+
+    let error = runtime
+        .checkpoint_restore_error(automatic_compaction_config_with_threshold(12_000))
+        .expect("restore is rejected under the serialized-byte policy");
+
+    assert!(
+        error.contains("token threshold cannot fit"),
+        "unexpected restore error: {error}"
+    );
+}
+
+/// Returns the automatic compaction config the way a Runtime without the
+/// standalone fallback sends it: with no `compaction_fallback` field at all.
+fn config_without_compaction_fallback() -> HarnessConfig {
+    let mut value = serde_json::to_value(automatic_compaction_config()).expect("config serializes");
+    value["settings"]["context"]
+        .as_object_mut()
+        .expect("context settings are an object")
+        .remove("compaction_fallback");
+    let config: HarnessConfig =
+        serde_json::from_value(value).expect("config without a fallback is valid");
+    let serialized = serde_json::to_value(&config).expect("config serializes");
+    assert!(
+        serialized["settings"]["context"]
+            .get("compaction_fallback")
+            .is_none(),
+        "the default fallback is omitted on the wire"
+    );
+    config
+}
+
+fn assert_in_context_request(action: &Value) {
+    assert!(
+        action.get("request").is_none(),
+        "an in-context compaction Action names no request kind: {action}"
+    );
+}
+
+/// A Runtime that does not opt into the standalone fallback (such as the
+/// TypeScript Runtime) keeps the earlier behaviour: after an invalid summary
+/// Core resends the same in-context request once, then fails.
+#[test]
+fn without_the_standalone_fallback_an_invalid_summary_resends_the_same_request() {
+    let turn_id = "turn-resend-invalid-summary";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(config_without_compaction_fallback());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+    assert_in_context_request(&compaction);
+
+    let retry = runtime
+        .apply(
+            text_completion(
+                &compaction,
+                "<summary>the response stops before its closing tag",
             ),
-            running(turn_id).dispatch(llm_call(0)),
+            running(turn_id).dispatch(compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
+    assert_in_context_request(&retry);
+    assert_eq!(action_messages(&retry), action_messages(&compaction));
+
+    let error = json!({
+        "code": "invalid_compaction_summary",
+        "message": "compaction response contained malformed <summary> delimiters",
+        "retryable": false,
+        "details": null,
+    });
+    runtime.apply(
+        text_completion(&retry, "<summary>the response stops before its closing tag"),
+        failed(turn_id, error.clone())
+            .observe(context_compaction_failed(turn_id, &retry, error.clone()))
+            .observe(turn_failed(turn_id, error)),
+    );
+}
+
+/// Without the standalone fallback a failed compaction call fails the
+/// compaction with the Runtime's error, as before.
+#[test]
+fn without_the_standalone_fallback_a_failed_call_fails_the_compaction() {
+    let turn_id = "turn-resend-call-failed";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(config_without_compaction_fallback());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
         )
         .only_action();
 
-    // Assert
-    assert!(
-        action_messages(&compaction)
-            .iter()
-            .all(|message| message_text(message) != Some(context.as_str()))
+    let error = json!({
+        "code": "model_stream_failed",
+        "message": "provider failed",
+        "retryable": false,
+        "details": null,
+    });
+    runtime.apply(
+        completion_failed(&compaction, "model_stream_failed", "provider failed"),
+        failed(turn_id, error.clone())
+            .observe(context_compaction_failed(
+                turn_id,
+                &compaction,
+                error.clone(),
+            ))
+            .observe(turn_failed(turn_id, error)),
     );
-    let delivered = action_messages(&resumed)
-        .iter()
-        .filter(|message| message_text(message) == Some(context.as_str()))
-        .count();
-    assert_eq!(delivered, 1);
+}
+
+/// Without the standalone fallback bare text cut off at the output limit is
+/// still accepted as the summary, as before.
+#[test]
+fn without_the_standalone_fallback_a_cut_off_bare_summary_is_accepted() {
+    let turn_id = "turn-resend-cut-off-summary";
+    let request = large_text("request requiring compaction");
+    let mut runtime = SynchronousRuntime::new(config_without_compaction_fallback());
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+
+    let resumed = runtime
+        .apply(
+            length_completion(&compaction, "a bare summary that stops mid"),
+            running(turn_id)
+                .dispatch(llm_call(0))
+                .observe(context_compacted(
+                    turn_id,
+                    &compaction,
+                    "a bare summary that stops mid",
+                )),
+        )
+        .only_action();
+    runtime.finish_turn_with_text(turn_id, &resumed, "done");
+}
+
+/// A Runtime that opts into the standalone fallback names it in its settings
+/// and gets the standalone request after a failed in-context attempt.
+#[test]
+fn a_runtime_that_names_the_standalone_fallback_gets_the_standalone_request() {
+    let config = automatic_compaction_config();
     assert_eq!(
-        action_messages(&resumed).last().and_then(message_text),
-        Some(context.as_str())
+        serde_json::to_value(&config).expect("config serializes")["settings"]["context"]["compaction_fallback"],
+        "standalone"
     );
-    runtime.finish_turn_with_text(turn_id, &resumed, "done");
-}
-
-///
-/// *Prepare*: A pre-LLM hook is bound.
-/// *Do*: The hook returns keyed context larger than the automatic compaction threshold.
-/// *Assert*: The turn fails before any compaction call, because no replacement can hold the hook's current context.
-///
-#[test]
-fn keyed_context_that_cannot_fit_fails_before_a_compaction_call() {
-    // Prepare
-    let mut config = automatic_compaction_config();
-    add_always_hook(&mut config, HookPoint::PreLlmCall);
-    let compaction_id = compaction_action_id(&config.task_id, 1);
+    let turn_id = "turn-named-standalone-fallback";
+    let request = large_text("request requiring compaction");
     let mut runtime = SynchronousRuntime::new(config);
+    let compaction = runtime
+        .apply(
+            user_message(turn_id, &request, "queue"),
+            running(turn_id)
+                .dispatch(compaction_call("automatic", 0, 1))
+                .observe(turn_started(turn_id, &request)),
+        )
+        .only_action();
+    assert_in_context_request(&compaction);
 
-    // Do / Assert
-    fail_turn_with_unfittable_context(
-        &mut runtime,
-        &compaction_id,
-        "turn-unfittable-keyed-context",
-        &large_text("GitHub state"),
-    );
-}
-
-///
-/// *Prepare*: A turn fails because its pre-LLM hook returned `github` context larger than the threshold.
-/// *Do*: Start the next turn, and let the hook return smaller `github` context.
-/// *Assert*: The hook runs before compaction, the replacement leaves room only for the smaller context, and the agent sees only that context.
-///
-#[test]
-fn oversized_keyed_context_failure_does_not_block_the_next_turn() {
-    // Prepare
-    let small = "GitHub is connected.";
-    let mut config = automatic_compaction_config();
-    add_always_hook(&mut config, HookPoint::PreLlmCall);
-    let compaction_id = compaction_action_id(&config.task_id, 1);
-    let mut runtime = SynchronousRuntime::new(config);
-    fail_turn_with_unfittable_context(
-        &mut runtime,
-        &compaction_id,
-        "turn-oversized-context",
-        &large_text("GitHub state"),
-    );
-
-    // Do
-    let turn_id = "turn-after-oversized-context";
-    let resumed = compact_turn_after_pre_llm_hook(
-        &mut runtime,
-        turn_id,
-        pre_llm_continue_with_context(&[("github", small)]),
-    );
-
-    // Assert
-    let texts = model_texts(&resumed);
-    assert_eq!(texts.iter().filter(|text| **text == small).count(), 1);
-    assert!(texts.iter().all(|text| !text.starts_with("GitHub state")));
-    runtime.finish_turn_with_text(turn_id, &resumed, "done");
-}
-
-///
-/// *Prepare*: A turn fails because its pre-LLM hook returned `github` context larger than the threshold.
-/// *Do*: In the next turn, the hook returns only `jira` context, or no context.
-/// *Assert*: The replacement leaves no room for the stale `github` context, so compaction succeeds and the agent completion follows.
-///
-#[test]
-fn stale_context_key_is_not_reserved() {
-    for (label, output) in [
-        (
-            "other key",
-            pre_llm_continue_with_context(&[("jira", "Jira is connected.")]),
-        ),
-        ("no context", json!({"type": "continue"})),
-    ] {
-        // Prepare
-        let mut config = automatic_compaction_config();
-        add_always_hook(&mut config, HookPoint::PreLlmCall);
-        let compaction_id = compaction_action_id(&config.task_id, 1);
-        let mut runtime = SynchronousRuntime::new(config);
-        fail_turn_with_unfittable_context(
-            &mut runtime,
-            &compaction_id,
-            "turn-stale-context",
-            &large_text("GitHub state"),
-        );
-
-        // Do
-        let turn_id = "turn-after-stale-context";
-        let resumed = compact_turn_after_pre_llm_hook(&mut runtime, turn_id, output);
-
-        // Assert
-        assert!(
-            model_texts(&resumed)
-                .iter()
-                .all(|text| !text.starts_with("GitHub state")),
-            "{label}"
-        );
-        runtime.finish_turn_with_text(turn_id, &resumed, "done");
-    }
+    let fallback = runtime
+        .apply(
+            completion_failed(&compaction, "model_stream_failed", "provider failed"),
+            running(turn_id).dispatch(standalone_compaction_call("automatic", 0, 2)),
+        )
+        .only_action();
+    assert_eq!(fallback["request"], "standalone");
+    assert_standalone_request(&fallback, "request requiring compaction");
 }
