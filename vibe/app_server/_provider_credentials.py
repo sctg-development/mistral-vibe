@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from hashlib import sha256
+import os
 from typing import TYPE_CHECKING
 
 from mistralai_vibe_local_harness.vibe import (
@@ -24,13 +25,17 @@ from mistralai_vibe_local_harness.vibe import (
     ProviderCredentialSnapshot,
 )
 from vibe.core.config.models import MissingAPIKeyError
-from vibe.core.llm.key_pool import note_active_key
+from vibe.core.llm.key_pool import KeyLease, KeyPool, note_active_key
 from vibe.core.types import Backend
 from vibe.observability.logging import logger
 from vibe.utils.api_keys import (
+    ApiKeyOrigin,
+    ApiKeySource,
+    pool_env_var,
     pooled_keys,
     resolve_api_key_with_origin,
     session_credentials,
+    split_keys,
 )
 from vibe.utils.keyring import keyring_read_failure
 
@@ -82,6 +87,11 @@ class ProviderCredentialService:
         # key is not re-sent on the next turn.
         self._rejected: dict[str, str] = {}
         self._lock = asyncio.Lock()
+        # Pooled accounts (``VIBE_API_KEYS``): each resolution takes the next
+        # account, and a rejection parks the account that was sent. The lease
+        # is found again by the revision the Harness reports back.
+        self._pools: dict[tuple[str, ...], KeyPool] = {}
+        self._leases: dict[str, tuple[KeyPool, KeyLease]] = {}
 
     async def resolve(self) -> ProviderCredentialResult:
         try:
@@ -105,9 +115,11 @@ class ProviderCredentialService:
         if not provider.api_key_env_var and not provider.uses_vertex:
             return _snapshot(provider, None, {}, api_key_source=None)
 
-        snapshot = await asyncio.to_thread(
-            _resolve_snapshot, provider, self._credentials
-        )
+        snapshot = await asyncio.to_thread(self._pooled_snapshot, provider)
+        if snapshot is None:
+            snapshot = await asyncio.to_thread(
+                _resolve_snapshot, provider, self._credentials
+            )
         if snapshot is None:
             env_var = provider.api_key_env_var or "VIBE_API_KEY"
             error = MissingAPIKeyError(
@@ -141,6 +153,19 @@ class ProviderCredentialService:
         except ValueError:
             return
 
+        pooled = self._leases.pop(observed_revision, None)
+        if pooled is not None:
+            pool, lease = pooled
+            status = 401 if reason == "http_unauthorized" else 403
+            pool.report_failure(lease, status, retry_after=None, body="")
+            logger.info(
+                "Provider %s rejected pooled account #%d (%s)",
+                provider.name,
+                lease.index + 1,
+                reason,
+            )
+            return
+
         current = await asyncio.to_thread(
             _resolve_snapshot, provider, self._credentials
         )
@@ -165,11 +190,67 @@ class ProviderCredentialService:
             "Provider %s rejected the active credential (%s)", provider.name, reason
         )
 
+    def _pooled_snapshot(
+        self, provider: ProviderConfig
+    ) -> ProviderCredentialSnapshot | None:
+        """The next pooled account's credential, or ``None`` without a pool.
+
+        Several accounts spread the load: the least recently used one with
+        room goes first (the prompt cache is sacrificed on purpose), and an
+        account that refused its key is skipped while it cools down. Only the
+        refusals the Harness reports (401, 403) park an account; the Unified
+        path's own transport hides rate-limit headers from the pool.
+        """
+        env_var = provider.api_key_env_var
+        if not env_var or provider.uses_vertex:
+            return None
+        if self._credentials and self._credentials.get(env_var):
+            return None
+        primary = resolve_api_key_with_origin(env_var)
+        keys = pooled_keys(env_var)
+        if primary and primary[0] not in keys:
+            keys.insert(0, primary[0])
+        if len(keys) < _MIN_POOL_SIZE:
+            return None
+        pool = self._pools.setdefault(tuple(keys), KeyPool(keys))
+        lease = pool.acquire()
+        if lease is None:
+            return None
+        pool.report_success(lease)
+        pool.report_headroom(lease, {})
+        note_active_key(lease.key)
+        origin = _pooled_origin(env_var, lease.key, primary)
+        snapshot = _snapshot(
+            provider,
+            lease.key,
+            _headers(provider, lease.key),
+            api_key_source=origin.describe(),
+        )
+        if len(self._leases) >= _MAX_TRACKED_LEASES:
+            self._leases.pop(next(iter(self._leases)))
+        self._leases[snapshot.revision] = (pool, lease)
+        return snapshot
+
     def _provider_name(self) -> str:
         try:
             return self._select_provider(self._orchestrator.config).name
         except Exception:
             return ""
+
+
+_MAX_TRACKED_LEASES = 64
+_MIN_POOL_SIZE = 2
+
+
+def _pooled_origin(
+    env_var: str, key: str, primary: tuple[str, ApiKeyOrigin] | None
+) -> ApiKeyOrigin:
+    if primary and primary[0] == key:
+        return primary[1]
+    plural = pool_env_var(env_var)
+    if key in split_keys(os.environ.get(plural)):
+        return ApiKeyOrigin(ApiKeySource.ENVIRONMENT, plural)
+    return ApiKeyOrigin(ApiKeySource.KEYRING, plural)
 
 
 def _active_provider(config: VibeConfigSchema) -> ProviderConfig:
