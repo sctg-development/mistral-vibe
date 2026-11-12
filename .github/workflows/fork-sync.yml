@@ -1,0 +1,236 @@
+# Upstream sync of this fork (mistralai/mistral-vibe -> sctg-development/mistral-vibe, branch `multi`), done by
+# Claude Code (headless). The rules the agent follows are in .claude/skills/fork-sync/SKILL.md; the
+# deterministic gate is scripts/fork-sync/check-fork-invariants.sh.
+#
+# There is NO schedule here on purpose: the run is started by the openclaw cron `fork-sync-watch`
+# (sctg-claw repo, scripts/fork-sync/), which dispatches this workflow, follows the run, and sends ONE e-mail
+# per sync. Two triggers would run the agent twice and send a mail for only one of them.
+#
+# Setup (once):
+#   - repo or org secret CLAUDE_CODE_OAUTH_TOKEN_CDVL59 (from `claude setup-token`), visible to this repo
+#   - Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests"
+# Note: a PR opened with the default token does not trigger the pull_request workflows, so this job runs the
+# invariants, ruff and the fork tests itself and comments the result on the PR.
+name: fork-sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run: report only, changes nothing. sync: merge upstream and open a DRAFT pull request."
+        type: choice
+        options: [dry-run, sync]
+        default: dry-run
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    if: github.repository == 'sctg-development/mistral-vibe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      MODE: ${{ inputs.mode || 'sync' }}
+      PYTHON_VERSION: "3.12"
+      # The voice feature needs ALSA, absent from the runner (same as ci.yml).
+      CARGO_BUILD_FLAGS: "--no-default-features"
+    steps:
+      # The runner context is not available in a job-level env, so the result path is set in a step.
+      - name: Result path
+        run: echo "FORK_SYNC_RESULT=$RUNNER_TEMP/fork-sync-result.json" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Pre-check (deterministic, no LLM)
+        id: pre
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/fork-sync/precheck.sh
+
+      - name: Nothing to do
+        if: steps.pre.outputs.needs_sync != 'true'
+        env:
+          PRE_REASON: ${{ steps.pre.outputs.reason }}
+          PRE_BEHIND: ${{ steps.pre.outputs.behind }}
+        run: |
+          # The cron that started this run reads this file; without it a no-op run would be indistinguishable
+          # from a run that lost its result.
+          jq -n --arg reason "$PRE_REASON" --argjson behind "${PRE_BEHIND:-0}" \
+            '{status: (if $reason == "up-to-date" then "up-to-date" else "skipped" end), reason: $reason, behind: $behind}' \
+            > "$FORK_SYNC_RESULT"
+          {
+            echo "### fork-sync: nothing to do"
+            echo "Reason: \`$PRE_REASON\` (behind $PRE_BEHIND, open sync PRs ${{ steps.pre.outputs.open_sync_prs }})."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install uv
+        if: steps.pre.outputs.needs_sync == 'true'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "latest"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        if: steps.pre.outputs.needs_sync == 'true'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Rust toolchain
+        if: steps.pre.outputs.needs_sync == 'true'
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - name: Install dependencies
+        if: steps.pre.outputs.needs_sync == 'true'
+        run: uv sync --all-extras
+
+      - name: Install Claude Code
+        if: steps.pre.outputs.needs_sync == 'true'
+        run: npm install -g @anthropic-ai/claude-code@2.1.289
+
+      - name: Git identity
+        if: steps.pre.outputs.needs_sync == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run the agent
+        if: steps.pre.outputs.needs_sync == 'true'
+        id: agent
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_CDVL59 }}
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.pre.outputs.behind }}
+          AHEAD: ${{ steps.pre.outputs.ahead }}
+          CONFLICTS: ${{ steps.pre.outputs.conflicts }}
+          CONFLICT_FILES: ${{ steps.pre.outputs.conflict_files }}
+        run: |
+          set -euo pipefail
+          READ='Read,Glob,Grep,Write,Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),Bash(git ls-files:*),Bash(git merge-base:*),Bash(git merge-tree:*),Bash(git rev-list:*),Bash(date:*),Bash(jq:*)'
+          # No generic `uv` or `cargo`: only the sub-commands the skill uses, so the agent cannot run arbitrary code.
+          WRITE='Edit,Bash(git fetch:*),Bash(git checkout:*),Bash(git branch:*),Bash(git merge:*),Bash(git add:*),Bash(git rm:*),Bash(git restore:*),Bash(git commit:*),Bash(git push origin sync/upstream-:*),Bash(sed -i:*),Bash(bash scripts/fork-sync/check-fork-invariants.sh:*),Bash(uv sync:*),Bash(uv lock:*),Bash(uv run ruff:*),Bash(uv run pytest:*),Bash(cargo build:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*)'
+          TOOLS="$READ"
+          if [ "$MODE" = "sync" ]; then TOOLS="$READ,$WRITE"; fi
+
+          cat > "$RUNNER_TEMP/prompt.txt" <<PROMPT
+          Follow the fork-sync skill (.claude/skills/fork-sync/SKILL.md) exactly.
+          MODE=$MODE
+          Pre-check facts: behind=$BEHIND ahead=$AHEAD conflicts=$CONFLICTS conflict_files=$CONFLICT_FILES
+          Write your result file to $FORK_SYNC_RESULT.
+          Never add Co-Authored-By or any attribution line to a commit or a PR description.
+          PROMPT
+
+          claude -p "$(cat "$RUNNER_TEMP/prompt.txt")" \
+            --allowedTools "$TOOLS" \
+            --max-turns 120 \
+            --settings '{"includeCoAuthoredBy":false,"attribution":{"commit":"","pr":""}}' \
+            --output-format stream-json --verbose > "$RUNNER_TEMP/agent.jsonl"
+
+      - name: Read the result
+        if: always() && steps.pre.outputs.needs_sync == 'true'
+        id: result
+        run: |
+          # The result file is written by the agent, whose input includes upstream content (untrusted). Its
+          # values reach later steps as expressions, so only strictly shaped values are passed on.
+          if [ -s "$FORK_SYNC_RESULT" ] && jq -e . "$FORK_SYNC_RESULT" >/dev/null 2>&1; then
+            status=$(jq -r '.status // "failed"' "$FORK_SYNC_RESULT")
+            branch=$(jq -r '.branch // ""' "$FORK_SYNC_RESULT")
+            pr=$(jq -r '.pr_url // ""' "$FORK_SYNC_RESULT")
+            case "$status" in synced|needs-human|failed|dry-run|up-to-date) ;; *) status=failed ;; esac
+            [[ "$branch" =~ ^sync/upstream-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || branch=""
+            [[ "$pr" =~ ^https://github\.com/sctg-development/mistral-vibe/pull/[0-9]+$ ]] || pr=""
+            if [ "$status" = synced ] && [ -z "$branch" ]; then status=failed; fi
+            {
+              echo "status=$status"
+              echo "branch=$branch"
+              echo "pr=$pr"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "The agent wrote no valid result file." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Dry-run must not change anything
+        if: always() && steps.pre.outputs.needs_sync == 'true' && env.MODE == 'dry-run'
+        run: |
+          if [ -n "$(git status --porcelain)" ] || [ -n "$(git branch --list 'sync/upstream-*')" ]; then
+            echo "::error::the dry-run modified the repository"
+            git status --short | head -20
+            exit 1
+          fi
+
+      - name: Guardrails must not be touched by the sync branch
+        if: always() && steps.result.outputs.status == 'synced' && steps.result.outputs.branch != ''
+        run: |
+          changed=$(git diff --name-only "origin/multi...${{ steps.result.outputs.branch }}" -- \
+            .claude/skills/fork-sync .github/workflows/fork-sync.yml scripts/fork-sync || true)
+          if [ -n "$changed" ]; then
+            echo "::error::the sync branch changes the sync agent itself:"; echo "$changed"; exit 1
+          fi
+
+      - name: Independent verification of the sync branch
+        if: always() && steps.result.outputs.status == 'synced' && steps.result.outputs.branch != ''
+        id: verify
+        run: |
+          set -uo pipefail
+          git checkout -q "${{ steps.result.outputs.branch }}"
+          uv sync --all-extras > "$RUNNER_TEMP/sync.log" 2>&1 || true
+          inv=PASS; lint=PASS; tests=PASS; rust=PASS
+          bash scripts/fork-sync/check-fork-invariants.sh > "$RUNNER_TEMP/invariants.log" 2>&1 || inv=FAIL
+          { uv run ruff check . && uv run ruff format --check .; } > "$RUNNER_TEMP/lint.log" 2>&1 || lint=FAIL
+          uv run pytest tests/backend/test_key_pool.py tests/test_key_accounts.py \
+            tests/app_server/test_provider_credentials_pool.py tests/app_server/test_provider_credentials.py \
+            tests/app_server/test_setup_store_credential.py tests/core/config/test_resolve_api_key.py \
+            -q -p no:cacheprovider > "$RUNNER_TEMP/tests.log" 2>&1 || tests=FAIL
+          # CARGO_BUILD_FLAGS is a list of flags: it must split.
+          # shellcheck disable=SC2086
+          cargo check --locked --manifest-path vibe/cli-rust/Cargo.toml --bin vibe-rs $CARGO_BUILD_FLAGS \
+            > "$RUNNER_TEMP/cargo.log" 2>&1 || rust=FAIL
+          wf=$(git diff --name-only "origin/multi...HEAD" -- .github/workflows | sed 's/^/  - /')
+          {
+            echo "### Independent verification (run by the workflow, not by the agent)"
+            echo "- fork invariants: **$inv** ($(tail -1 "$RUNNER_TEMP/invariants.log"))"
+            echo "- ruff check and format: **$lint**"
+            echo "- fork tests (key pool, credentials, sign-in): **$tests** ($(tail -1 "$RUNNER_TEMP/tests.log" | sed 's/=//g'))"
+            echo "- cargo check (vibe-rs, no voice): **$rust**"
+            echo "- not verified: the full test suite, cargo test, the pool against real accounts"
+            if [ -n "$wf" ]; then
+              echo ""; echo "**Workflow files changed by this sync. They run with this repository's secrets: review them.**"; echo "$wf"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY" > "$RUNNER_TEMP/verify.md"
+          if [ -n "${{ steps.result.outputs.pr }}" ]; then
+            GH_TOKEN="${{ github.token }}" gh pr comment "${{ steps.result.outputs.pr }}" --body-file "$RUNNER_TEMP/verify.md" || true
+          fi
+          [ "$inv" = PASS ] && [ "$lint" = PASS ] && [ "$tests" = PASS ] && [ "$rust" = PASS ]
+
+      - name: Fail loudly when a human is needed
+        if: always() && steps.pre.outputs.needs_sync == 'true' && (steps.result.outputs.status == 'needs-human' || steps.result.outputs.status == 'failed')
+        run: |
+          echo "::error::fork-sync status: ${{ steps.result.outputs.status }}"
+          jq -r '.notes // "no notes"' "$FORK_SYNC_RESULT" 2>/dev/null || true
+          exit 1
+
+      - name: Upload the agent transcript
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-sync-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/agent.jsonl
+            ${{ runner.temp }}/fork-sync-result.json
+          retention-days: 7
+          if-no-files-found: ignore
