@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import httpx
+import httpx2
 import pytest
 
 from vibe.core.llm.key_pool import KeyPool, KeyPoolTransport
@@ -23,26 +23,26 @@ class _Clock:
 class _Upstream:
     """Fake API: answers per key from `script`, records the keys it saw."""
 
-    def __init__(self, script: dict[str, list[httpx.Response]]) -> None:
+    def __init__(self, script: dict[str, list[httpx2.Response]]) -> None:
         self.script = script
         self.seen: list[str] = []
 
-    def handler(self, request: httpx.Request) -> httpx.Response:
+    def handler(self, request: httpx2.Request) -> httpx2.Response:
         key = request.headers["authorization"].removeprefix("Bearer ")
         self.seen.append(key)
-        queue = self.script.get(key, [httpx.Response(200, json={"ok": key})])
+        queue = self.script.get(key, [httpx2.Response(200, json={"ok": key})])
         return queue.pop(0) if len(queue) > 1 else queue[0]
 
 
 def _client(
     tmp_path: Path, upstream: _Upstream, clock: _Clock, keys: list[str] = KEYS
-) -> tuple[httpx.AsyncClient, KeyPool]:
+) -> tuple[httpx2.AsyncClient, KeyPool]:
     pool = KeyPool(keys, state_dir=tmp_path, clock=clock)
-    transport = KeyPoolTransport(httpx.MockTransport(upstream.handler), pool)
-    return httpx.AsyncClient(transport=transport), pool
+    transport = KeyPoolTransport(httpx2.MockTransport(upstream.handler), pool)
+    return httpx2.AsyncClient(transport=transport), pool
 
 
-async def _post(client: httpx.AsyncClient, key: str = KEYS[0]) -> httpx.Response:
+async def _post(client: httpx2.AsyncClient, key: str = KEYS[0]) -> httpx2.Response:
     return await client.post(
         URL, json={"model": "m"}, headers={"authorization": f"Bearer {key}"}
     )
@@ -74,7 +74,9 @@ def test_pool_needs_two_distinct_keys() -> None:
 
 @pytest.mark.asyncio
 async def test_rate_limited_account_is_replayed_on_the_next_one(tmp_path: Path) -> None:
-    upstream = _Upstream({"key-a": [httpx.Response(429, headers={"retry-after": "5"})]})
+    upstream = _Upstream({
+        "key-a": [httpx2.Response(429, headers={"retry-after": "5"})]
+    })
     client, _ = _client(tmp_path, upstream, _Clock())
 
     response = await _post(client)
@@ -86,7 +88,7 @@ async def test_rate_limited_account_is_replayed_on_the_next_one(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_failed_account_is_skipped_by_later_requests(tmp_path: Path) -> None:
-    upstream = _Upstream({"key-a": [httpx.Response(429)]})
+    upstream = _Upstream({"key-a": [httpx2.Response(429)]})
     clock = _Clock()
     client, _ = _client(tmp_path, upstream, clock)
 
@@ -100,7 +102,7 @@ async def test_failed_account_is_skipped_by_later_requests(tmp_path: Path) -> No
 @pytest.mark.asyncio
 async def test_cooldown_state_is_shared_between_pools(tmp_path: Path) -> None:
     clock = _Clock()
-    first, _ = _client(tmp_path, _Upstream({"key-a": [httpx.Response(429)]}), clock)
+    first, _ = _client(tmp_path, _Upstream({"key-a": [httpx2.Response(429)]}), clock)
     await _post(first)
 
     upstream = _Upstream({})
@@ -114,14 +116,14 @@ async def test_cooldown_state_is_shared_between_pools(tmp_path: Path) -> None:
 async def test_account_comes_back_after_cooldown(tmp_path: Path) -> None:
     clock = _Clock()
     upstream = _Upstream({
-        "key-a": [httpx.Response(429, headers={"retry-after": "10"})]
+        "key-a": [httpx2.Response(429, headers={"retry-after": "10"})]
     })
     client, _ = _client(tmp_path, upstream, clock, keys=["key-a", "key-b"])
     await _post(client)  # a refused, b answers and becomes the sticky account
 
     clock.now += 11  # a's cooldown is over; b is now the one that refuses
-    upstream.script["key-a"] = [httpx.Response(200, json={"ok": "key-a"})]
-    upstream.script["key-b"] = [httpx.Response(429, headers={"retry-after": "100"})]
+    upstream.script["key-a"] = [httpx2.Response(200, json={"ok": "key-a"})]
+    upstream.script["key-b"] = [httpx2.Response(429, headers={"retry-after": "100"})]
     upstream.seen.clear()
     response = await _post(client)
 
@@ -131,7 +133,7 @@ async def test_account_comes_back_after_cooldown(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_all_accounts_refused_returns_the_last_refusal(tmp_path: Path) -> None:
-    upstream = _Upstream({key: [httpx.Response(429)] for key in KEYS})
+    upstream = _Upstream({key: [httpx2.Response(429)] for key in KEYS})
     client, _ = _client(tmp_path, upstream, _Clock())
 
     response = await _post(client)
@@ -143,7 +145,7 @@ async def test_all_accounts_refused_returns_the_last_refusal(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_revoked_key_is_parked_for_a_long_time(tmp_path: Path) -> None:
     clock = _Clock()
-    upstream = _Upstream({"key-a": [httpx.Response(401)]})
+    upstream = _Upstream({"key-a": [httpx2.Response(401)]})
     client, pool = _client(tmp_path, upstream, clock)
     await _post(client)
 
@@ -159,7 +161,7 @@ async def test_revoked_key_is_parked_for_a_long_time(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_quota_message_skips_escalation(tmp_path: Path) -> None:
     clock = _Clock()
-    quota = httpx.Response(429, json={"message": "Monthly token quota exceeded"})
+    quota = httpx2.Response(429, json={"message": "Monthly token quota exceeded"})
     client, pool = _client(tmp_path, _Upstream({"key-a": [quota]}), clock)
     await _post(client)
 
@@ -169,7 +171,7 @@ async def test_quota_message_skips_escalation(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_server_errors_are_not_failed_over(tmp_path: Path) -> None:
-    upstream = _Upstream({"key-a": [httpx.Response(503)]})
+    upstream = _Upstream({"key-a": [httpx2.Response(503)]})
     client, _ = _client(tmp_path, upstream, _Clock())
 
     response = await _post(client)
@@ -180,7 +182,7 @@ async def test_server_errors_are_not_failed_over(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_foreign_credentials_are_left_alone(tmp_path: Path) -> None:
-    upstream = _Upstream({"other-key": [httpx.Response(429)]})
+    upstream = _Upstream({"other-key": [httpx2.Response(429)]})
     client, _ = _client(tmp_path, upstream, _Clock())
 
     response = await _post(client, key="other-key")
@@ -191,15 +193,15 @@ async def test_foreign_credentials_are_left_alone(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_streamed_refusal_is_replayed_before_any_byte(tmp_path: Path) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         key = request.headers["authorization"].removeprefix("Bearer ")
         if key == "key-a":
-            return httpx.Response(429)
-        return httpx.Response(200, content=b"data: hello\n\n")
+            return httpx2.Response(429)
+        return httpx2.Response(200, content=b"data: hello\n\n")
 
     pool = KeyPool(KEYS, state_dir=tmp_path, clock=_Clock())
-    transport = KeyPoolTransport(httpx.MockTransport(handler), pool)
-    async with httpx.AsyncClient(transport=transport) as client:
+    transport = KeyPoolTransport(httpx2.MockTransport(handler), pool)
+    async with httpx2.AsyncClient(transport=transport) as client:
         async with client.stream(
             "POST",
             URL,
@@ -236,7 +238,7 @@ async def test_usage_is_spread_evenly_over_accounts(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_account_low_on_headroom_is_left_out(tmp_path: Path) -> None:
-    upstream = _Upstream({"key-a": [httpx.Response(200, headers=_limits(4))]})
+    upstream = _Upstream({"key-a": [httpx2.Response(200, headers=_limits(4))]})
     clock = _Clock()
     client, _ = _client(tmp_path, upstream, clock)
 
@@ -274,7 +276,9 @@ def test_window_expiry_makes_the_account_usable_again(tmp_path: Path) -> None:
 async def test_headroom_is_shared_between_pools(tmp_path: Path) -> None:
     clock = _Clock()
     first, _ = _client(
-        tmp_path, _Upstream({"key-a": [httpx.Response(200, headers=_limits(1))]}), clock
+        tmp_path,
+        _Upstream({"key-a": [httpx2.Response(200, headers=_limits(1))]}),
+        clock,
     )
     await _post(first)
 
@@ -302,7 +306,7 @@ def test_concurrent_requests_spread_over_idle_accounts(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_plain_rate_limit_rests_one_window_not_hours(tmp_path: Path) -> None:
     clock = _Clock()
-    upstream = _Upstream({"key-a": [httpx.Response(429)]})
+    upstream = _Upstream({"key-a": [httpx2.Response(429)]})
     client, pool = _client(tmp_path, upstream, clock)
     await _post(client)
 

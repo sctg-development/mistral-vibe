@@ -29,7 +29,7 @@ import tempfile
 import time
 from typing import Any
 
-import httpx
+import httpx2
 
 from vibe.utils.api_keys import pooled_keys
 
@@ -525,13 +525,13 @@ class _StateLock:
                 self._handle = None
 
 
-def _authorization_key(request: httpx.Request) -> str | None:
+def _authorization_key(request: httpx2.Request) -> str | None:
     header = request.headers.get("authorization", "")
     scheme, _, token = header.partition(" ")
     return token.strip() if scheme.lower() == "bearer" and token.strip() else None
 
 
-class KeyPoolTransport(httpx.AsyncBaseTransport):
+class KeyPoolTransport(httpx2.AsyncBaseTransport):
     """Replays refused requests on the next account of a ``KeyPool``.
 
     Only requests that carry one of the pool's keys are touched, so calls to
@@ -540,11 +540,11 @@ class KeyPoolTransport(httpx.AsyncBaseTransport):
     was swapped out never surfaces as a retry notice.
     """
 
-    def __init__(self, inner: httpx.AsyncBaseTransport, pool: KeyPool) -> None:
+    def __init__(self, inner: httpx2.AsyncBaseTransport, pool: KeyPool) -> None:
         self._inner = inner
         self._pool = pool
 
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
         sent_key = _authorization_key(request)
         if (
             sent_key is None
@@ -568,7 +568,7 @@ class KeyPoolTransport(httpx.AsyncBaseTransport):
                 self._pool.end(lease)
             self._pool.report_headroom(lease, response.headers)
             if response.status_code not in _FAILOVER_STATUSES:
-                if response.status_code < httpx.codes.BAD_REQUEST:
+                if response.status_code < httpx2.codes.BAD_REQUEST:
                     self._pool.report_success(lease)
                 return response
             self._pool.report_failure(
@@ -590,16 +590,16 @@ class KeyPoolTransport(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
-def _is_replayable(request: httpx.Request) -> bool:
+def _is_replayable(request: httpx2.Request) -> bool:
     """Whether the body can be sent again (bytes/JSON/multipart, not a generator)."""
     try:
         request.content  # noqa: B018 - raises RequestNotRead for one-shot streams
-    except httpx.RequestNotRead:
+    except httpx2.RequestNotRead:
         return False
     return True
 
 
-async def _read_error_body(response: httpx.Response) -> str:
+async def _read_error_body(response: httpx2.Response) -> str:
     try:
         await response.aread()
         return response.content[:_MAX_BODY_BYTES].decode("utf-8", errors="replace")
