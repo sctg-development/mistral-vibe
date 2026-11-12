@@ -189,9 +189,11 @@ jobs:
           set -uo pipefail
           git checkout -q "${{ steps.result.outputs.branch }}"
           uv sync --all-extras > "$RUNNER_TEMP/sync.log" 2>&1 || true
-          inv=PASS; lint=PASS; tests=PASS; rust=PASS
+          inv=PASS; lint=PASS; tests=PASS; rust=PASS; rtimp=PASS
           bash scripts/fork-sync/check-fork-invariants.sh > "$RUNNER_TEMP/invariants.log" 2>&1 || inv=FAIL
           { uv run ruff check . && uv run ruff format --check .; } > "$RUNNER_TEMP/lint.log" 2>&1 || lint=FAIL
+          # Tests run with dev dependencies; the released app does not have them.
+          uv run python scripts/fork-sync/check-runtime-imports.py > "$RUNNER_TEMP/rtimp.log" 2>&1 || rtimp=FAIL
           uv run pytest tests/backend/test_key_pool.py tests/test_key_accounts.py \
             tests/app_server/test_provider_credentials_pool.py tests/app_server/test_provider_credentials.py \
             tests/app_server/test_setup_store_credential.py tests/core/config/test_resolve_api_key.py \
@@ -205,6 +207,7 @@ jobs:
             echo "### Independent verification (run by the workflow, not by the agent)"
             echo "- fork invariants: **$inv** ($(tail -1 "$RUNNER_TEMP/invariants.log"))"
             echo "- ruff check and format: **$lint**"
+            echo "- no module imports a dev-only package (what the packaged app lacks): **$rtimp** ($(head -1 "$RUNNER_TEMP/rtimp.log"))"
             echo "- fork tests (key pool, credentials, sign-in): **$tests** ($(tail -1 "$RUNNER_TEMP/tests.log" | sed 's/=//g'))"
             echo "- cargo check (vibe-rs, no voice): **$rust**"
             echo "- not verified: the full test suite, cargo test, the pool against real accounts"
@@ -215,7 +218,7 @@ jobs:
           if [ -n "${{ steps.result.outputs.pr }}" ]; then
             GH_TOKEN="${{ github.token }}" gh pr comment "${{ steps.result.outputs.pr }}" --body-file "$RUNNER_TEMP/verify.md" || true
           fi
-          [ "$inv" = PASS ] && [ "$lint" = PASS ] && [ "$tests" = PASS ] && [ "$rust" = PASS ]
+          [ "$inv" = PASS ] && [ "$lint" = PASS ] && [ "$tests" = PASS ] && [ "$rust" = PASS ] && [ "$rtimp" = PASS ]
 
       - name: Fail loudly when a human is needed
         if: always() && steps.pre.outputs.needs_sync == 'true' && (steps.result.outputs.status == 'needs-human' || steps.result.outputs.status == 'failed')
