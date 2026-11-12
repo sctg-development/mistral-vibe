@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Iterable
+import contextlib
+import logging
 
 from mistralai_vibe_local_harness.vibe._connector_models import (
     ConnectorAuthorizationRequiredSignal,
@@ -21,6 +23,12 @@ from mistralai_vibe_local_harness.vibe._connector_models import (
     empty_connector_snapshot,
 )
 from mistralai_vibe_local_harness.vibe._connector_naming import build_connector_snapshot
+from mistralai_vibe_local_harness.vibe._tool_schemas import (
+    ToolsLeftOutSignal,
+    type_is_not_object,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class ConnectorRuntime:
@@ -46,16 +54,38 @@ class ConnectorRuntime:
         self._snapshot = empty_connector_snapshot()
         self._source_overrides: dict[str, str] = {}
         self._suspended_tools: set[tuple[str, str]] = set()
+        self._noticed_left_out: dict[str, tuple[str, ...]] = {}
         self._pending_authorization: dict[
             tuple[str, str], ConnectorAuthorizationRequiredSignal
         ] = {}
         self._accept_snapshot: ConnectorSnapshotAcceptor | None = None
+        self._snapshot_deferred = False
         self._lock = asyncio.Lock()
         self._closed = False
+        self._catalog_loading: asyncio.Event | None = None
+        self._catalog_load_timeout_s = 0.0
 
     @property
     def snapshot(self) -> ConnectorRouteSnapshot:
         return self._snapshot
+
+    @contextlib.asynccontextmanager
+    async def hold_calls(self, *, timeout_s: float) -> AsyncIterator[None]:
+        """Hold calls while the caller loads a new catalog.
+
+        A call made meanwhile waits for the load, at most ``timeout_s``, then
+        runs on whatever routes the load left: the new catalog's, or the old
+        ones if it failed. Calls already past the wait are not held.
+        """
+        loading = asyncio.Event()
+        self._catalog_loading = loading
+        self._catalog_load_timeout_s = timeout_s
+        try:
+            yield
+        finally:
+            if self._catalog_loading is loading:
+                self._catalog_loading = None
+            loading.set()
 
     def bind_snapshot_acceptor(self, acceptor: ConnectorSnapshotAcceptor) -> None:
         self._accept_snapshot = acceptor
@@ -74,21 +104,84 @@ class ConnectorRuntime:
         capability reconfigure. This lets a caller ready the routes while Core is
         mid-turn (which rejects reconfigure) and publish them once Core is idle
         via ``push_snapshot_to_core``.
+
+        Such a reconfigure keeps what the running turn learned: a connector a
+        call found needing authorization stays withdrawn, with its pending
+        signal, as long as the new catalog still has it. A full reconfigure
+        starts afresh.
         """
         async with self._lock:
             self._guard_open()
-            candidate = plan_connector_snapshot(
-                catalog, selection, claimed_groups=self._claimed_groups
+            _validate_configuration(catalog, selection)
+            _warn_dropped_tools(catalog)
+            kept = {} if push_to_core else self._authorization_overrides(catalog)
+            candidate = build_connector_snapshot(
+                catalog,
+                selection,
+                source_overrides=kept,
+                claimed_groups=self._claimed_groups,
             )
             if push_to_core:
                 await self._accept(candidate)
             self._catalog = catalog
             self._selection = selection
-            self._source_overrides.clear()
+            self._source_overrides = dict(kept)
             self._suspended_tools.clear()
-            self._pending_authorization.clear()
+            self._pending_authorization = {
+                key: signal
+                for key, signal in self._pending_authorization.items()
+                if signal.alias in kept
+            }
             self._snapshot = candidate
-            return candidate
+            # Kept overrides withdraw routes Core may still offer.
+            self._snapshot_deferred = bool(kept)
+            left_out = self._newly_left_out(candidate)
+        if self._event_sink is not None:
+            for signal in left_out:
+                emitted = self._event_sink(signal)
+                if isinstance(emitted, Awaitable):
+                    await emitted
+        return candidate
+
+    def _newly_left_out(
+        self, snapshot: ConnectorRouteSnapshot
+    ) -> list[ToolsLeftOutSignal]:
+        """The notices for tools left out of a listing not noticed before.
+
+        Named once per listing, not on every rebuild that keeps it.
+        """
+        listed = {
+            source.alias: source.display_name
+            for source in snapshot.sources
+            if source.status != "disabled"
+        }
+        left_out = {
+            connector.alias: tuple(
+                tool.raw_name
+                for tool in connector.tools
+                if type_is_not_object(tool.input_schema)
+            )
+            for connector in self._catalog.connectors
+            if connector.alias in listed
+        }
+        signals = [
+            ToolsLeftOutSignal(listed[alias], names)
+            for alias, names in left_out.items()
+            if names and names != self._noticed_left_out.get(alias)
+        ]
+        self._noticed_left_out = left_out
+        return signals
+
+    def _authorization_overrides(
+        self, catalog: ResolvedConnectorCatalog
+    ) -> dict[str, str]:
+        """The authorization withdrawals that still apply to ``catalog``."""
+        aliases = {connector.alias for connector in catalog.connectors}
+        return {
+            alias: status
+            for alias, status in self._source_overrides.items()
+            if status == "needs_auth" and alias in aliases
+        }
 
     async def push_snapshot_to_core(self) -> None:
         """Hand the current route snapshot to the capability acceptor.
@@ -99,6 +192,21 @@ class ConnectorRuntime:
         async with self._lock:
             self._guard_open()
             await self._accept(self._snapshot)
+            self._snapshot_deferred = False
+
+    async def publish_deferred_snapshot(self) -> None:
+        """Hand Core the routes a connector call withdrew while Core was running.
+
+        A gateway authorization rejection arrives while its provided-tool Action
+        is still pending, and Core rejects a capability reconfigure until no
+        Action is. The withdrawn routes apply to dispatch at once; call this
+        once Core is idle so the advertised capabilities catch up.
+        """
+        async with self._lock:
+            if self._closed or not self._snapshot_deferred:
+                return
+            await self._accept(self._snapshot)
+            self._snapshot_deferred = False
 
     async def suspend(
         self, *, alias: str, tool_name: str | None
@@ -130,11 +238,18 @@ class ConnectorRuntime:
             self._source_overrides = source_overrides
             self._suspended_tools = suspended_tools
             self._snapshot = candidate
+            self._snapshot_deferred = False
             return candidate
 
     async def execute(
         self, *, group_name: str, tool_name: str, arguments: JsonObject
     ) -> ConnectorNormalizedResult:
+        loading = self._catalog_loading
+        if loading is not None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    loading.wait(), timeout=self._catalog_load_timeout_s
+                )
         async with self._lock:
             self._guard_open()
             snapshot = self._snapshot
@@ -211,9 +326,12 @@ class ConnectorRuntime:
                 suspended_tools=self._suspended_tools,
                 claimed_groups=self._claimed_groups,
             )
-            await self._accept(candidate)
+            # Core is running the call's Action and rejects a capability
+            # reconfigure, so only dispatch drops the routes here;
+            # ``publish_deferred_snapshot`` hands them to Core once it is idle.
             self._source_overrides = source_overrides
             self._snapshot = candidate
+            self._snapshot_deferred = True
             self._pending_authorization[(group_name, tool_name)] = (
                 ConnectorAuthorizationRequiredSignal(
                     raw_connector_id=connector.raw_id,
@@ -247,6 +365,9 @@ class ConnectorRuntime:
             )
 
     async def _accept(self, snapshot: ConnectorRouteSnapshot) -> None:
+        # Callers store ``snapshot`` right after this returns, with no await in
+        # between: an MCP update queued on the Runtime lock reads it as soon as
+        # the lock is released, and would otherwise put back the previous one.
         if self._accept_snapshot is not None:
             # The acceptor owns DurableSessionRuntime's distinct lock, and its
             # capability transition is required to be action-free.
@@ -261,7 +382,20 @@ def plan_connector_snapshot(
 ) -> ConnectorRouteSnapshot:
     """Build a validated candidate without making it the session's accepted snapshot."""
     _validate_configuration(catalog, selection)
+    _warn_dropped_tools(catalog)
     return build_connector_snapshot(catalog, selection, claimed_groups=claimed_groups)
+
+
+def _warn_dropped_tools(catalog: ResolvedConnectorCatalog) -> None:
+    """Name each listed tool the snapshot leaves out for its schema."""
+    for connector in catalog.connectors:
+        for tool in connector.tools:
+            if type_is_not_object(tool.input_schema):
+                logger.warning(
+                    'Connector %r, tool %r: input schema type is not "object"; tool unavailable',
+                    connector.alias,
+                    tool.raw_name,
+                )
 
 
 def _validate_configuration(

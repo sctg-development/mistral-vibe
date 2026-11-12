@@ -10,12 +10,13 @@ pub mod event;
 pub mod leanstall;
 pub mod provider_auth;
 pub mod retry;
-pub mod retry_continuation;
 pub mod retry_prompt;
 pub mod shell;
 pub mod simple;
 pub mod stress;
 pub mod submission;
 
-pub use commands::{argument_hint, builtin, entries, has_command, is_side_channel, parse};
-pub use event::CommandEvent;
+pub use commands::{
+    argument_hint, builtin, entries, has_command, is_side_channel, parse, waits_for_jobs, Feature,
+};
+pub use event::{spawn_session, CommandEvent};

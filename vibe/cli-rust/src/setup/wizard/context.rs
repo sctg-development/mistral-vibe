@@ -35,8 +35,16 @@ pub struct OnboardingContext {
     /// The server's own browser-sign-in answer (`SetupStatus`), not a
     /// client-side guess: it also weighs the provider's backend.
     pub supports_browser_sign_in: bool,
+    pub oidc_enabled: bool,
     /// The server-resolved TLS trust flag (ADR 0015).
     pub enable_system_trust_store: bool,
+    /// The administrator-pinned console URL (`VIBE_CUSTOM_CONSOLE_URL`), when
+    /// the server resolved one: sign-in locks to it and the domain cannot be
+    /// modified.
+    pub pinned_console_url: Option<String>,
+    /// The provider's key env var when the shell sets it: it overrides any
+    /// key setup saves, so the sign-in target screen warns.
+    pub shell_key_override: Option<String>,
 }
 
 impl Default for OnboardingContext {
@@ -47,12 +55,20 @@ impl Default for OnboardingContext {
             console_base_url: DEFAULT_CONSOLE_BASE_URL.into(),
             theme: "auto".into(),
             supports_browser_sign_in: true,
+            oidc_enabled: false,
             enable_system_trust_store: false,
+            pinned_console_url: None,
+            shell_key_override: None,
         }
     }
 }
 
 impl OnboardingContext {
+    /// OIDC follows the explicit Mistral AI target, independently of inference.
+    pub fn uses_oidc(&self, default_target: bool) -> bool {
+        self.oidc_enabled && default_target && self.pinned_console_url.is_none()
+    }
+
     /// Seed from the server's resolved view (`setup/status`); the server
     /// already applied the config layering, so the only client-side
     /// override left is `VIBE_THEME`, applied over the injected schema too
@@ -68,9 +84,21 @@ impl OnboardingContext {
             console_base_url: status.console_base_url.clone(),
             theme,
             supports_browser_sign_in: status.supports_browser_sign_in,
+            oidc_enabled: status.oidc_enabled,
             enable_system_trust_store: status.enable_system_trust_store,
+            pinned_console_url: status.pinned_console_url.clone(),
+            shell_key_override: shell_override_env_var(
+                status.active_credential_source.as_deref(),
+                &status.provider,
+            ),
         }
     }
+}
+
+/// The provider's key env var when the shell sets it: `process_env` means
+/// the shell key shadows any key the wizard saves for that provider.
+pub fn shell_override_env_var(source: Option<&str>, provider: &ProviderView) -> Option<String> {
+    (source == Some("process_env")).then(|| provider.api_key_env_var.clone())
 }
 
 /// Whether the wizard still holds the launch snapshot: provider, console,
@@ -186,6 +214,16 @@ pub fn configured_custom_api_base(provider: &ProviderView) -> Option<String> {
         return None;
     }
     Some(api.to_owned())
+}
+
+/// The configured split-horizon API base belonging to the admin-pinned
+/// console: the pin fixes the browser sign-in host and must not clobber an
+/// API base configured for the same deployment. Only returned when the
+/// configured browser base normalizes to the pin.
+pub fn pinned_console_api_base(provider: &ProviderView, pin: &str) -> Option<String> {
+    let browser_base = provider.browser_auth_base_url.as_deref()?;
+    let api_base = provider.browser_auth_api_base_url.as_deref()?;
+    (normalize_origin(browser_base) == pin).then(|| api_base.to_owned())
 }
 
 /// (scheme, host, normalized port) — the origin identity two URLs share or not.

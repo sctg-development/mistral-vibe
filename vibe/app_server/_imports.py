@@ -14,7 +14,7 @@ from vibe.app_server._import_jobs import (
     ImportJobSnapshot,
 )
 from vibe.app_server._model import ProtocolModel
-from vibe.app_server._vibe_projects import VibeProjectService
+from vibe.app_server._vibe_projects import LocalProjectStoreFactory, VibeProjectService
 from vibe.app_server.models import ImportHarness, ImportHarnessDiscovery
 from vibe.app_server.protocol import (
     ImportDiscoveryResponse,
@@ -49,6 +49,7 @@ IMPORTS_UPDATED = "imports/updated"
 
 def build_local_imports_service(
     session_writer_factory: Callable[[], Awaitable[ImportedSessionWriter]],
+    local_projects: LocalProjectStoreFactory,
 ) -> ImportsService:
     """Builds imports from harnesses installed on this machine."""
     claude_home = ClaudeHome.for_current_user()
@@ -56,7 +57,7 @@ def build_local_imports_service(
         ImportHarness.CLAUDE: ClaudeImportService(
             ClaudeProjectSource(claude_home.configuration_path),
             ClaudeSessionSource(claude_home.projects_path),
-            VibeProjectService(),
+            VibeProjectService(local_projects=local_projects),
             session_writer_factory,
         )
     })

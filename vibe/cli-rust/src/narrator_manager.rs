@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc::Sender;
 use tokio::task::AbortHandle;
 
 use crate::app::App;
@@ -33,12 +32,12 @@ pub struct ReadAloudTracking {
 impl ReadAloudTracking {
     pub fn reset(&mut self) {
         self.session_id = uuid::Uuid::new_v4().to_string();
-        self.requested_at = Some(Instant::now());
+        self.requested_at = Some(crate::clock::real_now());
         self.play_started_at = None;
     }
 
     pub fn mark_play_started(&mut self) {
-        self.play_started_at = Some(Instant::now());
+        self.play_started_at = Some(crate::clock::real_now());
     }
 
     pub fn time_to_first_read_s(&self) -> f64 {
@@ -49,8 +48,11 @@ impl ReadAloudTracking {
     }
 
     pub fn elapsed_since_play_s(&self) -> f64 {
-        self.play_started_at
-            .map_or(0.0, |started| started.elapsed().as_secs_f64())
+        self.play_started_at.map_or(0.0, |started| {
+            crate::clock::real_now()
+                .duration_since(started)
+                .as_secs_f64()
+        })
     }
 }
 
@@ -92,7 +94,7 @@ pub fn speak(app: &mut App, text: String) {
     stop(app);
     let (Some(cfg), Some(tx), Some(session_id)) = (
         app.narrator.speech_config.clone(),
-        app.narrator.tx.clone(),
+        app.events.clone(),
         app.session.session_id.clone(),
     ) else {
         app.narrator.state = NarratorState::Idle;
@@ -102,8 +104,19 @@ pub fn speak(app: &mut App, text: String) {
     let id = app.narrator.speech_id;
     let stop = Arc::new(AtomicBool::new(false));
     let task_stop = stop.clone();
-    let task = tokio::spawn(async move {
-        let event = match speak_summary(&cfg, &session_id, &text, task_stop, &tx, id).await {
+    let credential_client = app.credential_client.clone();
+    let task = crate::work::spawn_daemon(async move {
+        let event = match speak_summary(
+            &cfg,
+            credential_client.as_deref(),
+            &session_id,
+            &text,
+            task_stop,
+            &tx,
+            id,
+        )
+        .await
+        {
             Ok(()) => Event::Finished { id },
             Err(error) => {
                 tracing::warn!(error = %error.message, "TTS speak failed");
@@ -113,7 +126,7 @@ pub fn speak(app: &mut App, text: String) {
                 }
             }
         };
-        let _ = tx.send(event).await;
+        let _ = tx.send(event.into()).await;
     });
     app.narrator.speech = Some(Speech {
         id,
@@ -125,24 +138,32 @@ pub fn speak(app: &mut App, text: String) {
 /// Synthesize and play the summary, checking the device before paying for the TTS request.
 async fn speak_summary(
     cfg: &SpeechConfig,
+    credential_client: Option<&crate::server::Client>,
     session_id: &str,
     text: &str,
     stop: Arc<AtomicBool>,
-    tx: &Sender<Event>,
+    tx: &crate::ui_event::Sender,
     id: u64,
 ) -> Result<(), AudioError> {
     let env_var = cfg.api_key_env_var.clone();
-    let (available, api_key) = tokio::task::spawn_blocking(move || {
+    let (available, api_key) = crate::work::spawn_blocking(move || {
         (audio_player::check_available(), resolve_api_key(&env_var))
     })
     .await
     .map_err(|e| AudioError::backend(e.to_string()))?;
     available?;
     let metadata = tts::audio_request_metadata(session_id);
-    let audio = tts::speak(cfg, &api_key.unwrap_or_default(), text, metadata).await?;
+    let audio = tts::speak(
+        cfg,
+        credential_client,
+        &api_key.unwrap_or_default(),
+        text,
+        metadata,
+    )
+    .await?;
     let pcm = wav::decode_wav(&audio).map_err(AudioError::decode)?;
     let done = audio_player::play(pcm, stop).await?;
-    let _ = tx.send(Event::Speaking { id }).await;
+    let _ = tx.send(Event::Speaking { id }.into()).await;
     done.await.unwrap_or(Ok(()))
 }
 

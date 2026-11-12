@@ -16,13 +16,13 @@ mod subagents;
 mod turn;
 mod usage;
 
-use crate::cli::HeadlessOptions;
+use crate::cli::{HeadlessOptions, OutputFormat};
 use crate::headless_run::HeadlessRun;
 use crate::headless_startup::print_keyring_preflight;
 use crate::run_export::RunOutcome;
 use crate::server::{signal, Connect, Launch};
 
-pub use config::{agent_config, build_disabled_tools, turn_id_from};
+pub use config::{agent_config, build_disabled_tools, start_params, turn_id_from};
 pub use drive::{drive, stopped_report, turn_error_outcome};
 pub use open::open_failure;
 pub use report::final_outcome;
@@ -60,7 +60,7 @@ pub async fn run(
     };
     {
         let stop = stop.clone();
-        tokio::spawn(async move {
+        crate::work::spawn_daemon(async move {
             loop {
                 shutdown.wait().await;
                 stop.request(RunOutcome::Terminated);
@@ -77,6 +77,9 @@ pub async fn run(
         eprintln!("Error: {}", error.message);
     } else if report.result.outcome != RunOutcome::Finished {
         eprintln!("Stopped: {}", report.result.outcome);
+    } else if options.output == OutputFormat::Text && report.final_response.is_none() {
+        // Empty stdout must not read as a crash.
+        eprintln!("The agent finished without an answer.");
     }
     headless.finish(report).into()
 }

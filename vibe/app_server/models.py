@@ -28,6 +28,7 @@ from vibe.app_server._effect_models import (
     FileWriteEffectInput as FileWriteEffectInput,
     FileWriteEffectOutput as FileWriteEffectOutput,
     GenericEffectDetail as GenericEffectDetail,
+    McpAppReference as McpAppReference,
     ProcessEffectDetail as ProcessEffectDetail,
     ScratchpadEffectDetail as ScratchpadEffectDetail,
     ScratchpadEffectInput as ScratchpadEffectInput,
@@ -116,14 +117,22 @@ class AccountApiKeyView(ProtocolModel):
     access_scope: str | None = None
 
 
+class AccountBudgetView(ProtocolModel):
+    """The monthly Vibe Code allowance, from ``/v1/billing/budget``."""
+
+    usage_percentage: float
+    reset_at: str | None = None
+    # Usage past 100% is billed instead of paused.
+    payg_enabled: bool = False
+
+
 class AccountView(ProtocolModel):
     status: AccountStatus
     plan: AccountPlanView | None = None
     plan_offer: AccountAction | None = None
     rate_limit_action: AccountAction | None = None
-    teleport_eligible: bool = False
-    teleport_action: AccountAction | None = None
     api_key: AccountApiKeyView | None = None
+    budget: AccountBudgetView | None = None
 
 
 class IdentityEntityView(ProtocolModel):
@@ -422,6 +431,8 @@ class TurnErrorCode(StrEnum):
     INVALID_MODEL = auto()
     INVALID_API_KEY = auto()
     INTERNAL_ERROR = auto()
+    # A price budget is set, but a model the run uses has no price.
+    PRICING_UNAVAILABLE = auto()
 
 
 class PublicError(ProtocolModel):
@@ -511,112 +522,6 @@ class DebugLogPage(ProtocolModel):
     cursor: int | None = None
 
 
-class VibeCodeRepository(ProtocolModel):
-    repo_url: str
-    default_branch: str | None = None
-
-
-class VibeCodeProject(ProtocolModel):
-    project_id: str
-    name: str
-    repositories: list[VibeCodeRepository] = Field(default_factory=list)
-    is_read_only: bool = False
-
-
-class RemoteProjectLink(ProtocolModel):
-    repo_root: str
-    repo_url: str
-    project_id: str
-    project_name: str
-
-
-class VibeCodePickerContext(ProtocolModel):
-    repo_root: str
-    repo_url: str
-    repo_name: str
-    saved_link: RemoteProjectLink | None = None
-
-
-class VibeCodeGitInfo(ProtocolModel):
-    remote_name: str
-    remote_url: str
-    repo: str
-    branch: str | None = None
-    default_branch: str | None = None
-
-
-class VibeCodePickerState(ProtocolModel):
-    projects: list[VibeCodeProject]
-    next_cursor: str | None = None
-    repo_url: str = ""
-
-    @property
-    def has_more(self) -> bool:
-        return self.next_cursor is not None
-
-
-class VibeCodePickerView(ProtocolModel):
-    context: VibeCodePickerContext
-    state: VibeCodePickerState
-    git: VibeCodeGitInfo
-    saved_project_link_cleared: bool = False
-    project_repo_remote_changed: bool = False
-
-
-type VibeCodePickerPurpose = Literal["configure", "teleport"]
-
-
-class TeleportSummarizingContext(ProtocolModel):
-    kind: Literal["summarizing_context"] = "summarizing_context"
-    operation_id: str
-
-
-class TeleportCheckingGit(ProtocolModel):
-    kind: Literal["checking_git"] = "checking_git"
-    operation_id: str
-
-
-class TeleportPushRequired(ProtocolModel):
-    kind: Literal["push_required"] = "push_required"
-    operation_id: str
-    unpushed_count: int
-    branch_not_pushed: bool = False
-
-
-class TeleportPushing(ProtocolModel):
-    kind: Literal["pushing"] = "pushing"
-    operation_id: str
-
-
-class TeleportStartingWorkflow(ProtocolModel):
-    kind: Literal["starting_workflow"] = "starting_workflow"
-    operation_id: str
-
-
-class TeleportComplete(ProtocolModel):
-    kind: Literal["complete"] = "complete"
-    operation_id: str
-    url: str
-
-
-class TeleportFailed(ProtocolModel):
-    kind: Literal["failed"] = "failed"
-    operation_id: str
-    error: PublicError
-
-
-type TeleportEvent = Annotated[
-    TeleportSummarizingContext
-    | TeleportCheckingGit
-    | TeleportPushRequired
-    | TeleportPushing
-    | TeleportStartingWorkflow
-    | TeleportComplete
-    | TeleportFailed,
-    Field(discriminator="kind"),
-]
-
-
 class AgentSummary(ProtocolModel):
     name: str
     display_name: str
@@ -641,6 +546,7 @@ class SkillSummary(ProtocolModel):
     registry: RegistryRefView | None = None
     enabled: bool = True
     locked: bool = False
+    active: bool = True
 
 
 class SkillCatalogEntry(ProtocolModel):
@@ -680,7 +586,6 @@ class SkillDetailView(ProtocolModel):
 
 class ToolSummary(ProtocolModel):
     name: str
-    is_custom: bool = False
 
 
 # The closed set the App Server contract declares. Vibe never emits "unknown";
@@ -1039,6 +944,7 @@ class HookScope(StrEnum):
     POST_AGENT = auto()
     PRE_TOOL = auto()
     POST_TOOL = auto()
+    PRE_AGENT = auto()
 
 
 class HookSeverity(StrEnum):
@@ -1190,10 +1096,20 @@ class PublicSessionWorktree(ProtocolModel):
     created: bool
 
 
+class PublicSessionProject(ProtocolModel):
+    """The project stamp in a session's metadata; ``id`` is None for ``none``."""
+
+    kind: Literal["local", "cloud", "none"]
+    id: str | None = None
+
+
 class PublicSession(ProtocolModel):
     id: str
     root_session_id: str | None = None
     parent_session_id: str | None = None
+    started_by_session_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     title: str | None = None
     preview: str = ""
     status: PublicSessionStatus
@@ -1218,6 +1134,9 @@ class PublicSession(ProtocolModel):
     # Scheduled loops persisted for this session. The additive default keeps
     # old clients and old servers working (ADR 0014).
     loops: list[ScheduledLoop] = Field(default_factory=list)
+    # None while unstamped. With local projects on, a listing stamps an unstamped
+    # session whose folder is a local project's.
+    project: PublicSessionProject | None = None
 
     @model_validator(mode="after")
     def _default_bumped_at(self) -> Self:
@@ -1267,6 +1186,9 @@ class PublicTurnQueue(ProtocolModel):
     )
 
 
+BudgetStopReason = Literal["token_limit", "price_limit"]
+
+
 class PublicTurn(ProtocolModel):
     id: str
     session_id: str
@@ -1276,6 +1198,11 @@ class PublicTurn(ProtocolModel):
     completed_at: int | None = None
     error: PublicError | None = None
     stop_reason: PublicTurnStopReason | None = None
+    # Set only on an ``interrupted`` turn that a cumulative completion budget
+    # stopped before its next completion; any other interruption leaves it out.
+    budget_stop_reason: BudgetStopReason | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     queue_item_id: str | None = None
 
 

@@ -5,14 +5,28 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Final, Literal
 
-import httpx
-from mcp.client.auth import OAuthClientProvider
+import httpx2
+from mcp.client.auth import OAuthClientProvider, OAuthFlowError
 from mcp.client.auth.oauth2 import OAuthContext
+from mcp.client.auth.utils import (
+    build_oauth_authorization_server_metadata_discovery_urls,
+    build_protected_resource_metadata_discovery_urls,
+    create_oauth_metadata_request,
+    credentials_match_issuer,
+    handle_auth_metadata_response,
+    handle_protected_resource_response,
+    issuers_match,
+    validate_metadata_issuer,
+)
 
 from vibe.core.auth.mcp_oauth import MCPOAuthInvalidGrant, MCPOAuthTransientRefreshError
 
 if TYPE_CHECKING:
-    from mcp.shared.auth import OAuthClientMetadata
+    from mcp.shared.auth import (
+        AuthorizationCodeResult,
+        OAuthClientMetadata,
+        ProtectedResourceMetadata,
+    )
 
     from vibe.core.auth.mcp_oauth import KeyringTokenStorage
 
@@ -20,13 +34,13 @@ if TYPE_CHECKING:
 _OAUTH_INVALID_GRANT: Final = "invalid_grant"
 
 
-async def _classify_refresh_error(response: httpx.Response) -> tuple[str, bool]:
+async def _classify_refresh_error(response: httpx2.Response) -> tuple[str, bool]:
     """Return a reason and whether the refresh failed permanently (invalid_grant)."""
     try:
-        # body arrives unread in the httpx auth flow
+        # body arrives unread in the httpx2 auth flow
         await response.aread()
         payload = response.json()
-    except (ValueError, httpx.HTTPError):
+    except (ValueError, httpx2.HTTPError):
         return f"HTTP {response.status_code}", False
     if not isinstance(payload, dict):
         return f"HTTP {response.status_code}", False
@@ -36,6 +50,11 @@ async def _classify_refresh_error(response: httpx.Response) -> tuple[str, bool]:
         f"HTTP {response.status_code}"
     )
     return reason, error == _OAUTH_INVALID_GRANT
+
+
+async def _fetch_metadata(client: httpx2.AsyncClient, url: str) -> httpx2.Response:
+    # Unauthenticated: the client's OAuth auth would refresh before sending it.
+    return await client.send(create_oauth_metadata_request(url), auth=None)
 
 
 class _ServerIssuedSecretContext(OAuthContext):
@@ -92,7 +111,8 @@ class RefreshAwareOAuthClientProvider(OAuthClientProvider):
         *,
         server_alias: str,
         redirect_handler: Callable[[str], Awaitable[None]] | None = None,
-        callback_handler: Callable[[], Awaitable[tuple[str, str | None]]] | None = None,
+        callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]]
+        | None = None,
         client_metadata_url: str | None = None,
     ) -> None:
         super().__init__(
@@ -120,30 +140,65 @@ class RefreshAwareOAuthClientProvider(OAuthClientProvider):
         await super()._initialize()
         self.context.token_expiry_time = self._storage.token_expiry_time
 
-    async def _handle_refresh_response(self, response: httpx.Response) -> bool:
-        """Two corrections over the base class implementation:
-        1. Only clear stored tokens on a genuine invalid_grant error.
-        2. Preserve the previous refresh_token if the server did not return one.
-        """
-        if response.status_code == httpx.codes.OK:
-            previous_refresh_token = (
-                self.context.current_tokens.refresh_token
-                if self.context.current_tokens
-                else None
-            )
-            refreshed = await super()._handle_refresh_response(response)
-            tokens = self.context.current_tokens
-            if (
-                not refreshed
-                or tokens is None
-                or tokens.refresh_token is not None
-                or previous_refresh_token is None
+    async def discover_authorization_server(self, client: httpx2.AsyncClient) -> None:
+        """Discover the token endpoint the SDK skips when it refreshes a stored token."""
+        # Without it the SDK refreshes at `<MCP host>/token`, wrong wherever the
+        # authorization server lives elsewhere. Same rules as login's discovery.
+        try:
+            protected_resource = await self._discover_protected_resource(client)
+            auth_server_url = None
+            if protected_resource is not None:
+                await self._validate_resource_match(protected_resource)
+                auth_server_url = self._select_authorization_server([
+                    str(url) for url in protected_resource.authorization_servers
+                ])
+            self.context.auth_server_url = auth_server_url
+            expected_issuer = self._expected_issuer()
+            client_info = await self._storage.get_client_info()
+            if client_info is not None and not credentials_match_issuer(
+                client_info, expected_issuer, self.context.client_metadata_url
             ):
-                return refreshed
-            tokens = tokens.model_copy(update={"refresh_token": previous_refresh_token})
-            self.context.current_tokens = tokens
-            await self.context.storage.set_tokens(tokens)
-            return True
+                raise OAuthFlowError(
+                    "The MCP server moved to another authorization server"
+                )
+            for url in build_oauth_authorization_server_metadata_discovery_urls(
+                auth_server_url, self.context.server_url
+            ):
+                ok, metadata = await handle_auth_metadata_response(
+                    await _fetch_metadata(client, url)
+                )
+                if not ok:
+                    return
+                if metadata is None:
+                    continue
+                if auth_server_url is None and issuers_match(
+                    str(metadata.issuer), expected_issuer
+                ):
+                    expected_issuer = str(metadata.issuer)
+                validate_metadata_issuer(metadata, expected_issuer)
+                self.context.protected_resource_metadata = protected_resource
+                self.context.oauth_metadata = metadata
+                return
+        except httpx2.HTTPError:
+            return
+
+    async def _discover_protected_resource(
+        self, client: httpx2.AsyncClient
+    ) -> ProtectedResourceMetadata | None:
+        for url in build_protected_resource_metadata_discovery_urls(
+            None, self.context.server_url
+        ):
+            found = await handle_protected_resource_response(
+                await _fetch_metadata(client, url)
+            )
+            if found is not None:
+                return found
+        return None
+
+    async def _handle_refresh_response(self, response: httpx2.Response) -> bool:
+        """Only clear stored tokens on a genuine invalid_grant error."""
+        if response.status_code == httpx2.codes.OK:
+            return await super()._handle_refresh_response(response)
         reason, is_invalid_grant = await _classify_refresh_error(response)
         if is_invalid_grant:
             self.context.clear_tokens()

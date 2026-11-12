@@ -9,11 +9,8 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
-capture_steps = {1, 2, 3, 5}
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-settle_per_key = True
 screen_contains = ("Cache refresh confirmed after streaming update.",)
 
 _PROMPT = "compare keybindings"
@@ -53,8 +50,12 @@ timeline: Timeline = [
     ),
     turn_completed(),
     {"release": 4},
+    take_snapshot(),
     _SHIFT_UP * 30,
+    take_snapshot(),
     _SHIFT_DOWN * 15,
+    take_snapshot(),
     _SHIFT_DOWN * 15,
     {"release": 2},
+    take_snapshot(),
 ]

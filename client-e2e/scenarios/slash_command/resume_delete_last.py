@@ -23,7 +23,6 @@ handshake = {
         ],
         "nextCursor": None,
         "previousCursor": None,
-        "continueSessionId": None,
     }
 }
 
@@ -32,10 +31,7 @@ request_methods = {"session/delete"}
 # The current session is not listed, so the picker opens on the saved one.
 timeline: Timeline = ["/resume", "\r", "d", "d"]
 
-capture_startup = False
-capture_steps = {1, 3}
-settle_per_key = True
 screen_contains = (
-    "Deleted session 00000000",
+    "Deleted session 00000003",
     "No saved sessions left for this directory.",
 )

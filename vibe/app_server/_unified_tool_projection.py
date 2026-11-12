@@ -27,9 +27,8 @@ from vibe.app_server.models import (
     EffectCallDisplay,
     EffectDetail,
     EffectResultDisplay,
-    FileEditEffectBatchInput,
-    FileEditEffectChange,
     FileEditEffectDetail,
+    FileEditEffectInput,
     FileEditEffectOccurrence,
     FileEditEffectOutput,
     FileReadEffectDetail,
@@ -121,37 +120,33 @@ class _WriteResult(_SourceModel):
     file_existed: bool
 
 
-class _SearchReplaceChange(_SourceModel):
-    old_str: str = Field(min_length=1)
-    new_str: str
+class _EditArguments(_SourceModel):
+    file_path: str = Field(min_length=1)
+    old_string: str = Field(min_length=1)
+    new_string: str
     replace_all: bool = False
 
     @model_validator(mode="after")
     def validate_change(self) -> Self:
-        if self.old_str == self.new_str:
-            raise ValueError("old_str and new_str must differ")
+        if self.old_string == self.new_string:
+            raise ValueError("old_string and new_string must differ")
         return self
 
 
-class _SearchReplaceArguments(_SourceModel):
-    file_path: str = Field(min_length=1)
-    content: list[_SearchReplaceChange] = Field(min_length=1)
-
-
-class _SearchReplaceResult(_SourceModel):
+class _EditResult(_SourceModel):
     file: str = Field(min_length=1)
     warnings: list[str] = Field(default_factory=list)
 
 
-class _SearchReplacePreview(_SourceModel):
+class _EditPreview(_SourceModel):
     old_start_line: int = Field(ge=1)
     new_start_line: int | None = None
     old_lines: list[str]
     new_lines: list[str]
 
 
-class _SearchReplaceAnnotations(_SourceModel):
-    blocks: list[_SearchReplacePreview] = Field(min_length=1)
+class _EditAnnotations(_SourceModel):
+    blocks: list[_EditPreview] = Field(min_length=1)
     previous_content: str | None = None
 
 
@@ -270,6 +265,7 @@ class _CronResult(_SourceModel):
 class _ToolResultEnvelope(_SourceModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
+    content: list[dict[str, JsonValue]] = Field(default_factory=list)
     structured_content: dict[str, JsonValue]
     meta: dict[str, JsonValue] | None = Field(default=None, alias="_meta")
 
@@ -549,14 +545,16 @@ def _project_read(
             requested_limit=arguments.limit,
             was_truncated=result.was_truncated,
         )
-        word = "line" if result.lines_read == 1 else "lines"
+        path = _display_path(result.path, display_roots)
+        if any(block.get("type") == "image" for block in envelope.content):
+            message = f"the image {path}"
+        else:
+            word = "line" if result.lines_read == 1 else "lines"
+            message = f"{result.lines_read} {word} from {path}"
         display = EffectResultDisplay(
             success=True,
             verb="Read",
-            message=(
-                f"{result.lines_read} {word} from "
-                f"{_display_path(result.path, display_roots)}"
-            ),
+            message=message,
             suffix="(truncated)" if result.was_truncated else "",
         )
         return _completed_state(state, output, display)
@@ -582,11 +580,12 @@ def _project_write(
     def project_result(state: CompletedEffectState) -> CompletedEffectState:
         envelope = _ToolResultEnvelope.model_validate(state.output)
         result = _WriteResult.model_validate(envelope.structured_content)
+        previous_content = _replaced_content(envelope)
         output = FileWriteEffectOutput(
             file_path=result.path,
-            content=arguments.content,
+            content=_written_content(arguments.content, previous_content),
             file_existed=result.file_existed,
-            previous_content=_replaced_content(envelope),
+            previous_content=previous_content,
         )
         display = EffectResultDisplay(
             success=True,
@@ -598,22 +597,39 @@ def _project_write(
     return _ProjectedCall(detail=semantic, project_result=project_result)
 
 
-def _project_search_replace(
+def _written_content(content: str, previous_content: str | None) -> str:
+    """The text a write put on disk, so a diff against the replaced text is exact.
+
+    A write reads ``\\n``, ``\\r\\n`` and ``\\r`` as line breaks and keeps the
+    dominant line ending of the file it replaces. A new file's line ending
+    depends on where the Runtime runs, so its content stands as given.
+    """
+    if not previous_content:
+        return content
+    crlf = previous_content.count("\r\n")
+    counts = {
+        "\r\n": crlf,
+        "\n": previous_content.count("\n") - crlf,
+        "\r": previous_content.count("\r") - crlf,
+    }
+    newline = max(counts, key=counts.__getitem__)
+    if counts[newline] == 0:
+        return content
+    lf_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    return lf_content if newline == "\n" else lf_content.replace("\n", newline)
+
+
+def _project_edit(
     detail: GenericEffectDetail, display_roots: Sequence[Path]
 ) -> _ProjectedCall:
-    arguments = _SearchReplaceArguments.model_validate(detail.input)
+    arguments = _EditArguments.model_validate(detail.input)
     semantic = FileEditEffectDetail(
         tool_name=detail.tool_name,
-        input=FileEditEffectBatchInput(
+        input=FileEditEffectInput(
             file_path=arguments.file_path,
-            changes=[
-                FileEditEffectChange(
-                    old_string=change.old_str,
-                    new_string=change.new_str,
-                    replace_all=change.replace_all,
-                )
-                for change in arguments.content
-            ],
+            old_string=arguments.old_string,
+            new_string=arguments.new_string,
+            replace_all=arguments.replace_all,
         ),
         display=_file_display(
             "Editing", "Edited", _display_path(arguments.file_path, display_roots)
@@ -622,8 +638,8 @@ def _project_search_replace(
 
     def project_result(state: CompletedEffectState) -> CompletedEffectState:
         envelope = _ToolResultEnvelope.model_validate(state.output)
-        result = _SearchReplaceResult.model_validate(envelope.structured_content)
-        annotations = _search_replace_annotations(envelope)
+        result = _EditResult.model_validate(envelope.structured_content)
+        annotations = _edit_annotations(envelope)
         output = FileEditEffectOutput(
             file=result.file,
             occurrences=[
@@ -1522,7 +1538,8 @@ def _cron_schedule(interval_seconds: int | None, cron: str | None) -> str:
 
 
 def _cron_prompt_summary(prompt: str) -> str:
-    return " ".join(prompt.split())[:100]
+    # The prompt's first line is the loop's title.
+    return " ".join(prompt.strip().split("\n", 1)[0].split())[:100]
 
 
 def _cron_result_text(result: _CronResult, *, action: str) -> str:
@@ -1696,12 +1713,10 @@ def _replaced_content(envelope: _ToolResultEnvelope) -> str | None:
     return _WriteFileAnnotations.model_validate(annotation).previous_content
 
 
-def _search_replace_annotations(
-    envelope: _ToolResultEnvelope,
-) -> _SearchReplaceAnnotations:
+def _edit_annotations(envelope: _ToolResultEnvelope) -> _EditAnnotations:
     if envelope.meta is None:
-        raise ValueError("search_replace result has no annotations")
-    return _SearchReplaceAnnotations.model_validate(
+        raise ValueError("edit result has no annotations")
+    return _EditAnnotations.model_validate(
         envelope.meta.get(_SEARCH_REPLACE_ANNOTATION_KEY)
     )
 
@@ -1814,7 +1829,9 @@ _TOOL_LABELS: dict[str, _ToolLabel] = {
     # ── Built-in harness tools ──────────────────────────────────────────
     "ui.ask_user_question": _ToolLabel("Asking", "a question", "Asked"),
     "self.sleep": _ToolLabel("Sleeping", "", "Slept"),
-    "self.wait": _ToolLabel("Waiting", "for input", "Waited"),
+    # The model waits for its subagents or background processes, not for the
+    # user: a message the user sends joins the waiting turn.
+    "self.wait": _ToolLabel("Waiting", "for background work", "Waited"),
     "agents.list_configs": _ToolLabel("Listing", "subagent configs", "Listed"),
     "agents.list": _ToolLabel("Listing", "subagents", "Listed"),
     "agents.send_message": _ToolLabel("Sending", "a message to a subagent", "Sent"),
@@ -2133,8 +2150,8 @@ _PATH_PROJECTORS: dict[
     "file_system.read_file": _project_read,
     "write_file": _project_write,
     "file_system.write_file": _project_write,
-    "search_replace": _project_search_replace,
-    "file_system.search_replace": _project_search_replace,
+    "edit": _project_edit,
+    "file_system.edit": _project_edit,
     "grep": _project_grep,
     "bash": _project_shell,
     "file_system.bash": _project_shell,
@@ -2163,8 +2180,8 @@ _TOOL_CATEGORIES: dict[str, UnifiedToolCategory] = {
     "file_system.read_file": "file_read",
     "write_file": "file_write",
     "file_system.write_file": "file_write",
-    "search_replace": "file_edit",
-    "file_system.search_replace": "file_edit",
+    "edit": "file_edit",
+    "file_system.edit": "file_edit",
     "bash": "shell",
     "file_system.bash": "shell",
     "skill.read": "skill",

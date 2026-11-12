@@ -7,17 +7,28 @@ import os
 import signal
 import sys
 import threading
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from vibe.app_server import _termination, stdio
+from vibe.app_server._host import HostRequestHandler
+from vibe.app_server._process_services import ProcessServices
+from vibe.app_server._session_backend_port import SessionBackendHost
 from vibe.app_server._termination import (
     TERMINATED_EXIT_CODE,
     InputEndingTransport,
     ending_on_sigterm,
 )
+from vibe.app_server.multiplex import (
+    _CHANNEL_INBOX_SIZE,
+    ChannelOpen,
+    _ChannelTransport,
+    serve_multiplexed,
+)
+from vibe.app_server.server import AppServer
 from vibe.app_server.transport import JsonRpcTransport, memory_transport_pair
+from vibe.core.config.harness_files import HarnessFilesManager
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 
@@ -67,6 +78,173 @@ async def test_ending_the_input_ends_its_messages_as_the_end_of_the_stream_would
     async with asyncio.timeout(5):
         await serving
     assert received == [{"id": 1}]
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_serving_mid_read_ends_its_messages_cancelled() -> None:
+    _, transport = memory_transport_pair()
+    ending = InputEndingTransport(transport)
+    reading = asyncio.Event()
+
+    async def serve() -> None:
+        messages = ending.messages()
+        reading.set()
+        async for _ in messages:
+            pass
+
+    serving = asyncio.create_task(serve())
+    await reading.wait()
+    await asyncio.sleep(0)
+    serving.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        async with asyncio.timeout(5):
+            await serving
+
+
+@pytest.mark.asyncio
+async def test_a_server_closing_itself_mid_read_ends_its_serving_cleanly(
+    process_services: ProcessServices,
+) -> None:
+    class Host:
+        async def shutdown(self) -> None:
+            pass
+
+    _, transport = memory_transport_pair()
+    server = AppServer(
+        InputEndingTransport(transport),
+        oidc_tenants=process_services.oidc_tenants,
+        session_backend_host_factory=lambda _: cast(SessionBackendHost, Host()),
+        host_handler=HostRequestHandler(
+            HarnessFilesManager(sources=("user", "project")),
+            org_config=process_services.org_config,
+            worktrees=process_services.worktrees,
+            experiments=process_services.experiments,
+            model_catalog=process_services.model_catalog,
+        ),
+    )
+    serving = asyncio.create_task(server.serve())
+    await asyncio.sleep(0)
+
+    # As session/stop does, from its request's task.
+    await server.close()
+
+    async with asyncio.timeout(5):
+        await serving
+
+
+class _ClientLossHost:
+    def __init__(self) -> None:
+        self.disconnected = False
+
+    def mark_client_disconnected(self) -> None:
+        self.disconnected = True
+
+    async def shutdown(self) -> None:
+        pass
+
+
+def _server_over(
+    transport: JsonRpcTransport, host: _ClientLossHost, services: ProcessServices
+) -> AppServer:
+    return AppServer(
+        transport,
+        oidc_tenants=services.oidc_tenants,
+        session_backend_host_factory=lambda _: cast(SessionBackendHost, host),
+        host_handler=HostRequestHandler(
+            HarnessFilesManager(sources=("user", "project")),
+            org_config=services.org_config,
+            worktrees=services.worktrees,
+            experiments=services.experiments,
+            model_catalog=services.model_catalog,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stopped", "disconnected"), [(False, True), (True, False)])
+async def test_only_an_input_ending_without_a_stop_reports_a_lost_client(
+    process_services: ProcessServices, stopped: bool, disconnected: bool
+) -> None:
+    _, transport = memory_transport_pair()
+    ending = InputEndingTransport(transport)
+    host = _ClientLossHost()
+    server = _server_over(ending, host, process_services)
+    serving = asyncio.create_task(server.serve())
+    await asyncio.sleep(0)
+
+    if stopped:
+        await server.close()
+    else:
+        ending.end_input()
+    async with asyncio.timeout(5):
+        await serving
+
+    assert host.disconnected is disconnected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("closed", "acked", "disconnected"),
+    [(True, True, False), (True, False, False), (False, False, True)],
+)
+async def test_only_a_channel_ending_without_its_close_frame_reports_a_lost_client(
+    process_services: ProcessServices, closed: bool, acked: bool, disconnected: bool
+) -> None:
+    client, transport = memory_transport_pair()
+    host = _ClientLossHost()
+
+    async def create_server(
+        channel: JsonRpcTransport, _options: ChannelOpen | None
+    ) -> AppServer:
+        return _server_over(channel, host, process_services)
+
+    serving = asyncio.create_task(serve_multiplexed(transport, create_server))
+    request = {"jsonrpc": "2.0", "id": 1, "method": "session/list", "params": {}}
+    await client.send({"channelId": "1", "message": request})
+
+    # As Vibe Desktop ends a session: a close frame, never a session/stop. Unacked,
+    # the stream ends before the channel's server reads the close.
+    if closed:
+        await client.send({"channelId": "1", "message": None})
+    if acked:
+        async with asyncio.timeout(5):
+            async for frame in client.messages():
+                if frame == {"channelId": "1", "message": None}:
+                    break
+    await client.close()
+    async with asyncio.timeout(5):
+        await serving
+
+    assert host.disconnected is disconnected
+
+
+@pytest.mark.asyncio
+async def test_a_channel_closed_for_a_full_inbox_does_not_report_a_lost_client(
+    process_services: ProcessServices,
+) -> None:
+    client, transport = memory_transport_pair()
+    channel = _ChannelTransport("1", transport)
+    for request_id in range(_CHANNEL_INBOX_SIZE + 1):
+        channel.receive({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "session/list",
+            "params": {},
+        })
+    host = _ClientLossHost()
+    draining = asyncio.create_task(_drain(client))
+
+    async with asyncio.timeout(5):
+        await _server_over(channel, host, process_services).serve()
+    draining.cancel()
+
+    assert host.disconnected is False
+
+
+async def _drain(transport: JsonRpcTransport) -> None:
+    async for _ in transport.messages():
+        pass
 
 
 @posix_only
@@ -144,7 +322,9 @@ async def test_a_sigtermed_stdio_server_closes_as_on_the_end_of_its_stdin(
         return servers[-1]
 
     exits: list[int] = []
-    monkeypatch.setattr(stdio, "create_harness_server", create_harness_server)
+    monkeypatch.setattr(
+        "vibe.app_server._runtime.create_harness_server", create_harness_server
+    )
     monkeypatch.setattr(_termination, "_exit_now", exits.append)
     serving = asyncio.create_task(
         stdio.serve_stdio(reader=stdin, writer=BytesIO(), end_on_sigterm=True)

@@ -1,9 +1,9 @@
 """Per-key JSON cache files with a TTL, written atomically.
 
-Shared by the experiment-eval cache and the model-catalog cache: one file
-per feature, entries keyed by a per-user key (the hashed Mistral API key),
-each entry stamped with ``stored_at_timestamp`` and a payload. A stale or
-corrupt entry is never fatal — the caller gets None and falls back.
+Shared by the experiment-eval, model-catalog, and managed-config caches:
+one file per feature, entries keyed by a per-user key (the hashed Mistral
+API key), each entry stamped with ``stored_at_timestamp`` and a payload. A
+stale or corrupt entry is never fatal — the caller gets None and falls back.
 """
 
 from __future__ import annotations
@@ -26,6 +26,14 @@ def load_keyed_entry(
     ``parse`` receives the stored payload and returns the typed value or
     None when it cannot be used; a corrupt payload is the caller's to log.
     """
+    record = load_keyed_record(path, key, ttl_seconds=ttl_seconds, parse=parse)
+    return record[0] if record is not None else None
+
+
+def load_keyed_record[T](
+    path: Path, key: str, *, ttl_seconds: int, parse: Callable[[Any], T | None]
+) -> tuple[T, int] | None:
+    """The fresh entry for ``key`` and when it was stored, in Unix seconds."""
     entry = _read_entries(path).get(key)
     if not isinstance(entry, dict):
         return None
@@ -35,13 +43,19 @@ def load_keyed_entry(
         return None
     if stored_at <= int(time.time()) - ttl_seconds:
         return None
-    return parse(payload)
+    value = parse(payload)
+    return (value, stored_at) if value is not None else None
 
 
-def store_keyed_entry(path: Path, key: str, payload: Any) -> None:
+def store_keyed_entry(
+    path: Path, key: str, payload: Any, *, stored_at: int | None = None
+) -> None:
     """Insert or overwrite the entry for ``key``; never raises."""
     entries = _read_entries(path)
-    entries[key] = {"stored_at_timestamp": int(time.time()), "payload": payload}
+    entries[key] = {
+        "stored_at_timestamp": int(time.time()) if stored_at is None else stored_at,
+        "payload": payload,
+    }
     _write_entries(path, entries)
 
 
@@ -49,7 +63,7 @@ def _read_entries(path: Path) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 

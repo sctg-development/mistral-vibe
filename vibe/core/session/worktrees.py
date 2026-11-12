@@ -33,6 +33,7 @@ from vibe.core.git.worktree import (
 )
 from vibe.core.git.worktree.naming_model import suggest_worktree_name
 from vibe.core.telemetry.types import LaunchContext
+from vibe.core.trusted_folders import TrustedFoldersManager
 from vibe.observability.logging import logger
 
 
@@ -49,13 +50,18 @@ class CreateNamedWorktree:
 
     name: str
     branch: str | None = None
+    branch_off_in_use: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class CreateWorktreeForPrompt:
-    """Raise a worktree and let the naming model choose what to call it."""
+    """Raise a worktree and let the naming model choose what to call it.
+
+    A ``name`` the caller already has (the agent's, say) replaces the model.
+    """
 
     prompt: str | None = None
+    name: str | None = None
 
 
 type WorktreeRequest = (
@@ -101,6 +107,9 @@ class SessionWorktrees:
         suggested_name: str | None = None,
         on_progress: WorktreeProgressCallback | None = None,
         base: RefreshedBase | None = None,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
     ) -> ResolvedWorktree:
         """Turn a request into the directory the session will run in."""
         base_cwd = base_cwd.expanduser().resolve()
@@ -110,7 +119,9 @@ class SessionWorktrees:
         match request:
             case UseExistingWorktree(cwd=cwd):
                 requested = cwd.expanduser().resolve()
-                with WorktreeRepository.open(base_cwd) as repository:
+                with WorktreeRepository.open(
+                    base_cwd, trust_store=trust_store
+                ) as repository:
                     linked = repository.linked()
                 if not any(worktree.path == requested for worktree in linked):
                     raise WorktreeError(
@@ -127,13 +138,23 @@ class SessionWorktrees:
                 ):
                     raise WorktreeError(f"Worktree is no longer available: {requested}")
                 return ResolvedWorktree(cwd=requested, pending_hold=pending_hold)
-            case CreateNamedWorktree(name=name, branch=branch):
-                with WorktreeRepository.open(base_cwd) as repository:
+            case CreateNamedWorktree(
+                name=name, branch=branch, branch_off_in_use=branch_off
+            ):
+                with WorktreeRepository.open(
+                    base_cwd, trust_store=trust_store, copy_on_write=copy_on_write
+                ) as repository:
                     created = repository.prepare(
-                        name, branch=branch, on_progress=on_progress, base=base
+                        name,
+                        branch=branch,
+                        on_progress=on_progress,
+                        base=base,
+                        branch_in_use="branch_off" if branch_off else "fail",
                     )
             case CreateWorktreeForPrompt(prompt=prompt):
-                with WorktreeRepository.open(base_cwd) as repository:
+                with WorktreeRepository.open(
+                    base_cwd, trust_store=trust_store, copy_on_write=copy_on_write
+                ) as repository:
                     created = repository.prepare_auto(
                         prompt=prompt,
                         suggested_name=suggested_name,
@@ -149,6 +170,9 @@ class SessionWorktrees:
         request: WorktreeRequest,
         base_cwd: Path,
         on_progress: WorktreeProgressCallback | None = None,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
     ) -> ResolvedWorktree:
         """Resolve off the event loop, cleaning up if the start is cancelled.
 
@@ -162,12 +186,23 @@ class SessionWorktrees:
         # the branch, and the fetch only decides where that branch starts.
         (suggested_name, naming_ms), (base, base_ref_ms) = await asyncio.gather(
             _timed(lambda: self._suggest_name(request, base_cwd, on_progress)),
-            _timed(lambda: self._refresh_base(request, base_cwd, on_progress)),
+            _timed(
+                lambda: self._refresh_base(
+                    request, base_cwd, on_progress, trust_store=trust_store
+                )
+            ),
         )
         prepared_at = time.monotonic()
         resolve = asyncio.create_task(
             asyncio.to_thread(
-                self.resolve, request, base_cwd, suggested_name, on_progress, base
+                self.resolve,
+                request,
+                base_cwd,
+                suggested_name,
+                on_progress,
+                base,
+                trust_store=trust_store,
+                copy_on_write=copy_on_write,
             )
         )
         try:
@@ -188,7 +223,13 @@ class SessionWorktrees:
         )
         return resolved
 
-    async def resolve_fork(self, base_cwd: Path) -> ResolvedWorktree:
+    async def resolve_fork(
+        self,
+        base_cwd: Path,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
+    ) -> ResolvedWorktree:
         """Create an independent checkout when the source is Vibe-managed.
 
         An ordinary directory is retained unchanged. Vibe has no ownership
@@ -218,7 +259,11 @@ class SessionWorktrees:
 
         resolve = asyncio.create_task(
             asyncio.to_thread(
-                self._resolve_fork, base_cwd, suggested_name=f"{managed.name}-fork"
+                self._resolve_fork,
+                base_cwd,
+                suggested_name=f"{managed.name}-fork",
+                trust_store=trust_store,
+                copy_on_write=copy_on_write,
             )
         )
         try:
@@ -232,8 +277,16 @@ class SessionWorktrees:
             source_hold.release()
 
     @staticmethod
-    def _resolve_fork(base_cwd: Path, *, suggested_name: str) -> ResolvedWorktree:
-        with WorktreeRepository.open(base_cwd) as repository:
+    def _resolve_fork(
+        base_cwd: Path,
+        *,
+        suggested_name: str,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
+    ) -> ResolvedWorktree:
+        with WorktreeRepository.open(
+            base_cwd, trust_store=trust_store, copy_on_write=copy_on_write
+        ) as repository:
             created = repository.prepare_fork(suggested_name=suggested_name)
         return ResolvedWorktree(
             cwd=created.path, prepared=created, pending_hold=created.pending_hold
@@ -244,6 +297,8 @@ class SessionWorktrees:
         request: WorktreeRequest,
         base_cwd: Path,
         on_progress: WorktreeProgressCallback | None = None,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
     ) -> RefreshedBase | None:
         """Fetch where the new branch starts, alongside the model naming it.
 
@@ -255,7 +310,9 @@ class SessionWorktrees:
             return None
 
         def refresh() -> RefreshedBase:
-            with WorktreeRepository.open(base_cwd) as repository:
+            with WorktreeRepository.open(
+                base_cwd, trust_store=trust_store
+            ) as repository:
                 return repository.refresh_base(on_progress)
 
         return await asyncio.to_thread(refresh)
@@ -274,6 +331,8 @@ class SessionWorktrees:
         """
         if not isinstance(request, CreateWorktreeForPrompt):
             return None
+        if request.name is not None:
+            return request.name
         if request.prompt and on_progress is not None:
             on_progress(WorktreeCreationProgress(WorktreeCreationPhase.NAMING))
         return await suggest_worktree_name(
@@ -312,11 +371,13 @@ class SessionWorktrees:
             managed.forget()
 
     @staticmethod
-    async def restore(cwd: Path) -> bool:
+    async def restore(
+        cwd: Path, *, trust_store: TrustedFoldersManager | None = None
+    ) -> bool:
         managed = ManagedWorktree.at(cwd)
         if managed is None:
             return False
-        return await asyncio.to_thread(managed.restore, cwd)
+        return await asyncio.to_thread(managed.restore, cwd, trust_store=trust_store)
 
     # -- who is standing in it ---------------------------------------------
 

@@ -37,7 +37,7 @@ fn programmatic_wait_cannot_start_a_waiting_effect() {
         run_typescript_completion(action_id(&completion), "program", source),
         running("programmatic-wait")
             .dispatch(llm_call(1))
-            .observe(tool_execution_started("programmatic-wait", "program"))
+            .observe(core_tool_execution_started("programmatic-wait", "program"))
             .observe_tool_execution_finished(
                 "program",
                 run_typescript_success(json!("not programmatic")),
@@ -275,6 +275,48 @@ fn wait_setting_reconfiguration_replaces_the_tool_catalog() {
         );
         assert_eq!(advertises_wait(&next), offered_after, "{name}");
     }
+}
+
+/// *Prepare*: A Session with subagents and wait has a system prompt that names `wait` as a
+/// direct-only tool.
+/// *Do*: Disable model wait between Turns.
+/// *Assert*: The next completion replaces the system prompt, which no longer names `wait`.
+#[test]
+fn disabling_wait_removes_it_from_the_direct_tools_sentence() {
+    let mut initial = serde_json::to_value(config()).unwrap();
+    initial["settings"]["tools"]["model_wait"] = feature(true);
+    initial["settings"]["tools"]["subagents"] = feature(true);
+    let mut runtime = SynchronousRuntime::new(serde_json::from_value(initial.clone()).unwrap());
+    let first = runtime.start_turn("before", "inspect");
+    let sentence = "call them directly: `wait`";
+    assert!(
+        first["model_input"]["messages"]
+            .to_string()
+            .contains(sentence)
+    );
+    runtime.finish_turn_with_text("before", &first, "done");
+    let mut settings = initial["settings"].clone();
+    settings["tools"]["model_wait"] = feature(false);
+
+    runtime.reconfigure_settings(
+        serde_json::from_value(settings).unwrap(),
+        completed("before", vec![json!({"type":"text", "text":"done"})]),
+    );
+    let next = runtime
+        .apply(
+            user_message("after", "inspect again", "queue"),
+            running("after")
+                .dispatch(llm_call(0))
+                .observe(turn_started("after", "inspect again")),
+        )
+        .only_action();
+
+    assert_eq!(next["model_input"]["messages"]["type"], "replace");
+    assert!(
+        !next["model_input"]["messages"]
+            .to_string()
+            .contains(sentence)
+    );
 }
 
 fn feature(enabled: bool) -> Value {

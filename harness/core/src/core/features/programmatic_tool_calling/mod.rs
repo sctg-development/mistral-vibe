@@ -16,10 +16,10 @@ pub(crate) use execution::{
     AcceptedProgramResult, ProgramAdvance, ProgramInput, ProgramTransition,
     interrupted_program_content,
 };
-pub(crate) use prompt::{Prompts, tool_group_inventory_prompt};
+pub(crate) use prompt::{Prompts, direct_tools_prompt, tool_group_inventory_prompt};
 pub(crate) use settings::Settings;
 pub(crate) use state::{
-    PendingProgramRecord, ProgramCapture, ProgramExecution, ProgramFunctionRecord,
+    PendingProgramOperation, ProgramCapture, ProgramExecution, ProgramFunctionRecord,
     ProgramOperationRecord,
 };
 pub(crate) use time_budget::ProgramClock;

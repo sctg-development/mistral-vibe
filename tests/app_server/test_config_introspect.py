@@ -68,8 +68,13 @@ def test_build_field_wires_covers_schema_and_defaults(
 
     # ``max_context_length`` is per-model only, so it arrives as a synthetic
     # row on top of the schema's own fields.
+    retired = {
+        name for name, info in type(config).model_fields.items() if info.deprecated
+    }
+    assert {"include_model_info", "include_prompt_detail"} <= retired
     assert by_name.keys() == (
-        set(type(config).model_fields) - HIDDEN_SETTINGS | {"max_context_length"}
+        set(type(config).model_fields) - HIDDEN_SETTINGS - retired
+        | {"max_context_length"}
     )
     assert not HIDDEN_SETTINGS & by_name.keys()
     assert by_name["autocopy_to_clipboard"].kind is ConfigFieldKind.BOOL
@@ -148,7 +153,7 @@ def test_build_field_wires_keeps_admin_lock_for_global_compaction_threshold(
     assert threshold.value == 50_000
     assert threshold.path == "/auto_compact_threshold"
     assert threshold.origin == "admin"
-    # The unset sentinel is not a value a layer set; it must never surface as
+    # An unset threshold is not a value a layer set; it must never surface as
     # the row's default origin.
     assert [(entry.layer, entry.value) for entry in threshold.layer_values] == [
         ("admin", 50_000)
@@ -189,12 +194,14 @@ def test_build_field_wires_edits_the_user_model_own_compaction_threshold(
 
 
 @pytest.mark.asyncio
-async def test_collect_layer_values_groups_fields_by_priority(tmp_path) -> None:
+async def test_collect_layer_values_groups_fields_by_priority(
+    tmp_path, make_config: Callable[..., VibeConfigSchema]
+) -> None:
     missing = UserConfigLayer(path=tmp_path / "missing.toml", name="missing")
     low = OverridesLayer(data={"theme": "a"}, name="user-toml")
     high = OverridesLayer(data={"theme": "b", "api_timeout": 1.0}, name="overrides")
 
-    values = await collect_layer_values([missing, low, high])
+    values = await collect_layer_values([missing, low, high], make_config())
 
     assert [(entry.layer, entry.value) for entry in values["theme"]] == [
         ("overrides", "b"),
@@ -206,12 +213,14 @@ async def test_collect_layer_values_groups_fields_by_priority(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_collect_layer_values_hides_the_unset_threshold_sentinel() -> None:
-    # The default layer materializes the sentinel for every threshold; it
-    # means "no layer set one" and must never surface as provenance.
+async def test_collect_layer_values_hides_the_unset_threshold(
+    make_config: Callable[..., VibeConfigSchema],
+) -> None:
+    # The default layer materializes None for every threshold; it means "no
+    # layer set one" and must never surface as provenance.
     defaults = DefaultConfigLayer(schema=VibeConfigSchema)
 
-    values = await collect_layer_values([defaults])
+    values = await collect_layer_values([defaults], make_config())
 
     assert "auto_compact_threshold" not in values
     assert not [path for path in values if path.endswith("/auto_compact_threshold")]
@@ -235,12 +244,12 @@ async def test_build_field_wires_projects_growthbook_routed_model_threshold(
         }
     })
 
-    values = await collect_layer_values([growthbook])
     config = make_config(
         active_model="",
         routed_default_model="routed",
         routed_model_config=json.dumps(routed),
     )
+    values = await collect_layer_values([growthbook], config)
     threshold = next(
         wire
         for wire in build_field_wires(config, values)
@@ -301,11 +310,11 @@ def test_build_field_wires_shows_an_unset_window_as_default(
     assert window.path == "/models/custom/max_context_length"
 
 
-def test_build_field_wires_shows_the_derived_threshold_on_the_global_row(
+def test_build_field_wires_shows_an_unset_threshold_as_default(
     make_config: Callable[..., VibeConfigSchema],
 ) -> None:
-    # Nothing is set anywhere, so the row must display the derived value,
-    # never the raw unset sentinel the merged config carries.
+    # Nothing is set anywhere: the row shows no value, and the session derives
+    # the threshold from the window when it starts.
     config = make_config(
         active_model="custom",
         models=[
@@ -324,7 +333,7 @@ def test_build_field_wires_shows_the_derived_threshold_on_the_global_row(
         if wire.name == "auto_compact_threshold"
     )
 
-    assert threshold.value == 209_715
+    assert threshold.value is None
     assert threshold.origin == DEFAULT_ORIGIN
 
 
@@ -463,3 +472,49 @@ def test_effective_config_keeps_a_command_outside_mcp_servers() -> None:
 
     # Assert
     assert dumped["tools"]["custom"]["command"] == "make test --verbose"
+
+
+@pytest.mark.asyncio
+async def test_build_field_wires_edits_the_catalog_filter_model_threshold() -> None:
+    """A threshold the catalog filter sets is the model's own: the row edits
+    the model's entry, where an edit wins over the filter.
+    """
+    from vibe.core.config import build_default_orchestrator
+    from vibe.core.config.layers.model_catalog import apply_model_catalog
+    from vibe.core.model_catalog import parse_model_catalog_response
+
+    orchestrator = await build_default_orchestrator()
+    growthbook = orchestrator.get_layer(GrowthbookLayer.NAME)
+    assert isinstance(growthbook, GrowthbookLayer)
+    growthbook.set_variants({
+        ExperimentName.MODEL_CATALOG.value: True,
+        ExperimentName.MODEL_CATALOG_FILTER.value: {
+            "default": "large",
+            "settings": {"large": {"auto_compact_threshold": 50_000}},
+        },
+    })
+    catalog = parse_model_catalog_response({
+        "models": [
+            {
+                "id": "large",
+                "label": "Large",
+                "capabilities": {"function_calling": True},
+            }
+        ]
+    })
+    assert catalog is not None
+    await apply_model_catalog(orchestrator, catalog)
+    await orchestrator.set_field("/active_model", "", target_layer=OverridesLayer.NAME)
+    config = orchestrator.config
+
+    values = await collect_layer_values(orchestrator.layers, config)
+    threshold = next(
+        wire
+        for wire in build_field_wires(config, values)
+        if wire.name == "auto_compact_threshold"
+    )
+
+    assert config.get_active_model().alias == "large"
+    assert threshold.value == 50_000
+    assert threshold.path == "/models/large/auto_compact_threshold"
+    assert "model_catalog_filter" not in values

@@ -4,11 +4,10 @@ import asyncio
 
 import pytest
 
+from mistralai_vibe_local_harness.vibe.completion_profile import WireFormat
 from tests.conftest import build_test_vibe_config
-from tests.mock.utils import mock_llm_chunk
-from tests.stubs.fake_backend import FakeBackend
+from tests.stubs.fake_utility_completion import FakeUtilityCompletion
 from vibe.core.config import ModelConfig, ProviderConfig, UtilityFeature
-from vibe.core.llm import utility_completion
 from vibe.core.llm.model_probe import MODEL_AVAILABILITY
 from vibe.core.llm.utility_completion import (
     FAST_MODEL_CANDIDATES,
@@ -133,11 +132,7 @@ class TestRunUtilityCompletion:
     @pytest.mark.asyncio
     async def test_returns_message_content(self, monkeypatch) -> None:
         config = build_test_vibe_config()
-        monkeypatch.setattr(
-            utility_completion,
-            "create_backend",
-            lambda **_: FakeBackend([mock_llm_chunk(content="the answer")]),
-        )
+        FakeUtilityCompletion("the answer").install(monkeypatch)
 
         content = await run_utility_completion(
             config=config,
@@ -151,15 +146,9 @@ class TestRunUtilityCompletion:
         assert content == "the answer"
 
     @pytest.mark.asyncio
-    async def test_forwards_budgets_to_the_backend(self, monkeypatch) -> None:
+    async def test_forwards_budgets_to_the_harness(self, monkeypatch) -> None:
         config = build_test_vibe_config()
-        captured: dict = {}
-
-        def fake_create_backend(**kwargs):
-            captured.update(kwargs)
-            return FakeBackend([mock_llm_chunk(content="ok")])
-
-        monkeypatch.setattr(utility_completion, "create_backend", fake_create_backend)
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
 
         await run_utility_completion(
             config=config,
@@ -170,17 +159,31 @@ class TestRunUtilityCompletion:
             retry_budget_seconds=7.0,
         )
 
-        assert captured["timeout"] == 1.5
-        assert captured["retry_max_elapsed_time"] == 7.0
+        [request] = completion.requests
+        assert request.config.timeout_s == 1.5
+        assert request.config.retry_max_elapsed_time_s == 7.0
 
     @pytest.mark.asyncio
-    async def test_propagates_backend_errors(self, monkeypatch) -> None:
-        config = build_test_vibe_config()
-        monkeypatch.setattr(
-            utility_completion,
-            "create_backend",
-            lambda **_: FakeBackend(exception_to_raise=RuntimeError("boom")),
+    async def test_follows_the_system_trust_store_setting(self, monkeypatch) -> None:
+        config = build_test_vibe_config(enable_system_trust_store=True)
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
+
+        await run_utility_completion(
+            config=config,
+            system_prompt="system",
+            user_content="user",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
         )
+
+        [request] = completion.requests
+        assert request.config.enable_system_trust_store is True
+
+    @pytest.mark.asyncio
+    async def test_propagates_completion_errors(self, monkeypatch) -> None:
+        config = build_test_vibe_config()
+        FakeUtilityCompletion(error=RuntimeError("boom")).install(monkeypatch)
 
         with pytest.raises(RuntimeError, match="boom"):
             await run_utility_completion(
@@ -193,16 +196,15 @@ class TestRunUtilityCompletion:
             )
 
     @pytest.mark.asyncio
-    async def test_skip_if_no_key_returns_none_without_touching_backend(
+    async def test_skip_if_no_key_returns_none_without_a_request(
         self, monkeypatch
     ) -> None:
         config = build_test_vibe_config()
         monkeypatch.delenv("VIBE_API_KEY", raising=False)
 
-        def fail_create_backend(**_):
-            raise AssertionError("backend must not be built when the key is missing")
-
-        monkeypatch.setattr(utility_completion, "create_backend", fail_create_backend)
+        FakeUtilityCompletion(error=AssertionError("no request without a key")).install(
+            monkeypatch
+        )
 
         content = await run_utility_completion(
             config=config,
@@ -233,11 +235,7 @@ class TestRunUtilityCompletion:
             models=[ModelConfig(name="local-model", provider="local", alias="local")],
             active_model="local",
         )
-        monkeypatch.setattr(
-            utility_completion,
-            "create_backend",
-            lambda **_: FakeBackend([mock_llm_chunk(content="named")]),
-        )
+        FakeUtilityCompletion("named").install(monkeypatch)
 
         content = await run_utility_completion(
             config=config,
@@ -255,11 +253,7 @@ class TestRunUtilityCompletion:
     async def test_skip_if_no_key_runs_when_key_present(self, monkeypatch) -> None:
         config = build_test_vibe_config()
         monkeypatch.setenv("VIBE_API_KEY", "present")
-        monkeypatch.setattr(
-            utility_completion,
-            "create_backend",
-            lambda **_: FakeBackend([mock_llm_chunk(content="named")]),
-        )
+        FakeUtilityCompletion("named").install(monkeypatch)
 
         content = await run_utility_completion(
             config=config,
@@ -277,8 +271,7 @@ class TestRunUtilityCompletion:
     async def test_call_type_and_launch_context_ride_the_request_metadata(
         self, monkeypatch
     ) -> None:
-        backend = FakeBackend([mock_llm_chunk(content="ok")])
-        monkeypatch.setattr(utility_completion, "create_backend", lambda **_: backend)
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
         config = build_test_vibe_config()
 
         await run_utility_completion(
@@ -298,7 +291,7 @@ class TestRunUtilityCompletion:
             session_id="session-123",
         )
 
-        metadata = backend._requests_metadata[0]
+        metadata = completion.requests[0].metadata
         assert metadata is not None
         assert metadata["call_type"] == "worktree_title"
         assert metadata["agent_entrypoint"] == "cli"
@@ -317,8 +310,7 @@ class TestRunUtilityCompletion:
             def send_request_sent(self, **kwargs) -> None:
                 self.request_events.append(kwargs)
 
-        backend = FakeBackend([mock_llm_chunk(content="ok")])
-        monkeypatch.setattr(utility_completion, "create_backend", lambda **_: backend)
+        FakeUtilityCompletion("ok").install(monkeypatch)
         telemetry = RecordingTelemetry()
         config = build_test_vibe_config()
 
@@ -336,9 +328,51 @@ class TestRunUtilityCompletion:
         (event,) = telemetry.request_events
         assert event["call_type"] == "title_generation"
         assert event["model"] == "mistral-small"
+        assert event["reasoning_effort"] == "off"
         assert event["nb_context_chars"] == len("system prompt") + len("user prompt")
         assert event["nb_context_messages"] == 2
         assert event["nb_prompt_chars"] == len("user prompt")
+
+    @pytest.mark.asyncio
+    async def test_request_sent_reports_the_reasoning_the_request_sends(
+        self, monkeypatch
+    ) -> None:
+        # A model that cannot stop reasoning runs at its lowest level when no
+        # level is configured, so the configured "off" must not be reported.
+        class RecordingTelemetry(TelemetryClient):
+            def __init__(self) -> None:
+                super().__init__(config_getter=build_test_vibe_config)
+                self.request_events: list[dict] = []
+
+            def send_request_sent(self, **kwargs) -> None:
+                self.request_events.append(kwargs)
+
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
+        telemetry = RecordingTelemetry()
+        config = build_test_vibe_config(
+            models=[
+                ModelConfig(name="mistral-large-4", provider="mistral", alias="large")
+            ],
+            active_model="large",
+            utility_models={"title": "large"},
+        )
+
+        await run_utility_completion(
+            config=config,
+            system_prompt="system prompt",
+            user_content="user prompt",
+            max_tokens=24,
+            request_timeout_seconds=1.0,
+            retry_budget_seconds=0.0,
+            feature=UtilityFeature.TITLE,
+            telemetry=telemetry,
+        )
+
+        (event,) = telemetry.request_events
+        (request,) = completion.requests
+        sent = request.route.reasoning_setting(WireFormat.MISTRAL)
+        assert sent == "low"
+        assert event["reasoning_effort"] == sent
 
     @pytest.mark.asyncio
     async def test_without_a_telemetry_client_no_event_is_emitted(
@@ -346,8 +380,7 @@ class TestRunUtilityCompletion:
     ) -> None:
         # Worktree naming runs before a session exists: no telemetry client, so
         # the call rides the request metadata alone.
-        backend = FakeBackend([mock_llm_chunk(content="ok")])
-        monkeypatch.setattr(utility_completion, "create_backend", lambda **_: backend)
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
         config = build_test_vibe_config()
 
         await run_utility_completion(
@@ -360,7 +393,7 @@ class TestRunUtilityCompletion:
             call_type="worktree_title",
         )
 
-        metadata = backend._requests_metadata[0]
+        metadata = completion.requests[0].metadata
         assert metadata is not None
         assert metadata["call_type"] == "worktree_title"
 
@@ -665,8 +698,7 @@ class TestFeatureLabelsTheCall:
     async def test_the_feature_names_the_request(
         self, monkeypatch, feature: UtilityFeature, call_type: str
     ) -> None:
-        backend = FakeBackend([mock_llm_chunk(content="ok")])
-        monkeypatch.setattr(utility_completion, "create_backend", lambda **_: backend)
+        completion = FakeUtilityCompletion("ok").install(monkeypatch)
 
         await run_utility_completion(
             config=build_test_vibe_config(),
@@ -678,7 +710,7 @@ class TestFeatureLabelsTheCall:
             retry_budget_seconds=0.0,
         )
 
-        metadata = backend._requests_metadata[0]
+        metadata = completion.requests[0].metadata
         assert metadata is not None
         assert metadata["call_type"] == call_type
 
@@ -686,10 +718,9 @@ class TestFeatureLabelsTheCall:
     async def test_a_feature_and_a_call_type_together_is_a_caller_error(
         self, monkeypatch
     ) -> None:
-        def fail_create_backend(**_):
-            raise AssertionError("a mislabelled call must not be sent")
-
-        monkeypatch.setattr(utility_completion, "create_backend", fail_create_backend)
+        FakeUtilityCompletion(
+            error=AssertionError("a mislabelled call must not be sent")
+        ).install(monkeypatch)
 
         with pytest.raises(TypeError):
             await run_utility_completion(

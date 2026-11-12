@@ -25,7 +25,7 @@ Adapter instead, between the read file's directory and the open root holding
 it, with the same rendering and dedup. Each of those reads is a round trip to
 the sandbox, so the session remembers which directories it has looked in and
 does not look again, with or without a doc there. A ``write_file`` or
-``search_replace`` on an AGENTS.md makes its directory unchecked again, and a
+``edit`` on an AGENTS.md makes its directory unchecked again, and a
 ``bash`` command whose text names AGENTS.md makes every directory unchecked
 again, so a doc the model writes is found on its next read below it. A doc
 that appears any other way (a script, ``git checkout``, an archive) in a
@@ -57,6 +57,7 @@ from mistralai_vibe_local_harness.vibe import (
     PostToolCallHookHandler,
     sandbox_path,
 )
+from vibe.app_server._worktree_session import session_harness_files
 from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.paths.conventions import AGENTS_MD_FILENAME
 from vibe.utils import VIBE_WARNING_TAG
@@ -70,7 +71,7 @@ _BASH_TOOL_NAME = "file_system.bash"
 # The builtins that write a file, with the argument naming it.
 _WRITE_TOOL_PATH_ARGUMENTS = {
     "file_system.write_file": "path",
-    "file_system.search_replace": "file_path",
+    "file_system.edit": "file_path",
 }
 
 _AGENTS_MD_SECTION = "Contents of {directory}/AGENTS.md (project instructions for this directory):\n\n{content}"
@@ -85,22 +86,8 @@ def _passthrough(tool_result: RustToolResult) -> RustPostToolCallHookResult:
 def _session_files(
     harness_files: HarnessFilesManager, context: HookContext
 ) -> HarnessFilesManager:
-    # The Session workspace always lists the cwd among its roots (it is the
-    # file sandbox), but the session manager must never receive it there: a
-    # listed cwd becomes a session root, and ``project_roots`` returns the
-    # listed roots even when the tree is untrusted, which would inject
-    # AGENTS.md docs past the trust gate. ``_build_session_config`` passes
-    # only ``options.workspace_roots`` for the same reason — the invariant
-    # ("never list the session cwd among ``for_session`` workspace roots")
-    # therefore lives at two call sites. The durable home would be
-    # ``for_session`` itself ignoring a listed root equal to the cwd; until
-    # then, keep the two filters in sync.
     workspace = context.config.workspace
-    session_cwd = workspace.cwd
-    listed_roots = [
-        root for root in workspace.roots if root.expanduser().resolve() != session_cwd
-    ]
-    return harness_files.for_session(session_cwd, workspace_roots=listed_roots)
+    return session_harness_files(harness_files, workspace.cwd, workspace.roots)
 
 
 def _read_file_path(

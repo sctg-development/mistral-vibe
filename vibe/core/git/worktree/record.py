@@ -14,11 +14,8 @@ from typing import BinaryIO
 from pydantic import BaseModel, ConfigDict, Field
 
 from vibe.core.paths import WORKTREES_DIR
-from vibe.core.session.session_lease import (
-    _acquire_file_lock,
-    _lease_directory_lock,
-    _release_file_lock,
-)
+from vibe.core.session.session_lease import _lease_directory_lock
+from vibe.core.utils.file_lock import acquire_file_lock, release_file_lock
 from vibe.core.utils.time import utc_now
 from vibe.observability.logging import logger
 
@@ -31,6 +28,8 @@ from vibe.observability.logging import logger
 CLAIMS_DIR_NAME = ".claims"
 # Removed worktrees are renamed here, which is atomic, then deleted at leisure.
 TRASH_DIR_NAME = ".trash"
+# Copy-on-write templates (see copy_on_write.py): checkouts, but nobody's.
+TEMPLATES_DIR_NAME = ".templates"
 RECORD_FILENAME = "record.json"
 RECOVERY_FILENAME = "recovery.json"
 HOLDERS_DIR_NAME = "holders"
@@ -121,11 +120,11 @@ def worktree_prune_lock() -> Iterator[None]:
     root = _claims_root()
     root.mkdir(parents=True, exist_ok=True)
     with (root / _PRUNE_LOCK_FILENAME).open("a+b") as file:
-        _acquire_file_lock(file, blocking=True)
+        acquire_file_lock(file, blocking=True)
         try:
             yield
         finally:
-            _release_file_lock(file)
+            release_file_lock(file)
 
 
 # Identifies one managed worktree. Bucket and name are a pair that is meaningless
@@ -148,6 +147,7 @@ class WorktreeClaim:
         if len(parts) < _BUCKET_AND_NAME_PARTS or parts[0] in {
             CLAIMS_DIR_NAME,
             TRASH_DIR_NAME,
+            TEMPLATES_DIR_NAME,
         }:
             return None
         return cls(bucket=parts[0], name=parts[1])
@@ -350,7 +350,7 @@ class WorktreeClaim:
                 return
             file = holder.open("a+b")
             try:
-                _acquire_file_lock(file)
+                acquire_file_lock(file)
             except BlockingIOError as exc:
                 file.close()
                 raise WorktreeRecordError(
@@ -371,7 +371,7 @@ class WorktreeClaim:
                         return
                     del _HELD_FILES[holder]
                     try:
-                        _release_file_lock(file)
+                        release_file_lock(file)
                     finally:
                         file.close()
                     holder.unlink(missing_ok=True)
@@ -453,12 +453,12 @@ def _discard_stale_holder(holder: Path) -> bool:
     except OSError:
         return False
     try:
-        _acquire_file_lock(file)
+        acquire_file_lock(file)
     except BlockingIOError:
         file.close()
         return False
     try:
-        _release_file_lock(file)
+        release_file_lock(file)
     finally:
         file.close()
     try:

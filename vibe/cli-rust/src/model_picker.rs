@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::app::{App, ModelOption, ToastSeverity};
+use crate::app::{App, ModelOption, Severity};
 use crate::config_write::Scope;
 use crate::event_handler;
 use crate::server::Client;
@@ -23,15 +23,12 @@ pub enum Event {
     Failed(String),
 }
 
-pub(crate) const FAILED_TOAST_SECS: u64 = 8;
-
-/// Apply the server's answer and release the commit that was in flight.
+/// Apply the server's answer.
 pub fn apply_event(app: &mut App, event: Event) {
     match event {
         Event::Written(runtime) => event_handler::apply_runtime_value(app, &runtime),
-        Event::Failed(message) => app.show_toast(message, ToastSeverity::Error, FAILED_TOAST_SECS),
+        Event::Failed(message) => crate::notices::inline(app, Severity::Error, &message),
     }
-    app.commit_finished();
 }
 
 /// Hand the highlighted model to the thinking picker, opened at once on its
@@ -67,6 +64,7 @@ pub fn select(app: &mut App, client: &Arc<Client>, scope: Scope) {
 pub fn open(app: &mut App) {
     app.model_picker.list = crate::option_list::OptionList::new(current_index(app));
     app.model_picker.open = true;
+    crate::model_selection::opened(app, crate::model_selection::Picker::Model);
 }
 
 /// Pre-selected row: pinned model `+1` (offset by Default), else `0` (Default).
@@ -127,78 +125,34 @@ pub fn cancel(app: &mut App) {
 /// Refresh the model snapshot from a `runtime/read`/`runtime/updated` value
 /// (shape `{runtime: {config: {...}}}`), so the picker reflects live config.
 pub fn apply_runtime(app: &mut App, response: &Value) {
-    let Some(config) = response.pointer("/runtime/config") else {
+    let Some(config) = crate::server::RuntimeSnapshot::config(response) else {
         return;
     };
-    app.model_picker.models = config
-        .get("models")
-        .and_then(Value::as_array)
-        .map(|models| models.iter().filter_map(read_model).collect())
-        .unwrap_or_default();
-    app.model_picker.current_model = config
-        .pointer("/activeModel/alias")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    app.model_picker.is_pinned = config
-        .get("activeModelPinned")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    app.model_picker.default_display_name = default_display_name(config);
-    app.model_picker.default_alias = config
-        .get("defaultModelAlias")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let models: Vec<ModelOption> = config.models.into_iter().filter_map(model_option).collect();
+    let alias = config.default_model_alias;
+    app.model_picker.default_display_name = models
+        .iter()
+        .find(|model| model.alias == alias)
+        .map_or_else(|| alias.clone(), |model| model.display_name.clone());
+    app.model_picker.models = models;
+    app.model_picker.current_model = config.active_model.map(|m| m.alias).unwrap_or_default();
+    app.model_picker.is_pinned = config.active_model_pinned;
+    app.model_picker.default_alias = alias;
 }
 
-/// Display name of the default model, looked up by `defaultModelAlias`;
-/// falls back to the alias itself.
-fn default_display_name(config: &Value) -> String {
-    let alias = config
-        .get("defaultModelAlias")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    config
-        .get("models")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|m| m.get("alias").and_then(Value::as_str) == Some(alias))
-        .and_then(|m| m.get("displayName").and_then(Value::as_str))
-        .unwrap_or(alias)
-        .to_owned()
-}
-
-fn read_model(value: &Value) -> Option<ModelOption> {
-    let alias = value.get("alias").and_then(Value::as_str)?.to_owned();
-    let display_name = value
-        .get("displayName")
-        .and_then(Value::as_str)
-        .unwrap_or(&alias)
-        .to_owned();
-    let thinking = value
-        .get("thinking")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+fn model_option(model: crate::server::ModelView) -> Option<ModelOption> {
+    if model.alias.is_empty() {
+        return None;
+    }
     // Older servers omit the per-model set; fall back to the canonical five (ADR 0014).
-    let thinking_levels = value
-        .get("thinkingLevels")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .filter(|levels: &Vec<String>| !levels.is_empty())
-        .unwrap_or_else(|| THINKING_LEVELS.iter().map(|it| it.to_string()).collect());
+    let thinking_levels = match model.thinking_levels.is_empty() {
+        true => THINKING_LEVELS.iter().map(|it| it.to_string()).collect(),
+        false => model.thinking_levels,
+    };
     Some(ModelOption {
-        alias,
-        display_name,
-        thinking,
+        display_name: model.display_name.unwrap_or_else(|| model.alias.clone()),
+        alias: model.alias,
+        thinking: model.thinking.unwrap_or_default(),
         thinking_levels,
     })
 }

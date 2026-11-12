@@ -1,44 +1,27 @@
 use crate::core::error::CoreError;
 pub(crate) mod batch;
 mod direct;
+pub(crate) mod external_call;
 
 use serde_json::json;
 
 use crate::core::features::large_output::PendingWrite;
-use crate::core::features::permissions::GrantKey;
 use crate::core::features::programmatic_tool_calling::{
     ProgramExecution, interrupted_program_content,
 };
-use crate::core::hooks::HookCall;
 use crate::core::step_protocol::{Action, DeterminismContext};
 use crate::core::tools::context::ToolContext;
 use crate::core::tools::external::ExternalToolCall;
 use crate::core::wire::content::text_content;
 use crate::core::wire::message::Message;
-use crate::core::wire::tool::{ToolCall, ToolResult};
+use crate::core::wire::tool::ToolCall;
+
+use self::external_call::PendingExternalCall;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ToolExecutionState {
-    DirectAwaitingApproval {
-        approval_action_id: String,
-        grant_key: GrantKey,
-        call: ExternalToolCall,
-    },
-    DirectAwaitingPreHook {
-        hook_action_id: String,
-        hook_binding_ids: Vec<String>,
-        call: ExternalToolCall,
-    },
-    DirectPending {
-        call: ExternalToolCall,
-    },
-    DirectAwaitingPostHook {
-        hook_action_id: String,
-        hook_binding_ids: Vec<String>,
-        call: ExternalToolCall,
-        result: ToolResult,
-    },
+    Direct(PendingExternalCall),
     ProgramPending {
         execution: ProgramExecution,
     },
@@ -82,56 +65,36 @@ impl ToolBatch {
             .collect()
     }
 
+    /// Names the `run_typescript` call as the parent of a tool call Action that
+    /// its program made. Every other Action is unchanged.
+    pub(crate) fn with_program_parent(&self, action: Action) -> Action {
+        let program_call_id = self
+            .executions
+            .iter()
+            .find_map(|execution| match &execution.state {
+                ToolExecutionState::ProgramPending { execution: program }
+                    if program.handles_tool_action(action.action_id()) =>
+                {
+                    Some(execution.call.id.as_str())
+                }
+                _ => None,
+            });
+        match program_call_id {
+            Some(program_call_id) => action.issued_by_program(program_call_id),
+            None => action,
+        }
+    }
+
     pub(crate) fn pending_actions(&self, turn_id: &str) -> Vec<Action> {
         self.executions
             .iter()
             .flat_map(|execution| match &execution.state {
-                ToolExecutionState::DirectAwaitingApproval {
-                    approval_action_id,
-                    grant_key,
-                    call,
-                    ..
-                } => vec![Action::approval(
-                    approval_action_id.clone(),
-                    turn_id,
-                    grant_key,
-                    call,
-                    call.call
-                        .direct_model_name()
-                        .expect("direct approval call has a model-visible name"),
-                )],
-                ToolExecutionState::DirectAwaitingPreHook {
-                    hook_action_id,
-                    hook_binding_ids,
-                    call,
-                } => vec![Action::Hook {
-                    effect_id: hook_action_id.clone(),
-                    turn_id: turn_id.to_string(),
-                    hook_binding_ids: hook_binding_ids.clone(),
-                    call: HookCall::PreToolCall {
-                        tool_call: call.into(),
-                    },
-                }],
-                ToolExecutionState::DirectPending { call } => {
-                    vec![Action::external_tool(call, turn_id)]
-                }
-                ToolExecutionState::DirectAwaitingPostHook {
-                    hook_action_id,
-                    hook_binding_ids,
-                    call,
-                    result,
-                } => vec![Action::Hook {
-                    effect_id: hook_action_id.clone(),
-                    turn_id: turn_id.to_string(),
-                    hook_binding_ids: hook_binding_ids.clone(),
-                    call: HookCall::PostToolCall {
-                        tool_call: call.into(),
-                        tool_result: result.clone(),
-                    },
-                }],
-                ToolExecutionState::ProgramPending { execution } => {
-                    execution.pending_actions(turn_id)
-                }
+                ToolExecutionState::Direct(pending) => vec![pending.action(turn_id)],
+                ToolExecutionState::ProgramPending { execution: program } => program
+                    .pending_actions(turn_id)
+                    .into_iter()
+                    .map(|action| action.issued_by_program(&execution.call.id))
+                    .collect(),
                 ToolExecutionState::AwaitingLargeOutputWrite {
                     action_id, pending, ..
                 } => vec![Action::filesystem_write(
@@ -428,7 +391,7 @@ mod tests {
             ),
             (
                 "edit",
-                "file_system.search_replace",
+                "file_system.edit",
                 json!({
                     "file_path": "example.txt",
                     "old_string": "old",
@@ -436,18 +399,15 @@ mod tests {
                 }),
                 json!({
                     "file_path": "example.txt",
-                    "content": [{
-                        "old_str": "old",
-                        "new_str": "new",
-                        "replace_all": false,
-                    }],
+                    "old_string": "old",
+                    "new_string": "new",
                 }),
             ),
             (
                 "bash",
                 "file_system.bash",
                 json!({"command": "pwd"}),
-                json!({"command": "pwd"}),
+                json!({"command": "pwd", "timeout_seconds": 120}),
             ),
         ];
         for (tool_name, runtime_name, model_arguments, runtime_arguments) in calls {
@@ -484,6 +444,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     output_schema: None,
                     exposure: ProvidedToolExposure::Programmatic,
+                    direct_name: None,
                 },
                 ProvidedToolDefinition {
                     name: "direct_only".to_string(),
@@ -491,6 +452,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     output_schema: None,
                     exposure: ProvidedToolExposure::Direct,
+                    direct_name: None,
                 },
                 ProvidedToolDefinition {
                     name: "both".to_string(),
@@ -498,6 +460,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     output_schema: None,
                     exposure: ProvidedToolExposure::DirectAndProgrammatic,
+                    direct_name: None,
                 },
             ],
         });
@@ -521,14 +484,14 @@ mod tests {
         assert_eq!(
             tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
             [
+                "direct_only",
+                "both",
                 "search_tool_functions",
                 "run_typescript",
                 "read_file",
                 "write_file",
                 "edit",
-                "bash",
-                "direct_only",
-                "both"
+                "bash"
             ]
         );
 
@@ -567,6 +530,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     output_schema: None,
                     exposure: ProvidedToolExposure::Direct,
+                    direct_name: None,
                 },
                 ProvidedToolDefinition {
                     name: "both".to_string(),
@@ -574,6 +538,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                     output_schema: None,
                     exposure: ProvidedToolExposure::DirectAndProgrammatic,
+                    direct_name: None,
                 },
             ],
         });
@@ -631,6 +596,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 output_schema: None,
                 exposure: ProvidedToolExposure::Programmatic,
+                direct_name: None,
             }],
         });
         config.capabilities.skills.push(SkillDefinition {
@@ -674,10 +640,16 @@ mod tests {
     #[test]
     fn runtime_qualified_skill_aliases_are_generic_catalog_names() {
         let mut config = config();
+        // A plugin name qualifies its skills; a programmatic identifier still does too.
         config.capabilities.skills.push(SkillDefinition {
-            name: "acme_tools:prepare-report".to_string(),
+            name: "acme.tools:prepare-report".to_string(),
             description: "Prepare a report.".to_string(),
             path: r"C:\plugins\acme.tools\skills\prepare-report\SKILL.md".to_string(),
+        });
+        config.capabilities.skills.push(SkillDefinition {
+            name: "acme_tools:summarize".to_string(),
+            description: "Summarize a report.".to_string(),
+            path: r"C:\plugins\acme.tools\skills\summarize\SKILL.md".to_string(),
         });
 
         let step = advance(
@@ -687,7 +659,8 @@ mod tests {
         .unwrap();
 
         let system_prompt = message_text(&step.state.context.messages()[0]);
-        assert!(system_prompt.contains("<name>acme_tools:prepare-report</name>"));
+        assert!(system_prompt.contains("<name>acme.tools:prepare-report</name>"));
+        assert!(system_prompt.contains("<name>acme_tools:summarize</name>"));
         let Some(Action::Completion {
             model_input:
                 ModelInputUpdate {

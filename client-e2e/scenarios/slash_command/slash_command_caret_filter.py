@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _LEFT = "\x1b[D"
 
-settle_per_key = True
 
-timeline: Timeline = ["/status", _LEFT, _LEFT, _LEFT]
-
-capture_startup = False
+timeline: Timeline = ["/status", _LEFT, _LEFT, _LEFT, take_snapshot()]

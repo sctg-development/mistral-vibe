@@ -1,37 +1,26 @@
 //! Collapsed pastes and image placeholders across composer round trips:
 //! history and queue drafts, cut, line deletion, undo, and rewind.
 
-use std::sync::Arc;
-use std::time::Instant;
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use vibe_rs::app::App;
-use vibe_rs::config;
-use vibe_rs::input::{handle_key, handle_paste};
+use vibe_rs::input::handle_paste;
 use vibe_rs::long_paste::placeholder;
-use vibe_rs::server::Client;
+
+use crate::support::send_key;
 
 struct Harness {
     app: App,
-    client: Arc<Client>,
-    config_tx: tokio::sync::mpsc::Sender<config::Loaded>,
-    _config_rx: tokio::sync::mpsc::Receiver<config::Loaded>,
 }
 
 impl Harness {
     fn new() -> Self {
-        let (config_tx, _config_rx) = tokio::sync::mpsc::channel(1);
         Self {
             app: App::default(),
-            client: Arc::new(Client::stub()),
-            config_tx,
-            _config_rx,
         }
     }
 
     fn press(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        let key = KeyEvent::new(code, modifiers);
-        handle_key(&mut self.app, &self.client, &self.config_tx, key);
+        send_key(&mut self.app, KeyEvent::new(code, modifiers));
     }
 
     fn pastes(&self) -> Vec<String> {
@@ -115,7 +104,7 @@ fn an_undo_checkpoint_taken_before_a_sync_keeps_the_placeholder() {
     input.input.push_str(" dictated");
     input.cursor = input.input.len();
 
-    input.record_edit(before, true, Instant::now());
+    input.record_edit(before, true, vibe_rs::clock::now());
     assert!(input.restore_edit(false));
     assert!(input.restore_edit(true));
 
@@ -339,7 +328,7 @@ fn a_path_between_two_placeholders_is_rewritten_and_shell_mode_rewrites_nothing(
 #[test]
 fn moving_within_history_keeps_the_draft_for_when_recall_ends() {
     let mut harness = Harness::new();
-    harness.app.completion.skills = vec![("lint".into(), "Run the linters.".into())];
+    harness.app.completion.skills = vec![vibe_rs::skill::Skill::new("lint", "Run the linters.")];
     harness.app.chat_input.history.add("first");
     harness.app.chat_input.history.add("second");
     for character in "run /li".chars() {

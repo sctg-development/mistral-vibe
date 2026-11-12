@@ -1,4 +1,4 @@
-"""A `/config` edit failing with an RPC error shows the server's own message in the toast."""
+"""A `/config` edit failing with an RPC error shows the server's own message on its status line."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ handshake = {
     },
 }
 
-capture_startup = False
 screen_contains = (
     "Failed to save auto_compact_threshold (temporary):",
     "Session is busy; retry when idle",

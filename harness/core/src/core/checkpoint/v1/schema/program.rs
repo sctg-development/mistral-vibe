@@ -14,8 +14,12 @@ pub(in crate::core::checkpoint::v1) enum CheckpointRuntimeBuiltinToolName {
     FileSystemReadFile,
     #[serde(rename = "file_system.write_file")]
     FileSystemWriteFile,
+    #[serde(rename = "file_system.edit")]
+    FileSystemEdit,
+    /// Deprecated: Actions that older Sessions issued before the edit tool
+    /// took the model's argument names. They restore as retired Actions.
     #[serde(rename = "file_system.search_replace")]
-    FileSystemSearchReplace,
+    DeprecatedFileSystemSearchReplace,
     #[serde(rename = "file_system.bash")]
     FileSystemBash,
     #[serde(rename = "skill.read")]
@@ -53,7 +57,10 @@ impl CheckpointRuntimeBuiltinToolName {
             RuntimeBuiltinToolName::SelfSleep => Self::SelfSleep,
             RuntimeBuiltinToolName::FileSystemReadFile => Self::FileSystemReadFile,
             RuntimeBuiltinToolName::FileSystemWriteFile => Self::FileSystemWriteFile,
-            RuntimeBuiltinToolName::FileSystemSearchReplace => Self::FileSystemSearchReplace,
+            RuntimeBuiltinToolName::FileSystemEdit => Self::FileSystemEdit,
+            RuntimeBuiltinToolName::DeprecatedFileSystemSearchReplace => {
+                Self::DeprecatedFileSystemSearchReplace
+            }
             RuntimeBuiltinToolName::FileSystemBash => Self::FileSystemBash,
             RuntimeBuiltinToolName::SkillRead => Self::SkillRead,
             RuntimeBuiltinToolName::ProcessStart => Self::ProcessStart,
@@ -81,7 +88,10 @@ impl CheckpointRuntimeBuiltinToolName {
             Self::SelfSleep => RuntimeBuiltinToolName::SelfSleep,
             Self::FileSystemReadFile => RuntimeBuiltinToolName::FileSystemReadFile,
             Self::FileSystemWriteFile => RuntimeBuiltinToolName::FileSystemWriteFile,
-            Self::FileSystemSearchReplace => RuntimeBuiltinToolName::FileSystemSearchReplace,
+            Self::FileSystemEdit => RuntimeBuiltinToolName::FileSystemEdit,
+            Self::DeprecatedFileSystemSearchReplace => {
+                RuntimeBuiltinToolName::DeprecatedFileSystemSearchReplace
+            }
             Self::FileSystemBash => RuntimeBuiltinToolName::FileSystemBash,
             Self::SkillRead => RuntimeBuiltinToolName::SkillRead,
             Self::ProcessStart => RuntimeBuiltinToolName::ProcessStart,
@@ -139,6 +149,7 @@ impl CheckpointExternalTool {
                 group_name,
                 tool_name,
                 arguments,
+                ..
             } => Self::Provided {
                 group_name: group_name.clone(),
                 tool_name: tool_name.clone(),
@@ -161,6 +172,7 @@ impl CheckpointExternalTool {
             } => ExternalTool::Provided {
                 group_name,
                 tool_name,
+                invocation_name,
                 arguments,
             },
         }
@@ -230,7 +242,11 @@ mod tests {
                 "file_system.write_file",
             ),
             (
-                CheckpointRuntimeBuiltinToolName::FileSystemSearchReplace,
+                CheckpointRuntimeBuiltinToolName::FileSystemEdit,
+                "file_system.edit",
+            ),
+            (
+                CheckpointRuntimeBuiltinToolName::DeprecatedFileSystemSearchReplace,
                 "file_system.search_replace",
             ),
             (

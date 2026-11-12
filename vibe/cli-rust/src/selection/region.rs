@@ -17,13 +17,10 @@ pub enum ScrollTarget {
     Trust,
 }
 
-/// Stable identity for each concurrently painted selectable region. A toast
-/// carries its own id, so a selection stays with that toast while the rack
-/// shifts it and dies with it.
+/// Stable identity for each concurrently painted selectable region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionId {
     Main,
-    Toast(u64),
     Loading,
     BottomApp,
 }
@@ -93,7 +90,6 @@ impl Region {
 pub fn get(app: &App, id: RegionId) -> Region {
     match id {
         RegionId::Main => app.view.selection_region,
-        RegionId::Toast(_) => app.view.toast_selection_region,
         RegionId::Loading => app.view.loading_selection_region,
         RegionId::BottomApp => app.view.bottom_app_selection_region,
     }
@@ -108,7 +104,10 @@ pub fn spans(app: &App, buf: &Buffer, chat: Rect) -> Vec<RowSpan> {
         return Vec::new();
     };
     if let Some(table_cell) = &selection.table_cell {
-        return table::screen_spans(app, table_cell, chat);
+        return table::screen_spans(app, table_cell, chat)
+            .into_iter()
+            .flat_map(|span| split(&app.view.selection_chrome, span))
+            .collect();
     }
     let region = get(app, selection.owner);
     let (area, origin) = match selection.scroll_target {
@@ -118,6 +117,12 @@ pub fn spans(app: &App, buf: &Buffer, chat: Rect) -> Vec<RowSpan> {
             (region.area, region.origin(ScrollTarget::None))
         }
         target => (chat, region.origin(target)),
+    };
+    let area = match app.view.bottom_app_selection_halves {
+        Some(halves) if selection.owner == RegionId::BottomApp => {
+            half(halves, selection.anchor.0, area)
+        }
+        _ => area,
     };
     let chrome = selection.owner == RegionId::Main;
     let gutters: &[RowSpan] = if chrome { &app.view.diff_hitmap } else { &[] };
@@ -201,7 +206,7 @@ pub fn extract_document(app: &App) -> Option<String> {
 /// True when a press at `at` anchors a selection: inside the region and on a
 /// cell some widget owns, since bare padding anchors nothing. The
 /// chrome map belongs to its region: the transcript's padding and the
-/// bottom-app box's prefixes and scrollbars; a toast publishes only its text rows.
+/// bottom-app box's prefixes and scrollbars.
 pub fn selectable(app: &App, at: (u16, u16), owner: RegionId) -> bool {
     if !get(app, owner).contains(at) {
         return false;
@@ -214,6 +219,16 @@ pub fn selectable(app: &App, at: (u16, u16), owner: RegionId) -> bool {
     !chrome
         .iter()
         .any(|&(y, x0, x1)| y == at.1 && at.0 >= x0 && at.0 <= x1)
+}
+
+/// The columns of `area` a selection keeps to in a box split in `halves`: those of the half its anchor `column` is in.
+fn half((left, right): (Rect, Rect), column: u16, area: Rect) -> Rect {
+    let half = if column < left.right() { left } else { right };
+    Rect {
+        x: half.x,
+        width: half.width,
+        ..area
+    }
 }
 
 /// Cut the cells a screen painted as chrome out of a row span.
@@ -249,13 +264,6 @@ pub fn extract(buf: &Buffer, spans: &[RowSpan]) -> String {
 pub fn folds(app: &App, id: RegionId) -> Folds {
     match id {
         RegionId::BottomApp => app.view.bottom_app_selection_folds.clone(),
-        RegionId::Toast(toast) => app
-            .view
-            .toast_folds
-            .iter()
-            .find(|(painted, _)| *painted == toast)
-            .map(|(_, folds)| folds.clone())
-            .unwrap_or_default(),
         RegionId::Main | RegionId::Loading => Folds::default(),
     }
 }

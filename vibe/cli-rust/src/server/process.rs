@@ -79,7 +79,6 @@ pub struct Client {
     deny_callbacks: Arc<AtomicBool>,
     active_session: ActiveSession,
     replay_drained: AtomicU64,
-    unsent_telemetry: AtomicU64,
     /// The app-server's own pid, from `initialize`'s `processId`; 0 before it.
     server_pid: AtomicU32,
 }
@@ -132,11 +131,17 @@ impl Client {
         mpsc::Receiver<Notification>,
         watch::Receiver<bool>,
     )> {
+        use crate::observability::sentry::{dsn, CRASH_REPORT_DSN_ENV};
         // The server mirrors its per-key token usage here for the exit summary.
         let usage_file = crate::session_exit::key_usage_file();
         let _ = std::fs::remove_file(&usage_file);
         let usage_file = usage_file.to_string_lossy().into_owned();
-        let env = [(crate::session_exit::KEY_USAGE_FILE_ENV_VAR, usage_file.as_str())];
+        let dsn = dsn();
+        let mut env: Vec<_> = dsn
+            .iter()
+            .map(|dsn| (CRASH_REPORT_DSN_ENV, dsn.as_str()))
+            .collect();
+        env.push((crate::session_exit::KEY_USAGE_FILE_ENV_VAR, usage_file.as_str()));
         let (child, stdin, stdout) = ChildHandle::launch(&launch, &[], &env)?;
         let (to_writer, writer_rx) = mpsc::unbounded_channel::<Option<String>>();
         // Single owner of stdin, so frame order follows event-handling order.
@@ -221,6 +226,11 @@ impl Client {
             .send(Some(frame))
             .map_err(|_| anyhow!("writer task gone"))?;
         Ok(())
+    }
+
+    /// Whether this client asked the server to stop, so its closing is expected.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Relaxed)
     }
 
     /// Close child stdin after queued frames, so the server sees EOF and exits.

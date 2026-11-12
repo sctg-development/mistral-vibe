@@ -14,14 +14,15 @@ contract does not import core.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from vibe.app_server._dispatch import RequestFailure
-from vibe.app_server._worktree_cleanup import worktree_cleanup
+from vibe.app_server._worktree_housekeeping import WorktreeHousekeeping
 from vibe.app_server.protocol import ProtocolErrorCode, SessionOptions
+from vibe.core.config.harness_files import HarnessFilesManager
 from vibe.core.git.errors import GitError
 from vibe.core.git.worktree import (
     ManagedWorktree,
@@ -31,6 +32,7 @@ from vibe.core.git.worktree import (
     WorktreeProgressCallback,
     WorktreeRepository,
 )
+from vibe.core.git.worktree.naming import worktree_name_from_text
 from vibe.core.paths import dedup_paths
 from vibe.core.session.worktrees import (
     CreateNamedWorktree,
@@ -41,6 +43,8 @@ from vibe.core.session.worktrees import (
     WorktreeRequest,
 )
 from vibe.core.telemetry.types import LaunchContext
+from vibe.core.trusted_folders import TrustedFoldersManager
+from vibe.core.utils.slug import create_slug
 
 type MoveSession = Callable[[SessionOptions], Awaitable[None]]
 type AnnounceWorktree = Callable[
@@ -72,15 +76,23 @@ class SessionWorktrees:
     """
 
     def __init__(
-        self, launch_context_getter: Callable[[], LaunchContext | None] | None = None
+        self,
+        launch_context_getter: Callable[[], LaunchContext | None] | None = None,
+        *,
+        housekeeping: WorktreeHousekeeping | None = None,
     ) -> None:
         self._lifecycle = WorktreeLifecycle(launch_context_getter=launch_context_getter)
+        # None reaps nothing: a released worktree waits for the next sweep.
+        self._housekeeping = housekeeping
 
     # -- where a session starts -------------------------------------------
 
     @staticmethod
     def resolve(
-        options: SessionOptions, suggested_name: str | None = None
+        options: SessionOptions,
+        suggested_name: str | None = None,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
     ) -> WorktreeResolution:
         """Turn a `worktree` request into the directory the session will run in."""
         request = _requested(options)
@@ -93,7 +105,7 @@ class SessionWorktrees:
                 ),
             )
         resolved = WorktreeLifecycle.resolve(
-            request, _base_cwd(options), suggested_name
+            request, _base_cwd(options), suggested_name, trust_store=trust_store
         )
         return _rewritten(options, resolved)
 
@@ -101,6 +113,9 @@ class SessionWorktrees:
         self,
         options: SessionOptions,
         on_progress: WorktreeProgressCallback | None = None,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
     ) -> WorktreeResolution:
         """Resolve off the event loop, cleaning up if the start is cancelled."""
         request = _requested(options)
@@ -122,13 +137,25 @@ class SessionWorktrees:
                         pending_hold.release()
                 raise
         resolved = await self._lifecycle.resolve_for_start(
-            request, _base_cwd(options), on_progress
+            request,
+            _base_cwd(options),
+            on_progress,
+            trust_store=trust_store,
+            copy_on_write=copy_on_write,
         )
         return _rewritten(options, resolved)
 
-    async def resolve_for_fork(self, options: SessionOptions) -> WorktreeResolution:
+    async def resolve_for_fork(
+        self,
+        options: SessionOptions,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
+    ) -> WorktreeResolution:
         """Isolate a managed source while retaining an unmanaged workspace."""
-        resolved = await self._lifecycle.resolve_fork(_base_cwd(options))
+        resolved = await self._lifecycle.resolve_fork(
+            _base_cwd(options), trust_store=trust_store, copy_on_write=copy_on_write
+        )
         if resolved.prepared is None:
             return WorktreeResolution(options=options)
         return _rewritten(options, resolved)
@@ -142,6 +169,9 @@ class SessionWorktrees:
         started_in: SessionOptions,
         announce: AnnounceWorktree | None = None,
         on_progress: WorktreeProgressCallback | None = None,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
     ) -> WorktreeResolution:
         """Raise the worktree the session asked for and move it in.
 
@@ -150,7 +180,9 @@ class SessionWorktrees:
         the project must refuse to run rather than quietly write it.
         """
         previous = _base_cwd(started_in)
-        resolution = await self.resolve_for_start(requested, on_progress)
+        resolution = await self.resolve_for_start(
+            requested, on_progress, trust_store=trust_store, copy_on_write=copy_on_write
+        )
         cwd = _base_cwd(resolution.options)
         announced = False
         try:
@@ -175,7 +207,7 @@ class SessionWorktrees:
             # holds it. Anything that fails before the announce, or fails on
             # its own, unwinds the start it created.
             with suppress(BaseException):
-                self.release(cwd, session_id)
+                self.release(cwd, session_id, trust_store=trust_store)
             if not (announced and isinstance(exc, asyncio.CancelledError)):
                 await self.cleanup(resolution)
             raise
@@ -184,8 +216,40 @@ class SessionWorktrees:
         # A session that started in the worktree it joins was never elsewhere.
         if not _same_directory(previous, cwd):
             with suppress(Exception):
-                self.release(previous, session_id)
+                self.release(previous, session_id, trust_store=trust_store)
         return resolution
+
+    async def raise_for_agent(
+        self,
+        base_cwd: Path,
+        name: str | None,
+        *,
+        branch: str | None = None,
+        prompt: str | None = None,
+        trust_store: TrustedFoldersManager | None = None,
+        copy_on_write: bool = False,
+    ) -> ResolvedWorktree:
+        """Raise a worktree the agent asked for.
+
+        On ``branch`` when given, else on a fresh branch named after ``name``,
+        or after ``prompt`` by the naming model when the agent gave no name.
+        """
+        request: WorktreeRequest = (
+            CreateNamedWorktree(
+                name=worktree_name_from_text(name or branch) or create_slug(),
+                branch=branch,
+                branch_off_in_use=True,
+            )
+            if branch is not None
+            else CreateWorktreeForPrompt(prompt=prompt, name=name)
+        )
+        return await self._lifecycle.resolve_for_start(
+            request, base_cwd, trust_store=trust_store, copy_on_write=copy_on_write
+        )
+
+    async def discard(self, resolved: ResolvedWorktree) -> None:
+        """Undo a ``raise_for_agent`` nobody came to hold."""
+        await self._lifecycle.cleanup(resolved.prepared, resolved.pending_hold)
 
     async def cleanup(self, resolution: WorktreeResolution) -> None:
         """Undo what this start did, and only that."""
@@ -193,9 +257,11 @@ class SessionWorktrees:
             resolution.prepared_worktree, resolution.pending_hold
         )
 
-    async def restore(self, cwd: Path) -> bool:
+    async def restore(
+        self, cwd: Path, *, trust_store: TrustedFoldersManager | None = None
+    ) -> bool:
         try:
-            return await self._lifecycle.restore(cwd)
+            return await self._lifecycle.restore(cwd, trust_store=trust_store)
         except GitError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, str(exc)) from exc
 
@@ -268,14 +334,21 @@ class SessionWorktrees:
     def root(cwd: Path) -> Path | None:
         return WorktreeLifecycle.root(cwd)
 
-    @staticmethod
-    def release(cwd: Path, session_id: str) -> None:
+    def release(
+        self,
+        cwd: Path,
+        session_id: str,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+    ) -> None:
         WorktreeLifecycle.release(cwd, session_id)
-        worktree_cleanup().schedule(cwd)
+        self.schedule_reap(cwd, trust_store=trust_store)
 
-    @staticmethod
-    def schedule_reap(cwd: Path) -> None:
-        worktree_cleanup().schedule(cwd)
+    def schedule_reap(
+        self, cwd: Path, *, trust_store: TrustedFoldersManager | None = None
+    ) -> None:
+        if self._housekeeping is not None:
+            self._housekeeping.schedule_reap(cwd, trust_store=trust_store)
 
 
 def _requested(options: SessionOptions) -> WorktreeRequest | None:
@@ -305,6 +378,32 @@ def _base_cwd(options: SessionOptions) -> Path:
 
 def _same_directory(left: Path, right: Path) -> bool:
     return left.expanduser().resolve() == right.expanduser().resolve()
+
+
+def session_harness_files(
+    harness_files: HarnessFilesManager, cwd: Path, roots: Iterable[Path]
+) -> HarnessFilesManager:
+    """The manager for a session at ``cwd`` with ``roots`` open beside it.
+
+    The cwd is never listed: a listed root's project files are read even when
+    untrusted, which the cwd's are not. A worktree the agent entered may be on
+    anyone's branch, so it is writable but its hooks, skills and AGENTS.md
+    are not read either.
+    """
+    here = cwd.expanduser().resolve()
+    listed: list[Path] = []
+    writable: list[Path] = []
+    for root in roots:
+        resolved = root.expanduser().resolve()
+        if resolved == here:
+            continue
+        (writable if ManagedWorktree.at(resolved) is not None else listed).append(
+            resolved
+        )
+    return replace(
+        harness_files.for_session(cwd, workspace_roots=listed),
+        writable_roots=tuple(writable),
+    )
 
 
 def _rewritten(

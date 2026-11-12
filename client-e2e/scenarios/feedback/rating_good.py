@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 handshake = {
     "feedback/record": {},
     "feedback/shouldShow": {"show": True, "snoozeDurationSeconds": 604800},
 }
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
-capture_steps = {1, 2, 3}
-settle_per_key = True
 
 timeline: Timeline = [
     "hi\r",
@@ -22,4 +19,5 @@ timeline: Timeline = [
     {"release": 3},
     "1",
     {"release": 2},
+    take_snapshot(),
 ]

@@ -107,6 +107,20 @@ impl NotificationState {
         self.ready_for_model = false;
         self.pending_bytes = 0;
         let notifications = std::mem::take(&mut self.pending);
+        // The Runtime's process record, not Core, keeps a delivered process
+        // notification from being submitted again.
+        let delivered_process_ids = notifications
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.notification.source,
+                    NotificationSource::BackgroundProcess { .. }
+                )
+            })
+            .map(|entry| entry.notification.id.as_str())
+            .collect::<BTreeSet<_>>();
+        self.received_ids
+            .retain(|id| !delivered_process_ids.contains(id.as_str()));
         self.retain_recent(recent_limit);
         notifications
     }
@@ -256,14 +270,12 @@ fn validate_stored_notification(notification: &Notification) -> Result<(), CoreE
 
 fn attributed_agent_context(notification: &Notification) -> Option<AgentMessageContext> {
     match &notification.source {
-        NotificationSource::AgentMessage {
-            sender_agent_path,
-            kind,
-        } => Some(AgentMessageContext::text(
-            sender_agent_path.clone(),
-            *kind,
-            notification.content.clone(),
-        )),
+        NotificationSource::AgentMessage { sender_agent_path } => {
+            Some(AgentMessageContext::Message {
+                sender_agent_path: sender_agent_path.clone(),
+                content: notification.content.clone(),
+            })
+        }
         NotificationSource::AgentResult {
             sender_agent_path,
             termination,

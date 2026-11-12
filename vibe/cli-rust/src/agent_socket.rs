@@ -25,7 +25,6 @@ pub fn usage_error(cli: &Cli, windows: bool) -> Option<String> {
         (cli.worktree.is_some(), "--worktree"),
         (!cli.add_dir.is_empty(), "--add-dir"),
         (cli.continue_session, "--continue"),
-        (cli.teleport, "--teleport"),
     ]
     .into_iter()
     .filter_map(|(set, flag)| set.then_some(flag))
@@ -67,7 +66,7 @@ pub fn server_path(
 /// The outcome a session open error names for a failed handshake.
 pub fn named_outcome(error: &RpcError) -> Option<RunOutcome> {
     let outcome = error.data.as_ref()?.get(OUTCOME_ERROR_FIELD)?;
-    serde_json::from_value(Value::clone(outcome)).ok()
+    serde::Deserialize::deserialize(outcome).ok()
 }
 
 /// The server's message, when one of `notifications` says it aborted the run.

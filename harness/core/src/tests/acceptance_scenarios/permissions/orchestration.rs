@@ -60,8 +60,8 @@ fn programmatic_orchestration_bypasses_ask_policy() {
             ),
         ),
         (
-            "tools.agents.interrupt({ name: 'alpha' })",
-            runtime_tool("agents.interrupt", json!({"name": "alpha"})),
+            "tools.agents.interrupt({ agent_path: 'alpha' })",
+            runtime_tool("agents.interrupt", json!({"agent_path": "alpha"})),
         ),
     ];
     for (call, expected) in cases {
@@ -92,7 +92,7 @@ fn programmatic_spawn_still_asks_for_approval() {
             turn_id,
             &completion,
             call_id,
-            "async function main() { return tools.agents.spawn({ name: 'child', message: 'work' }); }",
+            "async function main() { return tools.agents.spawn({ name: 'child', message: 'work', instructions: 'Work.' }); }",
             [expected_approval(&operation_id)],
         )
         .only_action();
@@ -102,7 +102,7 @@ fn programmatic_spawn_still_asks_for_approval() {
             approve(&approval),
             running(turn_id).dispatch(runtime_tool(
                 "agents.spawn",
-                json!({"name": "child", "message": "work"}),
+                json!({"name": "child", "message": "work", "instructions": "Work."}),
             )),
         )
         .only_action();

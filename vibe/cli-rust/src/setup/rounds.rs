@@ -66,17 +66,14 @@ pub async fn setup_round(
         let (client, child, mut notifs, _crash_rx) = match Client::spawn(launch.clone()).await {
             Ok(spawned) => spawned,
             Err(error) => {
-                // The Sentry bridge only carries ERROR records, so the
-                // startup window's own failure sites log their own fatal
-                // errors.
-                tracing::error!(vibe_boundary = "startup", fatal = true, "{error:#}");
+                crate::startup::failure::log_spawn(&error);
                 let _ = boot_tx.send(SetupBoot::Spawn(error.context("spawn app-server")));
                 return None;
             }
         };
         timings.record("child_spawned");
         // A dropped receiver would stop the reader on the first server notification.
-        tokio::spawn(async move { while notifs.recv().await.is_some() {} });
+        crate::work::spawn_daemon(async move { while notifs.recv().await.is_some() {} });
         let client = Arc::new(client);
         let _ = child_tx.send(child);
         // A failed initialize leaves no setup surface to fall back to, so
@@ -100,7 +97,10 @@ pub async fn setup_round(
         Some(client)
     };
     tokio::pin!(boot);
-    let mut wizard = OnboardingState::default();
+    let mut wizard = OnboardingState {
+        offers_provider_choice: true,
+        ..OnboardingState::default()
+    };
     let round = run_setup_round(
         terminal,
         app,

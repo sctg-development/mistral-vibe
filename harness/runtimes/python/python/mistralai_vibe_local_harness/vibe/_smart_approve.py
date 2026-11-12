@@ -19,7 +19,7 @@ protocol and the Runtime completion adapter. It never imports ``vibe``/``vibe.co
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum, auto
 import hashlib
@@ -33,32 +33,32 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, Field, JsonValue
 
 from mistralai_vibe_local_harness.protocol import (
-    RustCompletionResult,
     RustExternalToolCall,
     RustMessage,
     RustProvidedToolCall,
     RustRuntimeBuiltinToolCall,
     RustSystemMessage,
     RustTextContentBlock,
-    RustToolDefinition,
     RustToolMessage,
     RustUserMessage,
 )
 from mistralai_vibe_local_harness.session_protocol import JsonObject
 from mistralai_vibe_local_harness.vibe._completion import report_request_sent
-from mistralai_vibe_local_harness.vibe._credentials import (
-    ProviderAuthRequired,
-    ProviderCredentialSnapshot,
-)
+from mistralai_vibe_local_harness.vibe._credentials import ProviderAuthRequired
 from mistralai_vibe_local_harness.vibe._runtime_config import (
     LocalModelRoute,
     LocalRuntimeAdapterConfig,
+    ProviderRetry,
 )
-from mistralai_vibe_local_harness.vibe.adapters.generic import (
-    execute_generic_completion,
+from mistralai_vibe_local_harness.vibe._utility_completion import (
+    CompletionFn,
+    UtilityCompletionError,
+    execute_utility_completion,
 )
-from mistralai_vibe_local_harness.vibe.adapters.mistral import (
-    execute_mistral_completion,
+from mistralai_vibe_local_harness.vibe.completion_profile import (
+    REASONING_LOWEST,
+    ReasoningSupport,
+    find_known_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,16 +69,12 @@ DEFAULT_SMART_APPROVE_MODEL = "mistral-small-latest"
 # are serialized, so a turn with N non-precleared tools pays up to N of these back
 # to back -- keep it tight for an interactive TUI. A timeout maps to ERROR ->
 # escalate (never a silent allow), so a slow classifier degrades to a prompt, not a
-# hang. Overlapping/concurrent classification is a follow-up (see the design doc's
-# Known follow-ups).
+# hang.
 _CLASSIFY_TIMEOUT_S = 10.0
 _MAX_ARGS_CHARS = 3000
 _MAX_USER_MESSAGE_CHARS = 2000
 _CLARIFICATION_TOOL_NAME = "ask_user_question"
-_ERROR_REASON = (
-    "Smart approve could not verify this call is safe, so it was skipped. "
-    "Try a narrower, clearly safe alternative."
-)
+_MAX_ERROR_DETAIL_CHARS = 200
 
 # The taxonomies the classifier prompt is contracted to emit.
 _RISK_LEVELS = frozenset({"low", "medium", "high", "critical"})
@@ -146,6 +142,8 @@ class RiskClassificationResult(BaseModel):
     latency_ms: float = 0.0
     risk_level: str | None = None
     user_authorization: str | None = None
+    error: str | None = None
+    error_type: str | None = None
 
     @property
     def user_authorized(self) -> bool:
@@ -250,11 +248,9 @@ async def classify_tool_call(
     classifier to run. It defaults to the model classifier.
     """
     factory = classifier_factory or default_tool_risk_classifier
-    # Swap the classify route onto the fast model with deterministic decoding
-    # (temperature 0, thinking off, no top_p or output cap), independent of the
-    # session: a thinking session must not send a thinking request to the small
-    # classifier. config.model is re-derived from active_model in __post_init__, so
-    # model= alone would be ignored.
+    # Classify at temperature 0 with the least reasoning the classifier model takes;
+    # thinking="off" leaves a model with unknown levels without a reasoning field.
+    # config.model is re-derived from active_model, so model= alone is ignored.
     classifier = factory(
         replace(
             config,
@@ -265,10 +261,13 @@ async def classify_tool_call(
                 thinking="off",
                 top_p=None,
                 max_output_tokens=None,
+                reasoning=_classifier_reasoning(config.active_model, classify_model),
+                request_thinking=REASONING_LOWEST,
+                pricing=config.classifier_pricing,
             ),
         )
     )
-    result = await _classify_safely(classifier, request)
+    result = await _classify_safely(classifier, request, model=classify_model)
     logger.info(
         "smart_approve verdict=%s tier=%s tool=%s latency_ms=%.1f",
         result.verdict,
@@ -280,7 +279,10 @@ async def classify_tool_call(
 
 
 async def _classify_safely(
-    classifier: ToolRiskClassifierPort, request: RiskClassificationRequest
+    classifier: ToolRiskClassifierPort,
+    request: RiskClassificationRequest,
+    *,
+    model: str | None = None,
 ) -> RiskClassificationResult:
     """Run the classifier, mapping any failure to an ``ERROR`` verdict (which denies).
 
@@ -294,19 +296,71 @@ async def _classify_safely(
     the human's explicit session grants, both of which are keyed on something that
     does not silently change underneath them.
     """
+    start = time.perf_counter()
     try:
         result = await classifier.classify(request)
     except Exception as error:
+        latency_ms = (time.perf_counter() - start) * 1000
+        failure = _provider_failure(error)
+        described = describe_classifier_error(failure)
         logger.warning(
-            "smart_approve classifier error tool=%s: %s", request.tool_name, error
+            "smart_approve classifier error tool=%s model=%s latency_ms=%.0f error=%s",
+            request.tool_name,
+            model,
+            latency_ms,
+            described,
+            exc_info=error,
         )
         return RiskClassificationResult(
             verdict=ClassificationVerdict.ERROR,
             tier=ClassificationTier.FAST,
-            reason=_ERROR_REASON,
+            reason=_error_reason(error, described),
+            model=model,
+            latency_ms=latency_ms,
+            error=described,
+            error_type=type(failure).__name__,
         )
 
     return result
+
+
+def _classifier_reasoning(
+    session: LocalModelRoute, classify_model: str
+) -> ReasoningSupport | None:
+    # The session route's levels belong to the session model; another model uses
+    # its own known levels, or none.
+    if classify_model == session.model:
+        return session.reasoning
+    known = find_known_model(classify_model)
+    return None if known is None else known.reasoning
+
+
+def _error_reason(error: BaseException, described: str) -> str:
+    # The user approves this call by hand, so name what broke: a classifier that
+    # fails on every call otherwise looks like a cautious one.
+    detail = (
+        error.explanation
+        if isinstance(error, UtilityCompletionError) and error.explanation
+        else described
+    )
+    first_line = detail.splitlines()[0][:_MAX_ERROR_DETAIL_CHARS]
+    return (
+        f"Smart approve could not verify this call is safe (classifier error: "
+        f"{first_line}), so it was skipped. Try a narrower, clearly safe alternative."
+    )
+
+
+def _provider_failure(error: BaseException) -> BaseException:
+    # Telemetry tells failures apart by the adapter's error, not its wrapper.
+    if isinstance(error, UtilityCompletionError) and error.__cause__ is not None:
+        return error.__cause__
+    return error
+
+
+def describe_classifier_error(error: BaseException) -> str:
+    message = str(error).strip()
+    name = type(error).__name__
+    return f"{name}: {message}" if message else name
 
 
 # ---------------------------------------------------------------------------
@@ -314,28 +368,26 @@ async def _classify_safely(
 # ---------------------------------------------------------------------------
 
 
-class CompletionFn(Protocol):
-    """One completion adapter invocation, carrying the call's attribution.
-
-    The leading parameters are positional-only so any callable matching the
-    adapters' shape satisfies the protocol, whatever it names its arguments.
-    ``metadata`` is the Host's request metadata for the call, or ``None`` when
-    the Host provides no source. The generic adapters accept and drop it: their
-    provider APIs have no request-metadata channel, so a classify call on one
-    of them is attributed only through the Host's request-sent telemetry.
+class ClassifierTimeout(TimeoutError):
+    """``asyncio.wait_for`` cancels the completion mid-retry, leaving a bare
+    ``TimeoutError``; this keeps the provider failures it was retrying.
     """
 
-    async def __call__(
-        self,
-        messages: list[RustMessage],
-        tools: list[RustToolDefinition],
-        config: LocalRuntimeAdapterConfig,
-        credential: ProviderCredentialSnapshot,
-        route: LocalModelRoute,
-        /,
-        *,
-        metadata: Mapping[str, str] | None = None,
-    ) -> RustCompletionResult: ...
+    def __init__(self, timeout_s: float, retries: Sequence[ProviderRetry]) -> None:
+        self.timeout_s = timeout_s
+        self.retries = tuple(retries)
+        super().__init__(self._describe())
+
+    def _describe(self) -> str:
+        budget = f"no answer within {self.timeout_s:g}s"
+        if not self.retries:
+            return budget
+        last = self.retries[-1]
+        return (
+            f"{budget}; {len(self.retries)} provider "
+            f"{'retry' if len(self.retries) == 1 else 'retries'}, "
+            f"last {last.category} ({last.detail})"
+        )
 
 
 def _classifier_completion_config(
@@ -366,14 +418,6 @@ def _classifier_completion_config(
         project_id=route.project_id,
         region=route.region,
     )
-
-
-def _completion_for_backend(backend: str) -> CompletionFn:
-    if backend == "mistral":
-        return execute_mistral_completion
-    if backend == "generic":
-        return execute_generic_completion
-    raise ValueError(f"unsupported classifier completion backend: {backend}")
 
 
 class ModelRiskClassifier:
@@ -417,7 +461,6 @@ class ModelRiskClassifier:
             raise RuntimeError(
                 f"classifier credential unavailable: {credential.reason}"
             )
-        complete = self._complete or _completion_for_backend(run_config.backend)
         # The classify completion is attributed and counted like any other: the
         # Host's metadata source names it, and its request shape reaches the
         # Host telemetry sink, so it is never lumped in with the session's own
@@ -431,13 +474,35 @@ class ModelRiskClassifier:
             if run_config.completion_metadata is not None
             else None
         )
+        retries: list[ProviderRetry] = []
+
+        async def record_retry(retry: ProviderRetry | None) -> None:
+            if retry is not None:
+                retries.append(retry)
+
         start = time.perf_counter()
-        completion = await asyncio.wait_for(
-            complete(messages, [], run_config, credential, route, metadata=metadata),
-            timeout=self._timeout_s,
-        )
+        try:
+            reply = await asyncio.wait_for(
+                execute_utility_completion(
+                    messages,
+                    config=run_config,
+                    credential=credential,
+                    route=route,
+                    metadata=metadata,
+                    on_retry=record_retry,
+                    complete=self._complete,
+                ),
+                timeout=self._timeout_s,
+            )
+        except TimeoutError as error:
+            raise ClassifierTimeout(self._timeout_s, retries) from error
+        except UtilityCompletionError as error:
+            # A stalled stream is a timeout too, whichever side noticed it.
+            if isinstance(error.__cause__, TimeoutError):
+                raise ClassifierTimeout(self._timeout_s, retries) from error.__cause__
+            raise
         latency_ms = (time.perf_counter() - start) * 1000
-        return _parse_result(completion, model=route.model, latency_ms=latency_ms)
+        return _parse_result(reply.text, model=route.model, latency_ms=latency_ms)
 
 
 def default_tool_risk_classifier(
@@ -447,9 +512,9 @@ def default_tool_risk_classifier(
 
 
 def _parse_result(
-    completion: RustCompletionResult, *, model: str | None, latency_ms: float
+    text: str, *, model: str | None, latency_ms: float
 ) -> RiskClassificationResult:
-    content = _strip_code_fences(_completion_text(completion))
+    content = _strip_code_fences(text)
     parsed = json.loads(content)
     if not isinstance(parsed, dict):
         raise TypeError("classifier response must be a JSON object")
@@ -490,12 +555,6 @@ def _verdict(
     if risk_level == "high" and user_authorization not in _AUTHORIZED_LEVELS:
         return ClassificationVerdict.PROMPT
     return ClassificationVerdict.ALLOW
-
-
-def _completion_text(completion: RustCompletionResult) -> str:
-    return "".join(
-        part.text for part in completion.parts if isinstance(part, RustTextContentBlock)
-    )
 
 
 def _strip_code_fences(content: str) -> str:
@@ -734,6 +793,16 @@ Evaluate the REAL-WORLD IMPACT of the action, not just the surface text.
 - A generated local script is not low-risk just because its body is omitted. Inspect its content if available.
 - **Judge only the tool call in front of you.** Do not penalise a safe action because a risky action might follow later. `git add`, `git status`, `git log`, and `git commit` are always low/medium risk even if the user previously mentioned pushing to main — only the push itself is high risk. The same holds for intent: a user request to open a PR, push or deploy does not make a local edit, read or commit riskier, and a call that does not itself push, deploy or contact a remote service must not be scored as if it did.
 
+## Connected tools (MCP servers and connectors)
+
+A tool name outside the built-in groups (`file_system`, `process`, `self`, `skill`, `agents`, `subagent`) belongs to an MCP server or connector the user added to this session (for example `mcp_mistral.list_workflows` or `connector_github_app.pull_request_read`). The user configured that service, so calling it is not "accessing a service the user never mentioned" and does not cross a trust boundary on its own. Judge what the call does to the remote system:
+
+- **Reads are low risk**: calls that list, get, search, read, describe, query or wait on remote state. This holds even when the user's request is broad ("test the Mistral MCP", "check this PR").
+- **Secret names and metadata are reads.** `list_secrets`, `get_secret_metadata` or `list_connector_credentials` return names, scopes, versions and status, not the secret value, so they are **low**. Only a call that returns a secret's value is accessing secrets (**high**).
+- **Remote writes** change state other people may see or use: creating, updating, publishing, deploying, executing or signalling a workflow, sending a message. Score them **medium** when the user asked for that kind of change, otherwise **high**.
+- **Remote destruction is high**: deleting, terminating or stopping a run, unpublishing, revoking. It is **critical** when broad or irreversible, as with deleting many resources. Its `user_authorization` is `medium` or `high` only when the user named that destructive action ("stop that run", "delete the secret"). Asking to test, explore or "try a few flows" on a service authorizes reads, not destroying or stopping resources that already exist there: score it `unknown`.
+- Sending sensitive data (secrets, `.env` contents, private files) through a connected service is exfiltration, whatever the service.
+
 ## Risk taxonomy
 
 - **low**: routine, narrowly scoped, easy-to-reverse actions. No credential access, no untrusted network export, no security weakening, no data loss risk. Examples: reading files, listing dirs, grep, git status/log/diff/show/add, running tests, linting, formatting, git push to a personal feature branch.
@@ -811,6 +880,7 @@ __all__ = [
     "ClassificationTier",
     "ClassificationVerdict",
     "ClassifierFactory",
+    "ClassifierTimeout",
     "ModelRiskClassifier",
     "RiskClassificationRequest",
     "RiskClassificationResult",
@@ -818,5 +888,6 @@ __all__ = [
     "build_classification_request",
     "classify_tool_call",
     "default_tool_risk_classifier",
+    "describe_classifier_error",
     "project_checkouts",
 ]

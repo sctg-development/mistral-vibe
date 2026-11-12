@@ -85,7 +85,7 @@ expression: reviewable(snapshot)
           "### Sandbox capabilities and durability model",
           "",
           "- The sandbox is a replayable TypeScript workflow environment, not a general-purpose Node.js runtime. Use it for orchestration, tool-call wiring, and local data transformation.",
-          "- It supports standard JavaScript/TypeScript computation such as async/await, Promises, JSON, Array/Object/Map/Set operations, RegExp, URL parsing, TextEncoder/TextDecoder, and console output for debugging.",
+          "- It supports standard JavaScript/TypeScript computation such as async/await, Promises, JSON, Array/Object/Map/Set operations, RegExp, and console output for debugging.",
           "- It does not provide ambient filesystem access, Node.js packages, browser APIs, DOM APIs, or direct network I/O. Reach external systems only through the provided `tools.<group>.<function>` functions.",
           "- Execution may pause while tool calls are pending and later replay from the beginning. Local code can therefore run more than once; keep it to pure orchestration, pure data transforms, and tool-call wiring.",
           "- Time, randomness, and promise-selection APIs are recorded automatically and replay deterministically. This includes `Date()`, `new Date()`, `Date.now()`, `performance.now()`, `Math.random()`, `crypto.randomUUID()`, `crypto.getRandomValues()`, `Promise.race()`, and `Promise.any()`.",
@@ -98,7 +98,15 @@ expression: reviewable(snapshot)
           "- You MUST NOT call `main()` yourself - the sandbox calls it automatically",
           "- The result of the `main` function will be visible as a { type: \"success\", value } object.",
           "- The input must contain inline `code`.",
-          "- Tool calls may throw. Use `try/catch` or `.catch(...)` to recover or keep partial results; otherwise let errors propagate to the tool result.",
+          "- A failed tool call throws a `ToolError`, a subclass of `Error`: `name` is `\"ToolError\"`, `message` explains the failure, `code` is a stable error code, `tool` names the called function (`tools.<group>.<function>`), and `details` or `structuredContent` hold extra data when the tool gives it, such as a failed command's output. Codes include:",
+          "  - `invalid_arguments`: the arguments are invalid; the call did not run.",
+          "  - `permission_denied`, `tool_denied` or `policy_rejected`: a policy, the user or the file system refused the call.",
+          "  - `approval_failed`: nobody answered the approval request in time.",
+          "  - `tool_skipped`: a hook skipped the call.",
+          "  - `subagent_not_found`: no agent at that `agent_path` (for `interrupt`, no direct child there).",
+          "  - `ProgramBudgetExceeded`: the program's time budget ran out.",
+          "  - Any other code: the tool itself failed; `message` says why.",
+          "- Use `try/catch` or `.catch(...)` and branch on `error.code` to recover or keep partial results; otherwise let errors propagate to the tool result.",
           "- AVOID using console.log or console.error to read the output of functions. Rely on the main function's returned value instead. Only use console for debugging.",
           "- For independent calls, prefer `Promise.allSettled(...)`. Use `Promise.all(...)` only when all must succeed; avoid sequential awaits when calls can run concurrently.",
           "- You MUST NOT use `fetch()`, `setInterval()`, `atob()`, `btoa()`, `DOMParser`, `Buffer`, `require()`, `import()`, or `export` — they do not exist. Tool functions are already available under the `tools` namespace.",
@@ -108,7 +116,7 @@ expression: reviewable(snapshot)
           "",
           "### Available tool functions",
           "",
-          "Tool functions are available under `tools.<group>.<function>`; no imports needed.",
+          "Tool functions are available under `tools.<group>.<function>`; no imports needed. A tool that declares no group lives in the `client` group, so it is called as `tools.client.<function>`.",
           "",
           "Before calling an unfamiliar tool function, use `search_tool_functions` to load details for the exact function name. Use only documented function paths and argument shapes.",
           "",
@@ -147,7 +155,7 @@ expression: reviewable(snapshot)
     },
     {
       "name": "wait",
-      "description": "Wait for new input or the requested timeout. Call wait alone. Incoming messages arrive in normal model context, not in the result.",
+      "description": "Wait until new input arrives, such as a result from a child you started, a background task, a user follow up or until the timeout ends. wait returns as soon as input arrives, so use a timeout relevant to expected timeframe. Call wait alone. The input arrives in normal model context, not in the result.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -194,7 +202,7 @@ expression: reviewable(snapshot)
     },
     {
       "name": "write_file",
-      "description": "Create or overwrite a UTF-8 file.",
+      "description": "Create or overwrite a UTF-8 file. Line breaks in `content` can be `\\n`, `\\r\\n` or `\\r`: the file keeps the line endings of the file it replaces, and a new file uses the repository's line endings when they can be found, or the platform default otherwise. To change a file's line endings, run a command such as `unix2dos` or `dos2unix`.",
       "parameters": {
         "type": "object",
         "additionalProperties": false,
@@ -218,7 +226,7 @@ expression: reviewable(snapshot)
         "$multiline": [
           "Exact string replacement in a file.",
           "",
-          "Read the current file first. `old_string` must match exactly, including whitespace, indentation, and line endings. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.",
+          "Read the current file first. `old_string` must match exactly, including whitespace and indentation. Line endings don't need to match: the file keeps its own. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.",
           "",
           "Example:",
           "{\"file_path\":\"src/config.ts\",\"old_string\":\"const mode = \\\"old\\\";\",\"new_string\":\"const mode = \\\"new\\\";\",\"replace_all\":false}"
@@ -234,7 +242,7 @@ expression: reviewable(snapshot)
           },
           "old_string": {
             "type": "string",
-            "description": "Exact text to find, including whitespace, indentation, and line endings. It must occur exactly once unless `replace_all` is true.",
+            "description": "Exact text to find, including whitespace and indentation. It must occur exactly once unless `replace_all` is true.",
             "minLength": 1
           },
           "new_string": {
@@ -431,7 +439,7 @@ expression: reviewable(snapshot)
         "namespace": "file_system",
         "name": "write_file"
       },
-      "description": "Create or overwrite a UTF-8 file.",
+      "description": "Create or overwrite a UTF-8 file. Line breaks in `content` can be `\\n`, `\\r\\n` or `\\r`: the file keeps the line endings of the file it replaces, and a new file uses the repository's line endings when they can be found, or the platform default otherwise. To change a file's line endings, run a command such as `unix2dos` or `dos2unix`.",
       "input_schema": {
         "type": "object",
         "additionalProperties": false,
@@ -478,7 +486,7 @@ expression: reviewable(snapshot)
         "$multiline": [
           "Exact string replacement in a file.",
           "",
-          "Read the current file first. `old_string` must match exactly, including whitespace, indentation, and line endings. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.",
+          "Read the current file first. `old_string` must match exactly, including whitespace and indentation. Line endings don't need to match: the file keeps its own. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.",
           "",
           "Example:",
           "{\"file_path\":\"src/config.ts\",\"old_string\":\"const mode = \\\"old\\\";\",\"new_string\":\"const mode = \\\"new\\\";\",\"replace_all\":false}"
@@ -494,7 +502,7 @@ expression: reviewable(snapshot)
           },
           "old_string": {
             "type": "string",
-            "description": "Exact text to find, including whitespace, indentation, and line endings. It must occur exactly once unless `replace_all` is true.",
+            "description": "Exact text to find, including whitespace and indentation. It must occur exactly once unless `replace_all` is true.",
             "minLength": 1
           },
           "new_string": {
@@ -645,7 +653,7 @@ expression: reviewable(snapshot)
         "namespace": "self",
         "name": "sleep"
       },
-      "description": "Pause this agent execution for a bounded number of seconds while Runtime-owned background work continues.",
+      "description": "Pause the program execution for a bounded number of seconds. This cannot be interrupted by more input contrary to wait.",
       "input_schema": {
         "type": "object",
         "additionalProperties": false,
@@ -1065,7 +1073,7 @@ expression: reviewable(snapshot)
         "namespace": "agents",
         "name": "list_configs"
       },
-      "description": "List available named configurations, sorted by name. Omit config_name when spawning a generic child that inherits this agent's configuration.",
+      "description": "List available named agent configurations, sorted by name. Omit config_name to spawn a generic child: it has your configuration but not your instructions, so give it instructions.",
       "input_schema": {
         "type": "object",
         "additionalProperties": false,
@@ -1105,7 +1113,7 @@ expression: reviewable(snapshot)
         "namespace": "agents",
         "name": "list"
       },
-      "description": "List admitted direct children in creation order. Provisional spawns are not listed.",
+      "description": "List your direct children in creation order.",
       "input_schema": {
         "type": "object",
         "additionalProperties": false,
@@ -1216,31 +1224,65 @@ expression: reviewable(snapshot)
         "namespace": "agents",
         "name": "spawn"
       },
-      "description": "Create an independent child with fresh conversation and admit its first message, without waiting for completion. name is a single path segment unique for the lifetime of this parent Session and cannot be reused. Omit config_name to inherit this agent's configuration.",
+      "description": "Create an independent child with fresh conversation and send its first message. This does not block or wait for the agent to complete its instruction. name is a single path segment unique for the lifetime of this Session. A child without config_name does not get your instructions: give it instructions written for its task.",
       "input_schema": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "name": {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "^(?!\\.{1,2}$)[^/]+$"
-          },
-          "message": {
-            "type": "string",
-            "minLength": 1
-          },
-          "config_name": {
-            "type": [
-              "string",
-              "null"
+        "description": "A generic child, which needs `instructions`, or a child from `config_name`, which has its own.",
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The child's name: one path segment, without `/`, other than `.` or `..`. The child's agent path is your path followed by `/name`.",
+                "minLength": 1,
+                "pattern": "^(?!\\.{1,2}$)[^/]+$"
+              },
+              "message": {
+                "type": "string",
+                "description": "The child's task, sent as its first message. Every child needs one.",
+                "minLength": 1
+              },
+              "instructions": {
+                "type": "string",
+                "description": "The child's instructions, written for its task: it does not get yours.",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "name",
+              "message",
+              "instructions"
             ],
-            "minLength": 1
+            "description": "A generic child: it has your configuration but not your instructions."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "The child's name: one path segment, without `/`, other than `.` or `..`. The child's agent path is your path followed by `/name`.",
+                "minLength": 1,
+                "pattern": "^(?!\\.{1,2}$)[^/]+$"
+              },
+              "message": {
+                "type": "string",
+                "description": "The child's task, sent as its first message. Every child needs one.",
+                "minLength": 1
+              },
+              "config_name": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "name",
+              "message",
+              "config_name"
+            ],
+            "description": "A child from a named configuration: it has that configuration's instructions."
           }
-        },
-        "required": [
-          "name",
-          "message"
         ]
       },
       "output_schema": {
@@ -1266,13 +1308,14 @@ expression: reviewable(snapshot)
         "namespace": "agents",
         "name": "send_message"
       },
-      "description": "Send a message to an agent path. Admission does not imply consumption or a reply.",
+      "description": "Send a message to another agent by agent_path: absolute, such as /root/researcher, or relative to you, such as researcher for a direct child. A message to an agent whose Turn has ended starts a new Turn only when you may wake it: by default, only when you are its parent. Otherwise the result is `queued`: the agent reads the message only in its next Turn, so do not wait for its reply.",
       "input_schema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "agent_path": {
             "type": "string",
+            "description": "The recipient's agent path: absolute, such as `/root/researcher`, or relative to you, such as `researcher` for a direct child.",
             "minLength": 1
           },
           "message": {
@@ -1297,7 +1340,26 @@ expression: reviewable(snapshot)
             "required": [
               "type"
             ],
-            "additionalProperties": false
+            "additionalProperties": false,
+            "description": "The recipient received the message: it starts or joins the recipient's Turn."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "reason": {
+                "type": "string",
+                "description": "Why the message started no Turn."
+              },
+              "type": {
+                "const": "queued"
+              }
+            },
+            "required": [
+              "type",
+              "reason"
+            ],
+            "description": "The recipient is idle and this message cannot start its Turn. The message waits in its history until something else starts its next Turn, so no reply comes from it."
           }
         ]
       }
@@ -1308,18 +1370,27 @@ expression: reviewable(snapshot)
         "namespace": "agents",
         "name": "interrupt"
       },
-      "description": "Interrupt a direct child's exact current Turn without closing its Session.",
+      "description": "Interrupt a direct child's exact current Turn. This does not terminate its Session. The agent remains available for follow-ups. agent_path is the child's name or absolute path.",
       "input_schema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "name": {
+          "agent_path": {
             "type": "string",
+            "description": "A direct child's agent path: its name, such as `researcher`, or its absolute path, such as `/root/researcher`.",
+            "minLength": 1
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the Turn is interrupted. The child's Turn records it.",
             "minLength": 1
           }
         },
         "required": [
-          "name"
+          "agent_path"
         ]
       },
       "output_schema": {

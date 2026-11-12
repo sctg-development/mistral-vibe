@@ -1,5 +1,9 @@
 //! Workspace-trust gate shown before the session opens.
 
+use std::time::Duration;
+
+use crate::clock::UiInstant;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc;
 
@@ -10,6 +14,9 @@ use crate::server::WorkspaceTrustDetails;
 pub const TRUST_REPO: &str = "trust_repo";
 pub const TRUST_CWD: &str = "trust_cwd";
 pub const DECLINE: &str = "decline";
+
+/// Keys typed while the gate appears must not answer it unseen.
+const GRACE_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct TrustFolders {
@@ -24,6 +31,8 @@ pub struct TrustFolders {
     pub scroll_max: usize,
     /// Answers the handshake task waits on before it opens the session.
     pub tx: Option<mpsc::Sender<String>>,
+    /// Decisions are ignored until then; `None` accepts them at once.
+    pub accepts_at: Option<UiInstant>,
 }
 
 impl TrustFolders {
@@ -72,6 +81,8 @@ pub fn open(app: &mut App, details: WorkspaceTrustDetails) {
     );
     app.trust.scroll = 0;
     app.trust.scroll_max = 0;
+    let grace = crate::utils::timeout_or_env("VIBE_TEST_TRUST_GRACE_MS", GRACE_PERIOD);
+    app.trust.accepts_at = Some(crate::clock::now() + grace);
     app.trust.open = true;
 }
 
@@ -187,6 +198,13 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent) {
 
 /// Answer the handshake and close the gate, so the session can open.
 fn decide(app: &mut App, option: usize) {
+    if app
+        .trust
+        .accepts_at
+        .is_some_and(|at| crate::clock::now() < at)
+    {
+        return;
+    }
     let Some((decision, _)) = app.trust.options.get(option) else {
         return;
     };

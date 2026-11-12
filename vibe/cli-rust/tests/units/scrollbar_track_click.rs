@@ -1,6 +1,6 @@
 //! Scrollbar track clicks page toward the pointer and repeat while held.
 
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::MouseEventKind;
 use ratatui::layout::Rect;
 
 use vibe_rs::{
@@ -9,6 +9,8 @@ use vibe_rs::{
     mouse::MouseTarget,
     ui::scrollbar::{Side, State},
 };
+
+use crate::support::{down, drag, mouse, up};
 
 const AREA: Rect = Rect::new(0, 0, 11, 10);
 const BAR: Rect = Rect::new(10, 0, 1, 10);
@@ -23,6 +25,16 @@ fn click_above_thumb_pages_transcript_up() {
     assert_eq!(app.view.scroll_target, 10);
     assert_eq!(app.view.scroll, 0);
     assert!(!app.view.mouse.is_dragging_scrollbar());
+}
+
+#[test]
+fn a_track_click_under_a_pinned_prompt_pages_by_the_rows_it_leaves_visible() {
+    let mut app = transcript(90);
+    app.view.sticky_prompt = Some((0, 3));
+
+    click(&mut app, 0);
+
+    assert_eq!(app.view.scroll_target, 7);
 }
 
 #[test]
@@ -183,7 +195,7 @@ fn wheel_cancels_held_track_click() {
     register(&mut app, MouseTarget::Completion, 100, 10, 90);
 
     press(&mut app, 0);
-    mouse::route(&mut app, event(MouseEventKind::ScrollUp, BAR.x, 0));
+    mouse::route(&mut app, mouse(MouseEventKind::ScrollUp, BAR.x, 0));
 
     assert!(!mouse::is_track_paging(&app));
 }
@@ -198,8 +210,8 @@ fn track_side_and_page_follow_the_thumb() {
     assert_eq!(state.track_side((10, 10)), None);
     assert_eq!(state.track_side((10, 4)), Some(Side::Above));
     assert_eq!(state.track_side((10, 6)), Some(Side::Below));
-    assert_eq!(state.page(Side::Above), Some(40));
-    assert_eq!(state.page(Side::Below), Some(50));
+    assert_eq!(state.page(Side::Above, 0), Some(40));
+    assert_eq!(state.page(Side::Below, 0), Some(50));
     assert_eq!(state.track_side((10, 5)), None);
 }
 
@@ -221,29 +233,10 @@ fn tick(app: &mut App, count: usize) {
 }
 
 fn press(app: &mut App, row: u16) {
-    mouse::route(
-        app,
-        event(MouseEventKind::Down(MouseButton::Left), BAR.x, row),
-    );
+    mouse::route(app, down(BAR.x, row));
 }
 
 fn click(app: &mut App, row: u16) {
     press(app, row);
-    mouse::route(
-        app,
-        event(MouseEventKind::Up(MouseButton::Left), BAR.x, row),
-    );
-}
-
-fn drag(column: u16, row: u16) -> MouseEvent {
-    event(MouseEventKind::Drag(MouseButton::Left), column, row)
-}
-
-fn event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
+    mouse::route(app, up(BAR.x, row));
 }

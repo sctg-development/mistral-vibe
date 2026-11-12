@@ -165,6 +165,48 @@ async def test_a_cancelled_apply_leaves_the_write_parked() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_commit_cancelled_while_installing_stays_parked() -> None:
+    """*Prepare*: A commit Core took, whose install is cancelled.
+    *Do*: Cancel it while it installs.
+    *Assert*: Parked, so the next boundary pushes what the shared config
+    holds, and nothing adopted.
+    """
+    pytest.importorskip("mistralai_vibe_local_harness.vibe")
+    from vibe.app_server._deferred_config import DeferredConfiguration
+
+    installing = asyncio.Event()
+
+    async def derive() -> str:
+        return "shared"
+
+    async def push(value: str) -> None:
+        return None
+
+    async def build() -> str:
+        return "candidate"
+
+    async def install() -> bool:
+        installing.set()
+        await asyncio.Event().wait()
+        return True
+
+    deferred = DeferredConfiguration(
+        derive=derive,
+        push=push,
+        adopt=lambda value: pytest.fail("A cancelled install must not be adopted"),
+        turn_running=lambda: False,
+    )
+
+    committing = asyncio.create_task(deferred.commit(build, install=install))
+    await installing.wait()
+    committing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await committing
+
+    assert deferred.parked is True
+
+
+@pytest.mark.asyncio
 async def test_settle_waits_for_an_apply_already_in_flight() -> None:
     """*Prepare*: An apply that has cleared the parked flag and is mid-derive.
     *Do*: Settle again, as the next turn opening does.
@@ -288,3 +330,40 @@ async def test_settle_reports_whether_the_session_moved() -> None:
     assert landed is True
     assert nothing_to_land is False
     assert still_running is False
+
+
+@pytest.mark.asyncio
+async def test_a_change_core_refuses_is_dropped_not_parked() -> None:
+    """*Prepare*: A change parked by a running turn, which Core then refuses.
+    *Do*: Settle it once the turn ends.
+    *Assert*: The refusal reaches the caller and nothing stays parked. Core
+    refuses the same change until the context changes, so a parked one failed
+    every later boundary and no queued turn ever started.
+    """
+    pytest.importorskip("mistralai_vibe_local_harness.vibe")
+    from mistralai_vibe_local_harness.vibe import HarnessConfigurationRejectedError
+    from vibe.app_server._deferred_config import DeferredConfiguration
+
+    pushes: list[str] = []
+
+    async def derive() -> str:
+        return "picked"
+
+    async def push(value: str) -> None:
+        pushes.append(value)
+        raise HarnessConfigurationRejectedError("the context cannot fit")
+
+    deferred = DeferredConfiguration(
+        derive=derive,
+        push=push,
+        adopt=lambda value: pytest.fail("A refused push must not be adopted"),
+        turn_running=lambda: False,
+    )
+    deferred.park()
+
+    with pytest.raises(HarnessConfigurationRejectedError):
+        await deferred.settle()
+
+    assert deferred.parked is False
+    assert await deferred.settle() is False
+    assert pushes == ["picked"]

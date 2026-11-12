@@ -24,11 +24,22 @@ impl Client {
     /// frame to the returned receiver, so a test can assert what reached the wire.
     #[doc(hidden)]
     pub fn stub_answering() -> (Self, mpsc::UnboundedReceiver<Value>) {
+        Self::stub_recording(true)
+    }
+
+    /// A `Client` that never answers, handing each written frame to the returned receiver.
+    #[doc(hidden)]
+    pub fn stub_silent() -> (Self, mpsc::UnboundedReceiver<Value>) {
+        Self::stub_recording(false)
+    }
+
+    /// A `Client` handing each written frame to the returned receiver, and answering every request with `null` when `answering`.
+    fn stub_recording(answering: bool) -> (Self, mpsc::UnboundedReceiver<Value>) {
         let (to_writer, mut writer_rx) = mpsc::unbounded_channel::<Option<String>>();
         let (frames_tx, frames_rx) = mpsc::unbounded_channel();
         let pending = Pending::default();
         let answers = pending.clone();
-        tokio::spawn(async move {
+        crate::work::spawn_daemon(async move {
             while let Some(Some(frame)) = writer_rx.recv().await {
                 let Ok(frame) = serde_json::from_str::<Value>(&frame) else {
                     continue;
@@ -36,6 +47,7 @@ impl Client {
                 let responder = frame
                     .get("id")
                     .and_then(Value::as_u64)
+                    .filter(|_| answering)
                     .and_then(|id| answers.take(id));
                 let _ = frames_tx.send(frame);
                 if let Some(responder) = responder {
@@ -57,7 +69,6 @@ impl Client {
             deny_callbacks: Arc::new(AtomicBool::new(false)),
             active_session: Arc::new(Mutex::new(None)),
             replay_drained: AtomicU64::new(0),
-            unsent_telemetry: AtomicU64::new(0),
             server_pid: AtomicU32::new(0),
         }
     }

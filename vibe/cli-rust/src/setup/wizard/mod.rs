@@ -8,13 +8,15 @@ mod domain;
 pub mod flow;
 pub mod mouse;
 pub mod paint;
+pub mod provider_choice;
 pub mod screens;
 pub mod sign_in;
 pub mod submit;
 
+pub use self::provider_choice::ProviderChoice;
 pub use self::sign_in::{BrowserSignInState, SignInStep, SignInVariant};
 
-use std::time::Instant;
+use crate::clock::UiInstant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -29,6 +31,7 @@ pub const WELCOME_TEXT: &str = "Welcome to Mistral Vibe - Let's get you started!
 pub enum Screen {
     Welcome,
     ThemeSelection,
+    ProviderChoice,
     AuthMethod,
     SignInTarget,
     CustomDomain,
@@ -77,6 +80,10 @@ pub struct OnboardingState {
     /// against it.
     pub config: OnboardingContext,
     pub theme_index: usize,
+    /// Set by `--setup`: a non-Mistral provider also gets the Mistral setup.
+    pub offers_provider_choice: bool,
+    pub provider_choice: Option<ProviderChoice>,
+    pub provider_selected: usize,
     pub auth_method_selected: usize,
     pub sign_in_target_selected: usize,
     pub custom_domain: OnboardingInput,
@@ -92,7 +99,7 @@ pub struct OnboardingState {
     pub browser_sign_in: BrowserSignInState,
     pub welcome_char_index: usize,
     pub welcome_done: bool,
-    pub welcome_timer: Option<Instant>,
+    pub welcome_timer: Option<UiInstant>,
     /// The app-server boot is still converging: the welcome screen says so
     /// instead of inviting an Enter the gate holds (the boot can take a
     /// first-run venv sync).
@@ -136,6 +143,9 @@ impl Default for OnboardingState {
             config: context.clone(),
             context,
             theme_index,
+            offers_provider_choice: false,
+            provider_choice: None,
+            provider_selected: 0,
             auth_method_selected: 0,
             sign_in_target_selected: 0,
             custom_domain: OnboardingInput::default(),
@@ -166,6 +176,7 @@ pub enum Action {
     Cancel,
     SelectTheme(usize),
     SubmitApiKey(String),
+    CompleteOidc,
     StartBrowserSignIn,
     RetrySignIn,
     /// Switch to the API key screen, cancelling any in-flight sign-in flow
@@ -193,6 +204,15 @@ impl OnboardingState {
             &mut self.custom_domain_api
         }
     }
+
+    /// The screen before the auth choices: the provider choice when offered.
+    pub fn before_auth(&self) -> Screen {
+        if self.provider_choice.is_some() {
+            Screen::ProviderChoice
+        } else {
+            Screen::ThemeSelection
+        }
+    }
 }
 
 /// Seed the effective wizard context from the server's resolved view
@@ -201,6 +221,7 @@ impl OnboardingState {
 pub fn seed(state: &mut OnboardingState, status: &SetupStatus) {
     state.context = OnboardingContext::from_status(status);
     state.config = state.context.clone();
+    state.provider_choice = provider_choice::from_status(state, status);
     state.theme_index = resolve_initial_theme_index(&state.context.theme);
 }
 
@@ -212,7 +233,7 @@ pub fn open(state: &mut OnboardingState) {
     state.screen = Screen::Welcome;
     state.welcome_char_index = 0;
     state.welcome_done = false;
-    state.welcome_timer = Some(Instant::now());
+    state.welcome_timer = Some(crate::clock::now());
     // Replay captures settle mid-animation otherwise; show the full text.
     if crate::utils::is_replaying() {
         settle_welcome_typing(state);

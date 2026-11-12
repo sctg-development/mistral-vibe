@@ -22,8 +22,7 @@ pub fn start_compact(app: &mut App, client: &Arc<Client>, value: &str) {
         );
         return;
     }
-    // The /compact echo above is local; only server rows count as history
-    // (the server history has no command echo in it).
+    // Only server rows count as history; local rows are client notices.
     if app.view.transcript.lines().all(|entry| entry.local) {
         local::add_command_error(
             &mut app.view.transcript,
@@ -47,7 +46,7 @@ pub fn start_compact(app: &mut App, client: &Arc<Client>, value: &str) {
     let status_id = new_message_id();
     local::add_compact_status(&mut app.view.transcript, &status_id);
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = json!({
             "sessionId": session_id,
             "extraInstructions": extra,

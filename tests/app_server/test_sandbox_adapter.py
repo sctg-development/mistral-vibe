@@ -9,6 +9,7 @@ adapter records.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 from pathlib import Path
 import sys
@@ -39,6 +40,7 @@ from tests.stubs.local_sandbox import (
     run_turn,
 )
 from vibe.app_server._agents_md_hooks import agents_md_hook
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server._runtime import HarnessProcess
 from vibe.app_server.local import (
     ClientDescriptor,
@@ -71,7 +73,7 @@ async function main() {{
   }} catch (error) {{
     processes = "failed: " + error.message;
   }}
-  await tools.agents.spawn({{name: "reader", message: {json.dumps(_CHILD_TASK)}}});
+  await tools.agents.spawn({{name: "reader", instructions: "Follow the message.", message: {json.dumps(_CHILD_TASK)}}});
   // Spawn does not wait. Keep this Turn open until the child's Turn ends, so
   // the child runs before the headless run finishes.
   let child;
@@ -109,7 +111,7 @@ _SLOW_CHILD_TASK = "SLOW_CHILD_TASK"
 
 _SPAWN_PROGRAM = f"""
 async function main() {{
-  return await tools.agents.spawn({{name: "reader", message: {json.dumps(_SLOW_CHILD_TASK)}}});
+  return await tools.agents.spawn({{name: "reader", instructions: "Follow the message.", message: {json.dumps(_SLOW_CHILD_TASK)}}});
 }}
 """
 
@@ -136,7 +138,9 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return build_trusted_project(tmp_path / "project", monkeypatch)
 
 
-def test_a_sandboxed_session_never_loads_project_files(tmp_path: Path) -> None:
+def test_a_sandboxed_session_never_loads_project_files(
+    tmp_path: Path, process_services: ProcessServices
+) -> None:
     """*Prepare*: Project config, skills and hooks would come from the host's disk.
     *Do*: Build a sandboxed harness process that asks for them.
     *Assert*: Host project sources are refused; user-only sources are accepted.
@@ -145,9 +149,11 @@ def test_a_sandboxed_session_never_loads_project_files(tmp_path: Path) -> None:
 
     with pytest.raises(HeadlessUsageError, match="cannot load project files"):
         HarnessProcess(
-            HarnessFilesManager(sources=("user", "project")), sandbox=sandbox
+            HarnessFilesManager(sources=("user", "project")),
+            sandbox=sandbox,
+            services=process_services,
         )
-    HarnessProcess(sandbox=sandbox)
+    HarnessProcess(sandbox=sandbox, services=process_services)
 
 
 @pytest.mark.asyncio
@@ -194,14 +200,15 @@ async def test_the_agents_md_hook_reads_subdirectory_docs_through_the_adapter(
             {"path": "pkg/mod/AGENTS.md", "content": "# Module rules"},
         ),
         (
-            "file_system.search_replace",
+            "file_system.edit",
             {
                 "file_path": "pkg/mod/AGENTS.md",
-                "content": [{"old_str": "", "new_str": "# Module rules"}],
+                "old_string": "",
+                "new_string": "# Module rules",
             },
         ),
     ],
-    ids=["write_file", "search_replace"],
+    ids=["write_file", "edit"],
 )
 @pytest.mark.asyncio
 async def test_the_agents_md_hook_looks_in_each_sandbox_directory_once(
@@ -507,3 +514,42 @@ def _appended(result: RustPostToolCallHookResult) -> list[str]:
         for block in result.output.tool_result.content[1:]
         if isinstance(block, RustTextContentBlock)
     ]
+
+
+@pytest.mark.asyncio
+async def test_an_auto_approve_sandboxed_start_keeps_other_session_grants(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """*Prepare*: Another session's trust grant on the sandbox's workspace.
+    *Do*: Start a sandboxed session there with auto-approve, which rebuilds its
+    context for the auto-approve agent.
+    *Assert*: It runs that agent and the other session's grant stays: a
+    sandboxed build grants no trust, so the rebuild has none to revoke.
+    """
+    # Prepare
+    from vibe.core.trusted_folders import trusted_folders_manager
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(project.parent / "state"))
+    monkeypatch.setattr(trusted_folders_manager, "_session_trusted", [])
+    trusted_folders_manager.trust_for_session(project)
+    options = _options(project, RecordingSandbox(project))
+    options = replace(
+        options,
+        session_options=options.session_options.model_copy(
+            update={"agent": None, "auto_approve": True, "trust_workspace": True}
+        ),
+    )
+    host = LocalHarnessHost()
+
+    # Do
+    session = await host.start(options)
+    try:
+        agent = session.resources.agents.active.name
+        grants = trusted_folders_manager._session_trusted.count(str(project.resolve()))
+    finally:
+        await session.close()
+        await host.close()
+
+    # Assert
+    assert agent == BuiltinAgentName.AUTO_APPROVE
+    assert grants == 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Annotated, Literal, Self
 
@@ -9,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    InstanceOf,
     JsonValue,
     field_validator,
     model_validator,
@@ -16,14 +18,21 @@ from pydantic import (
 
 from mistralai_vibe_local_harness.protocol import (
     RustHarnessNotification,
+    RustModelFacts,
     RustRuntimeBuiltinToolName,
+)
+from mistralai_vibe_local_harness.vibe._mcp_models import _pattern_matches
+from mistralai_vibe_local_harness.vibe._runtime_config import (
+    LocalModelRoute,
+    LocalProviderRoute,
 )
 
 _SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 # Core rejects a whole configuration carrying more agent types than this.
 MAX_DECLARED_AGENT_TYPES = 128
-_MAX_INSTRUCTION_CHARS = 64 * 1024
+# Longest system prompt a declared agent type may carry.
+MAX_DECLARED_INSTRUCTION_CHARS = 64 * 1024
 
 
 class SubagentModel(BaseModel):
@@ -89,8 +98,6 @@ class SubagentSessionIdentity(_SessionIdentityModel):
     def validate_ownership(self) -> Self:
         if self.session_id in {self.root_session_id, self.parent_session_id}:
             raise ValueError("a subagent Session must have a distinct identity")
-        if self.parent_session_id != self.root_session_id:
-            raise ValueError("a depth-one subagent must be owned by its root Session")
         return self
 
 
@@ -192,6 +199,8 @@ class CreationCleanupPendingChild(SubagentModel):
 class TurnFailedChild(SubagentModel):
     type: Literal["turn_failed"] = "turn_failed"
     outcome: FailedChildTurnOutcome
+    # Written for other readers; whether the child takes messages is decided
+    # from ``outcome.failure.code``.
     reusable: bool
 
 
@@ -231,6 +240,11 @@ class ChildSessionRecord(SubagentModel):
     spawn_request_digest: str = Field(min_length=1)
     template_digest: str = Field(min_length=1)
     policy_ceiling_digest: str = Field(min_length=1)
+    # A generic child's own instructions, from its spawn; they replace its
+    # binding's, which are its parent's. ``None`` runs the binding's. The
+    # binding's digest still covers the parent's instructions, so a change to
+    # them rebinds the child, which then keeps these.
+    instructions: str | None = Field(default=None, min_length=1)
     depth: Literal[1] = 1
     state: ChildLifecycleState
     last_notified_generation: int = Field(default=0, ge=0)
@@ -479,6 +493,21 @@ class ResolvedSubagentPolicyCeiling(SubagentModel):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class DeclaredCompletionRoute:
+    """The model a declared agent type's children complete on.
+
+    ``provider`` is ``None`` when the session's own provider serves the model:
+    the child then shares the session's destination and credentials.
+    ``model_facts`` is what Core reads about the model: its context window,
+    where it compacts and the input it accepts. ``None`` keeps the session's.
+    """
+
+    model: LocalModelRoute
+    provider: LocalProviderRoute | None = None
+    model_facts: RustModelFacts | None = None
+
+
 class DeclaredAgentTypeProfile(SubagentModel):
     # ``tool_ceiling`` is a ceiling, never a grant: a builtin absent from it is denied
     # in the child, and one present in it is resolved against the parent's own mode by
@@ -489,12 +518,23 @@ class DeclaredAgentTypeProfile(SubagentModel):
     description: str = Field(min_length=1)
     profile_path: str = Field(min_length=1)
     instructions: str | None = Field(
-        default=None, min_length=1, max_length=_MAX_INSTRUCTION_CHARS
+        default=None, min_length=1, max_length=MAX_DECLARED_INSTRUCTION_CHARS
     )
     tool_ceiling: dict[RustRuntimeBuiltinToolName, Literal["allow", "ask", "deny"]] = (
         Field(default_factory=dict)
     )
+    # Like the Host's skill config: enabled wins, an invalid ``re:`` is skipped.
+    enabled_skills: list[str] = Field(default_factory=list)
+    disabled_skills: list[str] = Field(default_factory=list)
+    # The model its children run on; ``None`` runs them on the session's. The
+    # Host resolves it, as it resolves the session's own route.
+    completion: InstanceOf[DeclaredCompletionRoute] | None = None
     authority_digest: str = Field(min_length=1)
+
+    def allows_skill(self, name: str) -> bool:
+        if self.enabled_skills:
+            return _pattern_matches(name, tuple(self.enabled_skills))
+        return not _pattern_matches(name, tuple(self.disabled_skills))
 
     @field_validator("agent_type", "description", "profile_path")
     @classmethod
@@ -504,10 +544,18 @@ class DeclaredAgentTypeProfile(SubagentModel):
         return value
 
 
+class RejectedAgentType(SubagentModel):
+    # A declared agent type the host could not turn into a profile. It is never
+    # bound or advertised; spawning it reports ``reason`` rather than an unknown
+    # type, so the caller learns why the type is missing.
+    agent_type: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class SubagentLimits(SubagentModel):
     max_depth: Literal[1] = 1
-    max_children: int = Field(default=8, gt=0)
-    max_concurrent_turns: int = Field(default=4, gt=0)
+    max_children: int = Field(default=32, gt=0)
+    max_concurrent_turns: int = Field(default=32, gt=0)
     max_lifetime_names: int = Field(default=128, gt=0)
 
 

@@ -1,7 +1,6 @@
 //! Client-to-server prompt-queue requests: enqueue, replace and remove.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde_json::json;
 
@@ -105,7 +104,7 @@ pub fn resume(app: &mut App, client: &Arc<Client>) {
         return;
     };
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let _ = request(
             &client,
             method::TURN_QUEUE_RESUME,
@@ -162,7 +161,7 @@ fn remove_at(app: &mut App, client: &Arc<Client>, index: usize) {
         return;
     }
     let client = client.clone();
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let params = TurnQueueRemoveParams {
             session_id,
             queue_item_id,
@@ -188,15 +187,13 @@ fn send(app: &mut App, client: &Arc<Client>, message_id: String, text: String) {
     };
     if matches!(app.session.status, Status::Ready) && !app.compacting {
         app.set_status(Status::Generating {
-            since: Instant::now(),
+            since: crate::clock::now(),
         });
     }
-    let tx = app.queue.tx.clone();
-    let pending = app.commit_started();
     let client = client.clone();
     let pastes = app.chat_input.collapsed_pastes.clone();
-    tokio::spawn(async move {
-        let event = match prepare(&client, &session_id, &text, &existing_images).await {
+    crate::ui_event::spawn(app, async move {
+        match prepare(&client, &session_id, &text, &existing_images).await {
             Ok(mut prepared) => {
                 merge_edit_images(&mut prepared, &existing_images, &text);
                 let images = prepared.images.clone();
@@ -240,7 +237,6 @@ fn send(app: &mut App, client: &Arc<Client>, message_id: String, text: String) {
                 message_id,
                 error: Some(error),
             },
-        };
-        crate::input::deliver(tx, event, &pending).await;
+        }
     });
 }

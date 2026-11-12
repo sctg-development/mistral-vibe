@@ -7,6 +7,8 @@ use anyhow::{bail, Result};
 use serde_json::Value;
 
 use crate::cli::OutputFormat;
+use crate::run_export::RunWarning;
+use crate::server::HistoryEntry;
 use crate::transcript::apply_json_patch;
 
 const MAX_TRACKED_ENTRIES: usize = 512;
@@ -121,38 +123,40 @@ pub fn turn_entries(history: &Value, turn_id: Option<&str>) -> Value {
     )
 }
 
-/// Last assistant text from a history array: all text blocks joined with
-/// `\n\n`, like the server's `PublicMessageEntry.text` property.
-pub fn last_assistant_text(history: &Value) -> Option<String> {
-    let entries = history.as_array()?;
-    entries.iter().rev().find_map(|entry| {
-        if entry.get("type").and_then(Value::as_str) != Some("message") {
-            return None;
+/// The warning for a tool call the run denied, or None for any other entry.
+pub fn denied_tool_warning(entry: &Value) -> Option<RunWarning> {
+    let state = &entry["state"];
+    if entry["type"] != "effect" || state["error"]["code"] != "tool_denied" {
+        return None;
+    }
+    let tool = entry["detail"]["toolName"]
+        .as_str()
+        .or_else(|| entry["title"].as_str())?;
+    let message = state["error"]["message"].as_str();
+    let reason = match state["approvalSource"].as_str() {
+        // The approval prompt a headless run cannot show, answered "deny".
+        Some("user") if message == Some("Tool execution denied by approval callback") => {
+            "needs approval, which a headless run cannot give"
         }
-        if entry.get("role").and_then(Value::as_str) != Some("assistant") {
-            return None;
-        }
-        if sent_back_for_a_retry(entry) {
-            return None;
-        }
-        let blocks = entry.get("content").and_then(Value::as_array)?;
-        let text: Vec<String> = blocks
-            .iter()
-            .filter_map(|b| {
-                if b.get("type").and_then(Value::as_str) == Some("text") {
-                    b.get("text").and_then(Value::as_str).map(str::to_owned)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let joined = text.join("\n\n");
-        (!joined.is_empty()).then_some(joined)
+        _ => message.unwrap_or("denied"),
+    };
+    Some(RunWarning {
+        message: format!("Tool call denied: {tool} ({reason})"),
+        source: Some(tool.to_owned()),
     })
 }
 
-/// A draft a post_agent hook rejected: shown while it streamed, never the answer.
-fn sent_back_for_a_retry(entry: &Value) -> bool {
-    entry.pointer("/outcome/type").and_then(Value::as_str) == Some("discarded")
-        && entry.pointer("/outcome/cause").and_then(Value::as_str) == Some("retry")
+/// Last assistant text from a history array: all text blocks joined with
+/// `\n\n`, like the server's `PublicMessageEntry.text` property.
+pub fn last_assistant_text(history: &Value) -> Option<String> {
+    history.as_array()?.iter().rev().find_map(|entry| {
+        // A draft a post_agent hook rejected: shown while it streamed, never the answer.
+        let retried =
+            entry["outcome"]["type"] == "discarded" && entry["outcome"]["cause"] == "retry";
+        let HistoryEntry::Message(message) = HistoryEntry::from_value(entry) else {
+            return None;
+        };
+        let text = message.text("\n\n");
+        (message.role == "assistant" && !retried && !text.trim().is_empty()).then_some(text)
+    })
 }

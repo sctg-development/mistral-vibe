@@ -50,23 +50,29 @@ impl PyHarnessSession {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (config_json, checkpoint_json, resume_input_id = 0))]
+    #[pyo3(signature = (config_json, checkpoint_json, resume_input_id = 0, moved_from_json = None))]
     fn restore(
         py: Python<'_>,
         config_json: &str,
         checkpoint_json: &str,
         resume_input_id: u64,
+        moved_from_json: Option<&str>,
     ) -> PyResult<Self> {
         let engine = Arc::clone(&SHARED_ENGINE);
         let config_value = config_json.to_string();
         let checkpoint_value = checkpoint_json.to_string();
+        let moved_from_value = moved_from_json.map(str::to_string);
         let handle = py
             .detach({
                 let engine = Arc::clone(&engine);
                 move || {
                     let config = decode_json(&config_value, "harness config")?;
                     let checkpoint = crate::core::decode_checkpoint(&checkpoint_value)?;
-                    engine.restore(config, checkpoint, resume_input_id)
+                    let moved_from = moved_from_value
+                        .as_deref()
+                        .map(|value| decode_json(value, "harness config"))
+                        .transpose()?;
+                    engine.restore(config, checkpoint, resume_input_id, moved_from)
                 }
             })
             .map_err(PyValueError::new_err)?;
@@ -108,12 +114,12 @@ impl PyHarnessSession {
         .map_err(PyValueError::new_err)
     }
 
-    fn export_conversation(&self, py: Python<'_>, fork_turns: &str) -> PyResult<String> {
+    fn export_conversation(&self, py: Python<'_>, context: &str) -> PyResult<String> {
         let engine = Arc::clone(&self.engine);
         let handle = self.required_handle()?;
-        let fork_turns = fork_turns.to_owned();
+        let context = context.to_owned();
         py.detach(move || {
-            let conversation = engine.export_conversation(handle, &fork_turns)?;
+            let conversation = engine.export_conversation(handle, &context)?;
             encode_json(&conversation)
         })
         .map_err(PyValueError::new_err)
@@ -146,13 +152,133 @@ impl Drop for PyHarnessSession {
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyHarnessSession>()?;
-    module.add_function(wrap_pyfunction!(hook_tool_catalog, module)?)
+    module.add_function(wrap_pyfunction!(hook_tool_catalog, module)?)?;
+    module.add_function(wrap_pyfunction!(direct_tool_key, module)?)?;
+    module.add_function(wrap_pyfunction!(process_tools_timeout_advice, module)?)?;
+    module.add_function(wrap_pyfunction!(process_tools_shell_guidance, module)?)?;
+    module.add_function(wrap_pyfunction!(restored_bash_call, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        unmatched_permission_tool_patterns,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(validate_permission_pattern, module)?)
+}
+
+#[pyfunction]
+#[pyo3(signature = (pattern, *, arguments = false))]
+fn validate_permission_pattern(pattern: &str, arguments: bool) -> PyResult<()> {
+    crate::core::validate_permission_pattern(pattern, arguments).map_err(PyValueError::new_err)
+}
+
+/// The `tools` patterns of a permission policy that name a namespace of
+/// `tool_ids` but match none of its tools; see `unmatched_tool_patterns` on
+/// Core's permission policy. `policy_json` holds a Core permission policy.
+#[pyfunction]
+#[pyo3(signature = (policy_json, *, tool_ids, open_namespaces))]
+fn unmatched_permission_tool_patterns(
+    policy_json: &str,
+    tool_ids: Vec<String>,
+    open_namespaces: Vec<String>,
+) -> PyResult<String> {
+    let policy: crate::core::PermissionPolicy =
+        decode_json(policy_json, "permission policy").map_err(PyValueError::new_err)?;
+    encode_json(&crate::core::unmatched_permission_tool_patterns(
+        &policy,
+        &tool_ids,
+        &open_namespaces,
+    ))
+    .map_err(PyValueError::new_err)
+}
+
+/// A bash call a restored Session saved, held to the Host's current timeouts
+/// before it runs, as Core holds a fresh call; see `restored_bash_call` in
+/// Core's file system feature. `arguments_json` holds the call's arguments and
+/// `bash_timeout_json` the Host's `settings.tools.bash_timeout`, or `None`
+/// when it sets none. Gives the arguments with the default filled in, or `None`
+/// when they stay as they are, and the failure result of a call above the
+/// maximum, or `None` when the call may run.
+#[pyfunction]
+#[pyo3(signature = (arguments_json, *, bash_timeout_json))]
+fn restored_bash_call(
+    arguments_json: &str,
+    bash_timeout_json: Option<&str>,
+) -> PyResult<(Option<String>, Option<String>)> {
+    use crate::core::{BashTimeout, BashTimeoutSettings};
+
+    let arguments: serde_json::Value =
+        decode_json(arguments_json, "bash arguments").map_err(PyValueError::new_err)?;
+    let settings = bash_timeout_json
+        .map(|value| decode_json::<BashTimeoutSettings>(value, "bash timeout"))
+        .transpose()
+        .map_err(PyValueError::new_err)?;
+    let timeout = BashTimeout::from_settings(settings.as_ref());
+    match crate::core::restored_bash_call(arguments.clone(), timeout) {
+        Ok(held) if held == arguments => Ok((None, None)),
+        Ok(held) => Ok((
+            Some(encode_json(&held).map_err(PyValueError::new_err)?),
+            None,
+        )),
+        Err(refusal) => Ok((
+            None,
+            Some(encode_json(&refusal).map_err(PyValueError::new_err)?),
+        )),
+    }
 }
 
 #[pyfunction]
 fn hook_tool_catalog(config_json: &str) -> PyResult<String> {
     let config = decode_json(config_json, "harness config").map_err(PyValueError::new_err)?;
     encode_json(&crate::core::hook_tool_catalog(&config)).map_err(PyValueError::new_err)
+}
+
+/// The key of the tool a top-level model call named `name` reaches under the
+/// config, as JSON, or `None` when no top-level tool has that name. A Runtime
+/// uses it to name a call that Core refused itself.
+#[pyfunction]
+fn direct_tool_key(config_json: &str, name: &str) -> PyResult<Option<String>> {
+    let config = decode_json(config_json, "harness config").map_err(PyValueError::new_err)?;
+    crate::core::direct_tool_key(&config, name)
+        .map(|key| encode_json(&key).map_err(PyValueError::new_err))
+        .transpose()
+}
+
+/// What ends the note on a bash command stopped at its timeout, or `None`
+/// where the process tools are not available; see `background_advice` on
+/// `CommandEnvironment`. `command_environment` is its `mode`.
+#[pyfunction]
+#[pyo3(signature = (*, background_processes, command_environment))]
+fn process_tools_timeout_advice(
+    background_processes: bool,
+    command_environment: &str,
+) -> PyResult<Option<&'static str>> {
+    Ok(
+        background_advice(background_processes, command_environment)?
+            .map(|advice| advice.timeout_note_advice),
+    )
+}
+
+/// The shell guidance of a Vibe Code prompt, or `None` where the process tools
+/// are not available; see `process_tools_timeout_advice`.
+#[pyfunction]
+#[pyo3(signature = (*, background_processes, command_environment))]
+fn process_tools_shell_guidance(
+    background_processes: bool,
+    command_environment: &str,
+) -> PyResult<Option<&'static str>> {
+    Ok(
+        background_advice(background_processes, command_environment)?
+            .map(|advice| advice.shell_guidance),
+    )
+}
+
+fn background_advice(
+    background_processes: bool,
+    command_environment: &str,
+) -> PyResult<Option<crate::core::tools::command_environment::BackgroundAdvice>> {
+    let environment: crate::core::tools::command_environment::CommandEnvironment =
+        serde_json::from_value(serde_json::json!({ "mode": command_environment }))
+            .map_err(|error| PyValueError::new_err(format!("command environment: {error}")))?;
+    Ok(environment.background_advice(background_processes))
 }
 
 fn decode_json<'a, T: Deserialize<'a>>(value: &'a str, label: &str) -> Result<T, String> {

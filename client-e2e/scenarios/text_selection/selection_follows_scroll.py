@@ -20,7 +20,7 @@ release.
 from __future__ import annotations
 
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 # Force the OSC 52 copy path so the copy notice is deterministic across hosts.
 env = {"SSH_TTY": "/dev/pts/0"}
@@ -54,7 +54,5 @@ timeline: Timeline = [
     _SELECT,
     _SHIFT_UP * 3,
     _SHIFT_DOWN * 3,
+    take_snapshot(),
 ]
-
-# Each key must land on a settled UI: batching changes the outcome here.
-settle_per_key = True

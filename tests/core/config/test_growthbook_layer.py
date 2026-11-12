@@ -347,13 +347,39 @@ async def test_maps_smart_approve_available_experiment_to_config_field() -> None
 
 
 @pytest.mark.asyncio
-async def test_maps_smart_approve_default_experiment_to_config_field() -> None:
+@pytest.mark.parametrize("agent", ["ask", "accept-edits", "smart-approve"])
+async def test_maps_default_agent_experiment_to_config_field(agent: str) -> None:
     layer = GrowthbookLayer()
-    layer.set_variants({ExperimentName.SMART_APPROVE_DEFAULT.value: "on"})
+    layer.set_variants({ExperimentName.DEFAULT_AGENT.value: agent})
 
     data = await layer.load()
 
-    assert data.model_dump() == {"smart_approve_default": True}
+    assert data.model_dump() == {"default_agent": agent}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "variant", ["", "auto-approve", "plan", "explore", "lean", "nope", True]
+)
+async def test_default_agent_experiment_ignores_values_it_may_not_roll_out(
+    variant: object,
+) -> None:
+    layer = GrowthbookLayer()
+    layer.set_variants({ExperimentName.DEFAULT_AGENT.value: variant})
+
+    data = await layer.load()
+
+    assert data.model_dump() == {}
+
+
+@pytest.mark.asyncio
+async def test_maps_mistral_mcp_connector_experiment_to_config_field() -> None:
+    layer = GrowthbookLayer()
+    layer.set_variants({ExperimentName.MISTRAL_MCP_CONNECTOR.value: True})
+
+    data = await layer.load()
+
+    assert data.model_dump() == {"experimental_enable_mistral_mcp_connector": True}
 
 
 @pytest.mark.asyncio
@@ -377,12 +403,12 @@ async def test_boolean_false_variant_leaves_smart_approve_unset() -> None:
 
 
 @pytest.mark.asyncio
-async def test_boolean_default_value_enables_smart_approve_end_to_end() -> None:
+async def test_default_value_rollout_sets_smart_approve_end_to_end() -> None:
     response = EvalResponse.model_validate({
         "features": {
             ExperimentName.SMART_APPROVE.value: {"defaultValue": True, "rules": []},
-            ExperimentName.SMART_APPROVE_DEFAULT.value: {
-                "defaultValue": True,
+            ExperimentName.DEFAULT_AGENT.value: {
+                "defaultValue": "smart-approve",
                 "rules": [],
             },
         }
@@ -394,7 +420,7 @@ async def test_boolean_default_value_enables_smart_approve_end_to_end() -> None:
 
     assert data.model_dump() == {
         "smart_approve_available": True,
-        "smart_approve_default": True,
+        "default_agent": "smart-approve",
     }
 
 
@@ -446,6 +472,73 @@ async def test_ignores_registry_skills_off_variant() -> None:
     data = await layer.load()
 
     assert data.model_dump() == {}
+
+
+@pytest.mark.asyncio
+async def test_selected_toml_disables_the_growthbook_model_catalog(
+    config_dir: Path,
+) -> None:
+    config_path = config_dir / "config.toml"
+    config_path.write_text(
+        "experimental_enable_model_catalog = false\n", encoding="utf-8"
+    )
+    orchestrator = await build_default_orchestrator()
+    layer = _require_growthbook_layer(orchestrator.get_layer(GrowthbookLayer.NAME))
+    layer.set_variants({ExperimentName.MODEL_CATALOG.value: True})
+
+    await orchestrator.reload()
+
+    assert orchestrator.config.experimental_enable_model_catalog is False
+
+
+@pytest.mark.asyncio
+async def test_growthbook_enables_the_model_catalog() -> None:
+    orchestrator = await build_default_orchestrator()
+    layer = _require_growthbook_layer(orchestrator.get_layer(GrowthbookLayer.NAME))
+    layer.set_variants({ExperimentName.MODEL_CATALOG.value: True})
+
+    await orchestrator.reload()
+
+    assert orchestrator.config.experimental_enable_model_catalog is True
+
+
+def _model_experiments(catalog_variant: object) -> dict[str, object]:
+    return {
+        ExperimentName.CLI_MODEL_ROUTING.value: json.dumps({"active_model": "glm-5-2"}),
+        ExperimentName.CLI_EXTRA_MODELS.value: json.dumps([
+            {"name": "glm-5-3", "provider": "mistral", "alias": "glm-5-3"}
+        ]),
+        ExperimentName.REGISTRY_SKILLS.value: True,
+        ExperimentName.MODEL_CATALOG.value: catalog_variant,
+    }
+
+
+@pytest.mark.parametrize("variant", [True, "on"])
+@pytest.mark.asyncio
+async def test_catalog_flag_drops_only_the_model_experiments(variant: object) -> None:
+    layer = GrowthbookLayer()
+    layer.set_variants(_model_experiments(variant))
+
+    data = await layer.load()
+
+    assert data.model_dump() == {
+        "experimental_enable_model_catalog": True,
+        "experimental_enable_registry_skills": True,
+    }
+
+
+@pytest.mark.parametrize("variant", [False, "off"])
+@pytest.mark.asyncio
+async def test_catalog_flag_off_keeps_the_model_experiments(variant: object) -> None:
+    layer = GrowthbookLayer()
+    layer.set_variants(_model_experiments(variant))
+
+    data = await layer.load()
+
+    dumped = data.model_dump()
+    assert dumped["routed_default_model"] == "glm-5-2"
+    assert "glm-5-3" in dumped["models"]
+    assert "experimental_enable_model_catalog" not in dumped
 
 
 @pytest.mark.asyncio
@@ -891,7 +984,7 @@ async def test_copied_orchestrator_keeps_growthbook_variant_after_reload() -> No
     copied = orchestrator.copy()
 
     failures = await copied.set_field(
-        "/include_model_info",
+        "/include_commit_signature",
         False,
         reason="exercise copied orchestrator reload",
         target_layer=OverridesLayer.NAME,
@@ -913,3 +1006,52 @@ async def test_routing_accepts_json_string_variant() -> None:
     data = await layer.load()
 
     assert data.model_dump()["routed_default_model"] == "routed-x"
+
+
+_SESSION_API_ENV = "VIBE_EXPERIMENTAL_LOCAL_RUNTIME_SESSION_API"
+
+
+async def _session_api_switch(
+    monkeypatch: pytest.MonkeyPatch, *, flag: object | None, env: str | None
+) -> bool:
+    if env is None:
+        monkeypatch.delenv(_SESSION_API_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_SESSION_API_ENV, env)
+    orchestrator = await build_default_orchestrator()
+    layer = _require_growthbook_layer(orchestrator.get_layer(GrowthbookLayer.NAME))
+    if flag is not None:
+        layer.set_variants({ExperimentName.LOCAL_RUNTIME_SESSION_API.value: flag})
+    await orchestrator.reload()
+    return orchestrator.config.experimental_local_runtime_session_api
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("flag", "env", "expected"),
+    [
+        (None, None, False),
+        (True, None, True),
+        ("on", None, True),
+        (False, None, False),
+        (True, "false", False),
+        (False, "true", True),
+        (None, "true", True),
+    ],
+)
+async def test_the_session_api_switch_follows_its_flag_unless_the_environment_sets_it(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: object | None,
+    env: str | None,
+    expected: bool,
+) -> None:
+    """*Prepare*: The migration flag and its environment variable, each set or not.
+    *Do*: Resolve the configuration.
+    *Assert*: The switch is off by default, follows the flag, and follows the
+        environment variable whenever it is set.
+    """
+    # Do
+    switch = await _session_api_switch(monkeypatch, flag=flag, env=env)
+
+    # Assert
+    assert switch is expected

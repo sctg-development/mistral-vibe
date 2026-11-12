@@ -91,7 +91,7 @@ impl CandidateMessage {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolOutcome {
     Success,
@@ -106,6 +106,11 @@ pub(crate) enum Message {
     },
     User {
         content: Vec<ContentBlock>,
+        /// Model-only context that the Runtime gave with a Turn start or a
+        /// steer, not the user's own words. A completion adapter may present it
+        /// apart from the user's text.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        context: bool,
     },
     Assistant {
         content: Vec<AssistantPart>,
@@ -145,7 +150,17 @@ impl Message {
     }
 
     pub(crate) fn user(content: Vec<ContentBlock>) -> Self {
-        Self::User { content }
+        Self::User {
+            content,
+            context: false,
+        }
+    }
+
+    pub(crate) fn context(content: Vec<ContentBlock>) -> Self {
+        Self::User {
+            content,
+            context: true,
+        }
     }
 
     pub(crate) fn user_text(content: impl Into<String>) -> Self {
@@ -220,7 +235,7 @@ impl Message {
                     ));
                 }
             }
-            Self::User { content } => {
+            Self::User { content, .. } => {
                 validate_non_empty_content(content, "user message content")?;
             }
             Self::Assistant { content } => {

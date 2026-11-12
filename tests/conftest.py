@@ -1,20 +1,32 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator
+import functools
 import os
 from pathlib import Path
 import sys
 import time
+import tomllib
 from types import SimpleNamespace
 from typing import Any
 
+import httpcore2
 import keyring
 from keyring.backend import KeyringBackend
 import keyring.errors
 import pytest
+import pytest_asyncio
+import respx.mocks
 import tomli_w
 
 from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+from tests.stubs.process_services import (
+    FakeModelCatalogServer,
+    FakeOrgConfigServer,
+    fake_process_services,
+)
+from tests.stubs.respx_httpx2 import HTTPCore2Mocker
+from vibe.app_server._process_services import ProcessServices
 from vibe.core.config import (
     SessionLoggingConfig,
     VibeConfigSchema,
@@ -27,15 +39,20 @@ from vibe.core.config.harness_files import (
     reset_harness_files_manager,
 )
 from vibe.core.config.orchestrator import ConfigOrchestrator
-from vibe.core.experiments.wait import reset_experiments_eval_failed
-from vibe.core.model_catalog.wait import reset_model_catalog_failed
 from vibe.core.utils.concurrency import run_sync
-from vibe.setup.onboarding.theme import resolve_auto_theme
+from vibe.setup.auth._oidc_credentials import clear_oidc_token_cache
 from vibe.utils import keyring as keyring_utils
 from vibe.utils.platform import resolve_windows_shell
 
+respx.mocks.DEFAULT_MOCKER = HTTPCore2Mocker.name
+
 _TESTS_ROOT = Path(__file__).parent
 _HOST_PLATFORM = sys.platform
+# The `VIBE_<FIELD>` names the environment config layer reads; it also reads
+# `VIBE_<FIELD>__<SUBFIELD>`, case-insensitively.
+_CONFIG_ENV_NAMES = frozenset(
+    f"VIBE_{field.upper()}" for field in VibeConfigSchema.model_fields
+)
 _LOCAL_XDIST_GROUPS = {
     Path("core/test_history_properties.py"): "history_properties",
     Path("core/test_system_prompt.py"): "git_processes",
@@ -47,15 +64,18 @@ _LOCAL_XDIST_GROUPS = {
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     local_run = not os.environ.get("BUILDKITE") and not os.environ.get("GITHUB_ACTIONS")
-    for item in items:
-        try:
-            relative_path = Path(item.path).relative_to(_TESTS_ROOT)
-        except ValueError:
+    relative_paths = [_relative_test_path(item) for item in items]
+    # Serialize e2e CLI trees only beside the unit suite, where they would overload the machine.
+    serialize_e2e = any(
+        path is not None and path.parts[0] != "e2e" for path in relative_paths
+    )
+    for item, relative_path in zip(items, relative_paths, strict=True):
+        if relative_path is None:
             continue
         if local_run and (group := _LOCAL_XDIST_GROUPS.get(relative_path)):
             item.add_marker(pytest.mark.xdist_group(name=group))
             continue
-        if relative_path.parts[0] != "e2e":
+        if relative_path.parts[0] != "e2e" or not serialize_e2e:
             continue
         if relative_path.name == "test_mock_server.py":
             continue
@@ -65,6 +85,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             else "subprocess_cli"
         )
         item.add_marker(pytest.mark.xdist_group(name=group))
+
+
+def _relative_test_path(item: pytest.Item) -> Path | None:
+    try:
+        return Path(item.path).relative_to(_TESTS_ROOT)
+    except ValueError:
+        return None
 
 
 class _EmptyKeyring(KeyringBackend):
@@ -82,6 +109,17 @@ class _EmptyKeyring(KeyringBackend):
         raise keyring.errors.PasswordDeleteError()
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _skip_fsync() -> Generator[None]:
+    # Session storage fsyncs on every journal write, about a hundred times per
+    # session test. On CI's shared disks those fsyncs, from every worker at once,
+    # pushed whole files of tests past the 10 s timeout. Nothing in-process ever
+    # crashes, so tests never rely on the durability fsync buys.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fsync", lambda _fd: None)
+        yield
+
+
 @pytest.fixture(autouse=True)
 def _reset_windows_shell_cache() -> None:
     # resolve_windows_shell is cached for the process; tests vary sys.platform,
@@ -90,15 +128,53 @@ def _reset_windows_shell_cache() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_model_catalog_failed() -> None:
-    # A failed catalog fetch is remembered for the process; one test's failure
-    # must not stop the next from waiting.
-    reset_model_catalog_failed()
+def _no_provider_model_catalogue(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Sessions never ask a provider's model catalogue over the network; a test of
+    # the catalogue sets its own fetcher factory.
+    try:
+        from mistralai_vibe_local_harness.vibe.completion_profile import (
+            PROCESS_CATALOGUE_CACHE,
+        )
+        from vibe.app_server import _completion_facts
+    except ImportError:
+        return
+    monkeypatch.setattr(_completion_facts, "catalogue_fetcher_factory", None)
+    PROCESS_CATALOGUE_CACHE.clear()
 
 
 @pytest.fixture(autouse=True)
-def _reset_experiments_eval_failed() -> None:
-    reset_experiments_eval_failed()
+def _no_billing_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Account reads never ask the billing API over the network; a test of the
+    # plan or budget passes its own gateway.
+    from vibe.app_server import _billing
+
+    monkeypatch.setattr(_billing, "billing_gateway_factory", None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_registry(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
+    """Under respx's own patch, which takes this method's name and arguments for the one
+    it replaces: a registry request respx lets through is refused here, and fails the
+    test.
+    """
+    reached: list[str] = []
+    send = httpcore2.AsyncConnectionPool.handle_async_request
+
+    @functools.wraps(send)
+    async def handle_async_request(
+        self: httpcore2.AsyncConnectionPool, request: httpcore2.Request
+    ) -> httpcore2.Response:
+        url = request.url
+        if url.host == b"api.mistral.ai" and url.target.startswith(b"/v1/skills"):
+            reached.append(url.target.decode())
+            raise httpcore2.ConnectError("Tests never reach the real AI Registry")
+        return await send(self, request)
+
+    monkeypatch.setattr(
+        httpcore2.AsyncConnectionPool, "handle_async_request", handle_async_request
+    )
+    yield
+    assert not reached, f"Mock the AI Registry with respx; this test reached {reached}"
 
 
 @pytest.fixture(autouse=True)
@@ -136,29 +212,13 @@ def _disable_os_keyring(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     monkeypatch.setattr(keyring_utils, "_should_use_macos_security", lambda: False)
     keyring.set_keyring(_EmptyKeyring())
     keyring_utils.clear_api_key_keyring_cache()
+    clear_oidc_token_cache()
     try:
         yield
     finally:
         keyring_utils.clear_api_key_keyring_cache()
+        clear_oidc_token_cache()
         keyring.set_keyring(original)
-
-
-@pytest.fixture(autouse=True)
-def _stub_clipboard_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the suite off the host clipboard.
-
-    ``pyperclip`` writes through the OS clipboard tool, ``_copy_osc52`` writes
-    to ``/dev/tty``, and Textual's ``App.copy_to_clipboard`` emits OSC 52 via
-    the driver; each is a real clipboard write outside the headless test
-    driver. Stub all three so no test can clobber the developer's clipboard;
-    tests that exercise them patch on top of these stubs.
-    """
-    monkeypatch.setattr("pyperclip.copy", lambda text: None)
-    monkeypatch.setattr("pyperclip.paste", lambda: "")
-    monkeypatch.setattr(
-        "vibe.setup.onboarding.clipboard._copy_osc52", lambda text: None
-    )
-    monkeypatch.setattr("textual.app.App.copy_to_clipboard", lambda self, text: None)
 
 
 def get_base_config() -> dict[str, Any]:
@@ -182,6 +242,8 @@ def get_base_config() -> dict[str, Any]:
             }
         ],
         "enable_telemetry": False,
+        # Connectors fetch the real bootstrap endpoint; connector tests opt in.
+        "enable_connectors": False,
     }
 
 
@@ -204,12 +266,29 @@ def config_dir(
     config_file = config_dir / "config.toml"
     config_file.write_text(tomli_w.dumps(get_base_config()), encoding="utf-8")
 
+    # Variables exported in the developer's shell would otherwise reach every
+    # test: VIBE_HOME points them all at one directory, and config settings
+    # override the test config through the environment layer. Other VIBE_*
+    # variables, such as CI inputs, are left alone.
+    for name in list(os.environ):
+        key = name.upper()
+        if key == "VIBE_HOME" or key.split("__", 1)[0] in _CONFIG_ENV_NAMES:
+            monkeypatch.delenv(name)
     monkeypatch.setattr("vibe.utils.vibe_home._DEFAULT_VIBE_HOME", config_dir)
     agents_dir = tmp_path / ".agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr("vibe.core.paths._agents_home._DEFAULT_AGENTS_HOME", agents_dir)
 
     return config_dir
+
+
+@pytest.fixture
+def connectors_enabled(config_dir: Path) -> None:
+    """Turn connectors on in the user config; the test mocks the bootstrap endpoint."""
+    config_file = config_dir / "config.toml"
+    config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    config["enable_connectors"] = True
+    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
@@ -272,24 +351,68 @@ def _mock_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _mock_platform(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mock platform to be Linux with /bin/sh shell for consistent test behavior.
-
-    This ensures that platform-specific system prompt generation is consistent
-    across all tests regardless of the actual platform running the tests.
+def _no_connector_warm_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A served app server fetches the connector catalog at start; with the
+    mock key above that would be a real request.
     """
+    from vibe.app_server._runtime import HarnessProcess
+
+    monkeypatch.setattr(HarnessProcess, "start_connector_warm_up", lambda _self: None)
+
+
+@pytest.fixture(autouse=True)
+def _offline_production_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Services an entry point builds itself (``LocalHarnessHost``, stdio) fetch
+    from an offline endpoint: with the mock key above, a real request.
+    """
+    offline = FakeOrgConfigServer()
+    monkeypatch.setattr(
+        ProcessServices,
+        "create",
+        classmethod(lambda _cls: fake_process_services(offline)),
+    )
+
+
+@pytest.fixture
+def org_server() -> FakeOrgConfigServer:
+    """The managed-config endpoint ``process_services`` fetch from: offline unless
+    the test serves an answer.
+    """
+    return FakeOrgConfigServer()
+
+
+@pytest.fixture
+def model_catalog_server() -> FakeModelCatalogServer:
+    """The model-catalog endpoint ``process_services`` fetch from: offline
+    unless the test serves an answer.
+    """
+    return FakeModelCatalogServer()
+
+
+@pytest_asyncio.fixture
+async def process_services(
+    org_server: FakeOrgConfigServer, model_catalog_server: FakeModelCatalogServer
+) -> AsyncIterator[ProcessServices]:
+    """This test's process services, as an entry point would build them."""
+    services = fake_process_services(
+        org_server, model_catalog_server=model_catalog_server
+    )
+    yield services
+    await services.close()
+
+
+@pytest.fixture(autouse=True)
+def _mock_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the platform to Linux with /bin/sh on POSIX hosts.
+
+    This keeps platform-specific system prompt generation consistent on the
+    Linux CI runners and macOS dev machines. On Windows the real platform
+    stays, so the suite exercises the Windows branches there (DSK-1495).
+    """
+    if _HOST_PLATFORM == "win32":
+        return
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("SHELL", "/bin/sh")
-    if not hasattr(os, "getuid"):
-        monkeypatch.setattr(os, "getuid", lambda: 0, raising=False)
-    resolve_auto_theme.cache_clear()
-    monkeypatch.setattr(
-        "vibe.setup.onboarding.theme_detection.detect_terminal_dark", lambda: None
-    )
-    monkeypatch.setattr(
-        "vibe.setup.onboarding.theme_detection.detect_system_preferred_dark",
-        lambda: None,
-    )
 
 
 @pytest.fixture(autouse=True)
@@ -440,12 +563,17 @@ def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     # Telemetry gates the remote experiment fetch (experiments.mistral.services);
     # off by default so a leaked VIBE_API_KEY never triggers an unmocked call.
     kwargs.setdefault("enable_telemetry", False)
+    # PR monitoring runs gh/glab against the session's checkout in the
+    # background; off in the configs built here so a checkout with a forge
+    # remote never reaches the real CLI. Artifact tests pass
+    # enable_pr_monitoring=True. Sessions built from config files (api_host,
+    # HarnessProcess) keep the schema default, which is on.
+    kwargs.setdefault("enable_pr_monitoring", False)
     # Use the lightweight test system prompt unless a test asks for a real one.
     kwargs.setdefault("system_prompt_id", "tests")
-    # Keep the test prompt minimal: skip project-context discovery and prompt
-    # detail unless a test opts in.
+    # Keep the test prompt minimal: skip project-context discovery unless a
+    # test opts in.
     kwargs.setdefault("include_project_context", False)
-    kwargs.setdefault("include_prompt_detail", False)
     return kwargs
 
 

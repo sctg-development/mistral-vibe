@@ -10,9 +10,7 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1", "VIBE_TYPING_GRACE_PERIOD_MS": "0"}
-capture_startup = False
-capture_steps = {1}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0"}
 screen_contains = ("-PATTERN-TAIL", "/PATH-TAIL")
 
 _INPUT = {
@@ -29,5 +27,3 @@ timeline: Timeline = [
     tool_approval("grep", "file_search", _INPUT),
     {"release": 5},
 ]
-
-settle_per_key = True

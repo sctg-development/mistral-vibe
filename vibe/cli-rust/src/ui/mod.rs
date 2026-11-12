@@ -1,22 +1,32 @@
 //! UI components; each submodule owns one region of the screen.
 
 pub mod approval;
+pub mod artifacts_modal;
 pub mod auth_app;
 pub mod banner;
 pub(crate) mod bottom_app;
 pub mod bottom_bar;
+mod bottom_bar_parts;
 pub mod braille_renderer;
+pub mod branch_app;
+pub(crate) mod browser_box;
 pub mod chat_input;
 pub mod completion_popup;
 pub(crate) mod composer_layout;
+pub mod composer_title;
 pub mod config;
 pub mod config_edit;
 mod config_options;
 pub mod connector_auth;
+pub mod context_app;
+pub mod context_bar;
 pub mod debug_console;
 pub mod feedback_bar;
+pub mod footer_fit;
+pub mod footer_gauge;
 pub mod highlight;
 pub(crate) mod hint_line;
+pub mod jump_to_bottom;
 pub(crate) mod list_cursor;
 mod list_hover;
 pub mod list_scroll;
@@ -29,6 +39,7 @@ pub mod model_picker;
 pub mod narrator;
 pub mod notice;
 pub mod plugins;
+pub mod pr_row;
 pub mod proxy_setup;
 pub mod pulse;
 pub mod question_app;
@@ -36,19 +47,21 @@ mod question_layout;
 pub(crate) mod question_other;
 mod question_rows;
 pub mod recording_indicator;
+pub mod release_notes;
 pub mod resume_picker;
+pub mod reverse_search;
 pub mod rewind;
 pub mod rng;
 pub mod scrollbar;
 pub(crate) mod search_field;
 pub mod selection;
+pub mod skills_browser;
 mod styled_text;
 pub mod subagent_list;
 pub mod tab_cells;
 pub mod theme;
 pub mod theme_picker;
 pub mod thinking_picker;
-pub mod toast;
 pub mod todo;
 pub mod transcript;
 pub mod trust_folders;
@@ -56,7 +69,7 @@ mod trust_folders_layout;
 mod trust_folders_paint;
 pub(crate) mod trust_folders_selection;
 mod trust_folders_text;
-pub mod vibe_code_project;
+pub(crate) mod visual_lines;
 pub mod voice_app;
 
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -71,25 +84,6 @@ pub fn draw(app: &mut App, f: &mut Frame) {
     let area = f.area();
     draw_active_screen(app, f, area);
     list_hover::paint(app, f);
-    // The toast stack is a top-level overlay so warnings show on every screen,
-    // not just the base chat.
-    toast::draw(app, f, toast_anchor(app, area));
-}
-
-/// Anchor the toast stack above the bottom-app box while one replaces the
-/// input box, else above the input box, else near the bottom of the frame so
-/// startup warnings on modal screens stay visible.
-fn toast_anchor(app: &App, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    if let Some((_, box_area)) = app.view.bottom_app {
-        box_area
-    } else if app.view.input_area.height > 0 {
-        app.view.input_area
-    } else if app.subagents.list.area.height > 0 {
-        // A child view hides the input box; the list sits where it was.
-        app.subagents.list.area
-    } else {
-        ratatui::layout::Rect::new(0, area.height.saturating_sub(1), area.width, 0)
-    }
 }
 
 fn draw_active_screen(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
@@ -116,16 +110,18 @@ fn draw_active_screen(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect)
 }
 
 fn draw_session_screen(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
-    // Bottom apps replace the input box; `/config` is the only overlay over the base.
+    // Bottom apps replace the input box; `/config` and `/release-notes` overlay the base.
     match app.focus() {
         Focus::Approval => approval::draw(app, f, area),
         Focus::Question => question_app::draw(app, f, area),
         Focus::VoiceApp => voice_app::draw(app, f, area),
+        Focus::BranchApp => branch_app::draw(app, f, area),
         Focus::ProxySetup => proxy_setup::draw(app, f, area),
-        Focus::VibeCodeProject => vibe_code_project::draw(app, f, area),
         Focus::ResumePicker => resume_picker::draw(app, f, area),
         Focus::Mcp => mcp::draw(app, f, area),
         Focus::Plugins => plugins::draw(app, f, area),
+        Focus::Skills => skills_browser::draw(app, f, area),
+        Focus::ContextApp => context_app::draw(app, f, area),
         Focus::McpOAuth => mcp_oauth::draw(app, f, area),
         Focus::ConnectorAuth => connector_auth::draw(app, f, area),
         Focus::Rewind => rewind::draw(app, f, area),
@@ -133,9 +129,14 @@ fn draw_session_screen(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect
         Focus::ModelPicker => model_picker::draw(app, f, area),
         Focus::LogLevelPicker => log_level_picker::draw(app, f, area),
         Focus::ThinkingPicker => thinking_picker::draw(app, f, area),
+        Focus::ArtifactsModal => artifacts_modal::draw(app, f, area),
         Focus::Config => {
             draw_base(app, f, area);
             config::draw(app, f, area);
+        }
+        Focus::ReleaseNotes => {
+            draw_base(app, f, area);
+            release_notes::draw(app, f, area);
         }
         Focus::Trust | Focus::SubagentList | Focus::Composer => draw_base(app, f, area),
     }
@@ -158,7 +159,7 @@ fn draw_base(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
     f.buffer_mut().set_style(area, theme::screen_style());
 
     // `#loading-area`: 3 rows on a fresh session (narrator/hint), else 2.
-    let loading_height = loading_height(app);
+    let loading_height = loading_height(app, area.width);
     // The shared slash-command/file popup sits above the input box.
     completion_popup::reconcile_scroll(app, area.width);
     let popup_height = completion_popup::popup_height(app, area.width);
@@ -244,7 +245,11 @@ fn draw_base(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
 /// narrator status, the loading spinner, the inline notice and the feedback
 /// bar, laid out left to right.
 pub(crate) fn draw_loading_area(app: &mut App, f: &mut Frame, area: ratatui::layout::Rect) {
-    let notice_width = notice::width(app);
+    // A squeezed area keeps the loading row: the block only gets the rows beyond it.
+    let block = notice_block(app, area.width).min(area.height.saturating_sub(2));
+    let [area, block_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(block)]).areas(area);
+    let notice_width = if block > 0 { 0 } else { notice::width(app) };
     let feedback_width = feedback_bar::width(app);
     // The narrator row is laid out before the loading spinner; zero width
     // while idle keeps the split identical to before.
@@ -260,13 +265,21 @@ pub(crate) fn draw_loading_area(app: &mut App, f: &mut Frame, area: ratatui::lay
     narrator::draw(app, f, loading_chunks[0]);
     loading::draw(app, f, loading_chunks[1]);
     feedback_bar::draw(app, f, loading_chunks[4]);
-    notice::draw(app, f, loading_chunks[2]);
+    match block > 0 {
+        true => notice::draw(app, f, block_area, true),
+        false => notice::draw(app, f, loading_chunks[2], false),
+    }
 }
 
-pub(crate) fn loading_height(app: &App) -> u16 {
-    if app.view.transcript.is_empty() {
-        3
-    } else {
-        2
-    }
+/// Rows of the wrapped-failure block under the loading row: 0 when the notice fits beside the narrator and feedback.
+fn notice_block(app: &App, width: u16) -> u16 {
+    let feedback = feedback_bar::width(app);
+    let others = narrator::width(app) + feedback + u16::from(feedback > 0);
+    notice::block_rows(app, width.saturating_sub(others), width)
+}
+
+/// A failed startup grows the area so its error wraps under the padding row; a wrapped failure adds its block below.
+pub(crate) fn loading_height(app: &App, width: u16) -> u16 {
+    let base = if app.view.transcript.is_empty() { 3 } else { 2 };
+    base.max(loading::failure::rows(app, width).saturating_add(1)) + notice_block(app, width)
 }

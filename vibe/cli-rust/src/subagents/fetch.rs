@@ -1,11 +1,9 @@
 //! Child history fetch pipeline.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 
 use crate::server::{method, Client};
 
@@ -16,12 +14,11 @@ use super::transcripts::entry_id;
 pub fn fetch_history(
     client: Arc<Client>,
     session_id: String,
-    tx: Option<mpsc::Sender<Event>>,
+    tx: Option<crate::ui_event::Sender>,
     known_ids: HashSet<String>,
     cached_complete: bool,
-    pending: Arc<AtomicU32>,
 ) {
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let event = match fetch(&client, &session_id, &known_ids, cached_complete).await {
             Ok((history, complete)) => Event::Fetched {
                 session_id,
@@ -30,14 +27,7 @@ pub fn fetch_history(
             },
             Err(_) => Event::Failed { session_id },
         };
-        // The main thread releases the commit once it has applied the answer.
-        let sent = match tx {
-            Some(tx) => tx.send(event).await.is_ok(),
-            None => false,
-        };
-        if !sent {
-            pending.fetch_sub(1, Ordering::Relaxed);
-        }
+        crate::input::deliver(tx, event).await;
     });
 }
 

@@ -15,14 +15,50 @@ else
   uv sync --no-dev --group build
 fi
 
+# vibe-acp.spec bundles vibe-rs for `vibe-acp --setup`. A wheel install
+# already carries it; a source install builds it here. The wizard needs no
+# voice, so the build drops it unless CARGO_BUILD_FLAGS says otherwise.
+if [[ " $* " == *" vibe-acp.spec "* ]] && [ "${VIBE_NO_INSTALL_PROJECT:-0}" != "1" ] \
+  && [ -z "${VIBE_SKIP_RUST_TUI:-}" ] && [ -z "${VIBE_ACP_RUST_TUI:-}" ]; then
+  tui_target="$PWD/.native-build/vibe-rs-target"
+  read -r -a tui_flags <<< "${CARGO_BUILD_FLAGS:---no-default-features}"
+  CARGO_TARGET_DIR="$tui_target" cargo build --release --locked \
+    --manifest-path vibe/cli-rust/Cargo.toml --bin vibe-rs "${tui_flags[@]}"
+  tui_name=vibe-rs
+  if [ "${OS:-}" = "Windows_NT" ]; then
+    tui_name=vibe-rs.exe
+  fi
+  export VIBE_ACP_RUST_TUI="$tui_target/release/$tui_name"
+fi
+
 if [ -n "${VIBE_PYINSTALLER_WITH:-}" ]; then
   uv_run_args+=(--with "$VIBE_PYINSTALLER_WITH")
 fi
 
 # A fresh checkout stamps every file with now, which would always
 # invalidate the cached TOCs; pin to a fixed epoch so they look current.
+# The touches run in bash-built batches, not through find -exec or xargs:
+# on the msys-based Windows agents those findutils exec paths compute
+# their spawn against sysconf(_SC_ARG_MAX), the CD job environment leaves
+# that below their floors, and they abort themselves
+# (find: The environment is too large for exec(); xargs: assertion
+# "bc_ctl.arg_max >= LINE_MAX"). Bash's own spawns carry the same
+# environment without that math — every other command in this script
+# (uv, cargo, PyInstaller) spawns through it — so the batched touch does
+# too. Plain bash, no GNU-isms: the same loop runs on Linux, macOS and
+# msys alike. 64 paths a batch, ~100 spawns on the ~6.5k-file tree.
 if [ -n "${VIBE_PIN_MTIMES:-}" ]; then
-  find vibe -type f -exec touch -t 202001010000 {} +
+  batch=()
+  while IFS= read -r -d '' f; do
+    batch+=("$f")
+    if [ "${#batch[@]}" -eq 64 ]; then
+      touch -t 202001010000 "${batch[@]}"
+      batch=()
+    fi
+  done < <(find vibe -type f -print0)
+  if [ "${#batch[@]}" -gt 0 ]; then
+    touch -t 202001010000 "${batch[@]}"
+  fi
 fi
 
 # PyInstaller stages/codesigns collected binaries in a single platform-wide

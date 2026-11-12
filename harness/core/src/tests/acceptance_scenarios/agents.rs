@@ -36,41 +36,36 @@ fn operator_discovery_description_reconfiguration_rejects_blank_text() {
     );
 }
 
-/// *Prepare*: Unattributed-task wording contains escaped literal braces.
-/// *Do*: Admit a task without tree context through the serialized Step Protocol.
-/// *Assert*: The model receives the once-rendered literal beside unchanged task content.
+/// *Prepare*: Serialized tasks without a recipient context, or with an unattributed one.
+/// *Do*: Decode each as a Step Protocol input.
+/// *Assert*: Decoding fails, so no task without agent paths can reach Core.
 #[test]
-fn operator_unattributed_task_template_renders_escaped_braces() {
-    // Prepare
-    let mut settings = serde_json::to_value(config()).unwrap();
-    settings["settings"]["prompts"]["agent_messages"]["task"] = json!("Use {{context}}.\n");
-    let mut runtime = SynchronousRuntime::new(serde_json::from_value(settings).unwrap());
-    let content = json!([
-        {"type":"text", "text":"Agent task from /root:\n"},
-        {"type":"text", "text":"Use {context}.\n"},
-        {"type":"text", "text":"Read {{this}} unchanged."},
-    ]);
+fn agent_task_without_recipient_context_is_rejected() {
+    for (context, expected) in [
+        (None, "missing field `context`"),
+        (
+            Some(json!({"type":"unattributed"})),
+            "unknown variant `unattributed`",
+        ),
+    ] {
+        // Prepare
+        let mut message = json!({"kind":"task", "sender_agent_path":"/root",
+            "content":[{"type":"text", "text":"investigate"}]});
+        if let Some(context) = context {
+            message["context"] = context;
+        }
 
-    // Do
-    let action = runtime
-        .apply(
-            json!({
-                "type":"agent_message", "turn_id":"task", "mode":"queue",
-                "message": {"kind":"task", "sender_agent_path":"/root",
-                    "content":[{"type":"text", "text":"Read {{this}} unchanged."}]},
-            }),
-            running("task").dispatch(llm_call(0)).observe(json!({
-                "type":"turn_started", "turn_id":"task", "content":content,
-            })),
-        )
-        .only_action();
+        // Do
+        let error = serde_json::from_value::<HarnessInput>(json!({
+            "protocol_version": 1, "input_id": 1,
+            "determinism": {"time_unix_ms": 1_700_000_000_000_u64, "random_seed": 1},
+            "command": {"type":"agent_message", "turn_id":"task", "mode":"queue", "message":message},
+        }))
+        .unwrap_err();
 
-    // Assert
-    runtime.assert_last_model_message_update(
-        &action,
-        "replace",
-        &[model_system(), json!({"role":"user", "content":content})],
-    );
+        // Assert
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 /// *Prepare*: A Session has already published its model tool catalog.
@@ -187,10 +182,10 @@ fn operator_prompts_reach_model_guidance_and_tool_catalogs() {
             "operator",
             &first,
             "spawn",
-            "return await tools.agents.spawn({name: 'worker', message: 'inspect'});",
+            "return await tools.agents.spawn({name: 'worker', message: 'inspect', instructions: 'Work.'});",
             [runtime_tool(
                 "agents.spawn",
-                json!({"name":"worker", "message":"inspect"}),
+                json!({"name": "worker", "message": "inspect", "instructions": "Work."}),
             )],
         )
         .only_action();
@@ -213,7 +208,7 @@ fn operator_task_framing_identifies_inherited_source_and_recipient() {
     });
     let mut child = SynchronousRuntime::new_with_conversation(
         serde_json::from_value(settings).unwrap(),
-        parent.export_conversation("all"),
+        parent.export_conversation(json!({"mode": "forked", "turns": "all"})),
     );
     let content = json!([
         {"type":"text", "text":"Agent task from /root/research:\n"},
@@ -250,17 +245,26 @@ fn operator_task_framing_identifies_inherited_source_and_recipient() {
 }
 
 fn attributed_agent_content(kind: &str, sender: &str, text: &str) -> Value {
-    let mut content = vec![json!({
-        "type":"text", "text":format!("Agent {kind} from {sender}:\n"),
-    })];
-    if kind == "task" {
-        content.push(json!({
-            "type":"text",
-            "text":"You are a separate agent with your own assigned task. Use prior conversation only as context; do not resume another agent's work. Follow the task below.\n",
-        }));
-    }
-    content.push(json!({"type":"text", "text":text}));
-    json!(content)
+    json!([
+        {"type":"text", "text":format!("Agent {kind} from {sender}:\n")},
+        {"type":"text", "text":text},
+    ])
+}
+
+/// A task with a `current` context, framed by the default wording.
+fn current_task_content(sender: &str, recipient: &str, text: &str) -> Value {
+    let framing = config()
+        .settings
+        .prompts
+        .agent_messages
+        .current_task
+        .replace("{recipient_agent_path}", recipient)
+        .replace("{sender_agent_path}", sender);
+    json!([
+        {"type":"text", "text":format!("Agent task from {sender}:\n")},
+        {"type":"text", "text":framing},
+        {"type":"text", "text":text},
+    ])
 }
 
 /// *Prepare*: A child inherits a parent's completed Turn and current unfinished request.
@@ -288,7 +292,7 @@ fn delegated_tasks_frame_inherited_context_without_resuming_parent_work() {
                 "Resume the audit and spawn helpers.",
             )),
     );
-    let seed = parent.export_conversation("all");
+    let seed = parent.export_conversation(json!({"mode": "forked", "turns": "all"}));
     let mut child_config = config();
     child_config.task_id = "child".into();
     child_config.system_instructions = "CHILD AUDIT INSTRUCTIONS".into();
@@ -305,13 +309,14 @@ fn delegated_tasks_frame_inherited_context_without_resuming_parent_work() {
         ("first-task", "Report the audit fact only.", "CORAL-31"),
         ("next-task", "Count the characters in that fact.", "8"),
     ] {
-        let content = attributed_agent_content("task", "/root", task);
+        let content = current_task_content("/root", "/root/auditor", task);
         let action = child
             .apply(
                 json!({
                     "type":"agent_message", "turn_id":turn_id, "mode":"queue",
                     "message":{
                         "sender_agent_path":"/root", "kind":"task",
+                        "context":{"type":"current", "recipient_agent_path":"/root/auditor"},
                         "content":[{"type":"text", "text":task}],
                     },
                 }),
@@ -330,7 +335,10 @@ fn delegated_tasks_frame_inherited_context_without_resuming_parent_work() {
         expected_messages.push(model_assistant_text(answer));
         child.restart_from_checkpoint();
     }
-    assert_eq!(parent.export_conversation("all"), seed);
+    assert_eq!(
+        parent.export_conversation(json!({"mode": "forked", "turns": "all"})),
+        seed
+    );
 }
 
 /// *Prepare*: A parent's program call that spawns a forked helper is still running.
@@ -346,7 +354,7 @@ fn forked_child_sees_the_running_spawn_call_closed_before_its_task() {
         .as_str()
         .unwrap();
     let request = "Spawn a helper to check the notes, then wait for it.";
-    let source = "async function main() { return tools.agents.spawn({ name: 'helper', message: 'Check the notes' }); }";
+    let source = "async function main() { return tools.agents.spawn({ name: 'helper', message: 'Check the notes', instructions: 'Work.' }); }";
     let mut parent = SynchronousRuntime::new(config());
     let first = parent.start_turn("parent", request);
     let spawn = parent
@@ -357,21 +365,23 @@ fn forked_child_sees_the_running_spawn_call_closed_before_its_task() {
             source,
             [runtime_tool(
                 "agents.spawn",
-                json!({"name":"helper", "message":"Check the notes"}),
+                json!({"name": "helper", "message": "Check the notes", "instructions": "Work."}),
             )],
         )
         .only_action();
     let content = json!([
         {"type":"text", "text":"Agent task from /root:\n"},
-        {"type":"text", "text":"The inherited conversation above was copied from /root. You are /root/helper. Your current task from /root is:\n"},
+        {"type":"text", "text":"The inherited conversation above was copied from the agent at /root. You are the agent at /root/helper. This 'agent path' is an id, it is not related to files or folders. Your final result goes back to your parent automatically, and only your own children's final results come to you automatically. If you need anything else from another agent, send it a message; if you cannot, say so in your answer. Your current task from the agent at /root is:\n"},
         {"type":"text", "text":"Check the notes"},
     ]);
 
     // Do
     let mut child_config = config();
     child_config.task_id = "child".into();
-    let mut child =
-        SynchronousRuntime::new_with_conversation(child_config, parent.export_conversation("all"));
+    let mut child = SynchronousRuntime::new_with_conversation(
+        child_config,
+        parent.export_conversation(json!({"mode": "forked", "turns": "all"})),
+    );
     let child_action = child
         .apply(
             json!({
@@ -430,13 +440,20 @@ fn forked_child_sees_the_running_spawn_call_closed_before_its_task() {
 fn agent_message_start_and_steering_share_turn_semantics_through_restore() {
     // Prepare
     let mut runtime = SynchronousRuntime::new(config());
-    let task = attributed_agent_content("task", "/root", "investigate");
-    let first = runtime.apply(json!({
-        "type":"agent_message", "turn_id":"child-turn", "mode":"queue",
-        "message":{"sender_agent_path":"/root", "kind":"task", "content":[{"type":"text", "text":"investigate"}]},
-    }), running("child-turn").dispatch(llm_call(0)).observe(json!({
-        "type":"turn_started", "turn_id":"child-turn", "content":task,
-    }))).only_action();
+    let task = current_task_content("/root", "/root/child", "investigate");
+    let first = runtime
+        .apply(
+            json!({
+                "type":"agent_message", "turn_id":"child-turn", "mode":"queue",
+                "message":{"sender_agent_path":"/root", "kind":"task",
+                    "context":{"type":"current", "recipient_agent_path":"/root/child"},
+                    "content":[{"type":"text", "text":"investigate"}]},
+            }),
+            running("child-turn").dispatch(llm_call(0)).observe(json!({
+                "type":"turn_started", "turn_id":"child-turn", "content":task,
+            })),
+        )
+        .only_action();
     let message = attributed_agent_content("message", "/root/sibling", "new evidence");
 
     // Do
@@ -485,7 +502,7 @@ fn pending_agent_message_survives_restore_and_is_seen_once_before_new_input() {
     // Prepare
     let mut runtime = SynchronousRuntime::new(config());
     let notification = json!({
-        "id":"delivery", "source":{"type":"agent_message", "sender_agent_path":"/root/child", "kind":"message"},
+        "id":"delivery", "source":{"type":"agent_message", "sender_agent_path":"/root/child"},
         "level":"info", "message":"Agent input", "content":[{"type":"text", "text":"retained advice"}],
     });
     let command = json!({"type":"notification", "notification":notification});
@@ -498,7 +515,7 @@ fn pending_agent_message_survives_restore_and_is_seen_once_before_new_input() {
     assert_eq!(
         runtime.checkpoint_value()["notifications"][0]["notification"]["source"],
         json!({
-            "type":"agent_message", "sender_agent_path":"/root/child", "kind":"message",
+            "type":"agent_message", "sender_agent_path":"/root/child",
         }),
     );
 
@@ -549,6 +566,14 @@ fn agent_results_survive_restore_and_are_seen_once_before_new_input() {
         (
             json!({"outcome":"completed", "output":[], "stop_reason":"iteration_limit"}),
             "Status: stopped, iteration limit reached before the agent finished\nTo let it continue with its history, send a message to /root/child.",
+        ),
+        (
+            json!({"outcome":"completed", "output":[{"type":"text", "text":"Two of five steps done."}], "stop_reason":"output_limit"}),
+            "Status: stopped, output limit reached before the agent finished its reply\nPartial output: [{\"type\":\"text\",\"text\":\"Two of five steps done.\"}]\nTo let it continue with its history, send a message to /root/child.",
+        ),
+        (
+            json!({"outcome":"completed", "output":[], "stop_reason":"output_limit"}),
+            "Status: stopped, output limit reached before the agent finished its reply\nTo let it continue with its history, send a message to /root/child.",
         ),
         (
             json!({"outcome":"completed", "output":[{"type":"text", "text":"Skipped by policy"}], "stop_reason":"skipped"}),
@@ -687,7 +712,7 @@ fn agent_result_start_and_steering_share_turn_semantics_through_restore() {
 
 /// *Prepare*: The parent cannot resume an idle child with a message: its tree policy keeps such
 /// messages pending, or it has no `send_message`.
-/// *Do*: Deliver a cancelled and an iteration-limited child result.
+/// *Do*: Deliver a cancelled, an iteration-limited and an output-limited child result.
 /// *Assert*: The result keeps its status and partial output but has no continue hint.
 #[test]
 fn unfinished_agent_results_omit_the_continue_hint_when_a_message_cannot_resume_the_child() {
@@ -703,6 +728,10 @@ fn unfinished_agent_results_omit_the_continue_hint_when_a_message_cannot_resume_
             (
                 json!({"outcome":"completed", "output":[], "stop_reason":"iteration_limit"}),
                 "Status: stopped, iteration limit reached before the agent finished",
+            ),
+            (
+                json!({"outcome":"completed", "output":[{"type":"text", "text":"Two of five"}], "stop_reason":"output_limit"}),
+                "Status: stopped, output limit reached before the agent finished its reply\nPartial output: [{\"type\":\"text\",\"text\":\"Two of five\"}]",
             ),
         ] {
             // Prepare
@@ -962,7 +991,7 @@ fn canonical_agent_operations_survive_restore() {
         ),
         (
             "interrupt",
-            json!({"name": "child"}),
+            json!({"agent_path": "child", "reason": "plan changed"}),
             json!({"type": "success"}),
         ),
     ];
@@ -1111,11 +1140,12 @@ fn agent_hooks_select_the_canonical_runtime_identity() {
             turn_id,
             &first,
             "program",
-            "async function main() { return tools.agents.spawn({name:'child', message:'work'}); }",
+            "async function main() { return tools.agents.spawn({name: 'child', message: 'work', instructions: 'Work.'}); }",
             [hook_call("pre_tool_call", &["spawn-pre"], Value::Null)],
         )
         .only_action();
-    let approved = json!({"name": "reviewer", "message": "review the patch"});
+    let approved =
+        json!({"name": "reviewer", "message": "review the patch", "instructions": "Work."});
 
     // Do
     runtime.restart_from_checkpoint();

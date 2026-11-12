@@ -1,4 +1,4 @@
-"""A `/config` edit the server rejects shows an error toast naming the field and layer."""
+"""A `/config` edit the server rejects shows an error naming the field and layer on its status line."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ handshake = {
     "config/write": {"rejected": True, "failures": []},
 }
 
-capture_startup = False
 screen_contains = (
     "Failed to save auto_compact_threshold (temporary):",
     "Invalid configuration edit",

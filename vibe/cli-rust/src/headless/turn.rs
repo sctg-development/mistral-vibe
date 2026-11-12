@@ -1,25 +1,26 @@
 //! The turn loop: consume notifications until the turn ends, and finalize
 //! the output once it does.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use super::report::compute_session_cost;
+use super::drive::RunState;
+use super::pre_turn;
 use super::subagents::wait_for_subagents;
-use super::usage::UsageBaseline;
 use crate::cli::OutputFormat;
 use crate::headless_history::read_history;
-use crate::headless_output::Output;
+use crate::headless_output::{denied_tool_warning, turn_entries, Output};
 use crate::headless_run::{StopRequests, TurnCounter};
 use crate::run_export::{turn_stop_from_turn, RunOutcome, TurnStop};
-use crate::server::{notification, Client, Notification};
+use crate::server::{notification, Client, Notification, PublicTurn};
 
 /// How the turn ended, as far as the turn loop can tell.
 pub(super) enum TurnEnd {
     /// The turn completed; carries its stop reason and the final response.
     Completed {
+        budget_outcome: Option<RunOutcome>,
         stop_reason: Option<TurnStop>,
         final_response: Option<String>,
     },
@@ -32,7 +33,7 @@ pub(super) enum TurnEnd {
 
 /// Consume notifications until the turn ends. The app-server ignores
 /// maxTurns, so the client counts assistant turns and stops the run as a
-/// limit when one more would exceed it; usage stats feed the budgets.
+/// limit when one more would exceed it.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_turn_loop(
     client: &Arc<Client>,
@@ -42,7 +43,7 @@ pub(super) async fn run_turn_loop(
     settled: Vec<Notification>,
     stop: &Arc<StopRequests>,
     turn_id: &str,
-    usage_baseline: &UsageBaseline,
+    state: &Mutex<RunState>,
 ) -> TurnEnd {
     let mut turns = TurnCounter::new(stop.limits().max_turns);
     let mut settled = settled.into_iter();
@@ -72,6 +73,7 @@ pub(super) async fn run_turn_loop(
                 }
                 match output.consume_entry(&notification.params) {
                     Ok(Some(entry)) => {
+                        report_denials(state, &output.format(), [&entry]);
                         if let Err(error) = output.emit_entry(&entry) {
                             return TurnEnd::Failed {
                                 code: None,
@@ -93,43 +95,44 @@ pub(super) async fn run_turn_loop(
                 let message = notification.params.get("message").and_then(Value::as_str);
                 stop.abort(message.unwrap_or_default());
             }
-            notification::SESSION_STATS_UPDATED => {
-                // Observe usage for budget enforcement.
-                if let Some(stats) = notification.params.get("stats") {
-                    let stats = &usage_baseline.run_stats(stats);
-                    let total_tokens = stats
-                        .get("sessionPromptTokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        + stats
-                            .get("sessionCompletionTokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                    let cost = compute_session_cost(stats);
-                    stop.observe_usage(total_tokens, cost);
-                }
+            // A load that ends after the run started: the export still lists it.
+            notification::WARNING if pre_turn::is_integrations_unavailable(&notification) => {
+                let unavailable =
+                    pre_turn::integrations_unavailable(&output.format(), &[notification]);
+                state.lock().unwrap().warnings.extend(unavailable);
             }
             notification::TURN_COMPLETED if matches_turn(&notification.params, turn_id) => {
                 // The run ends once its subagents do, so the export sees how each ended.
                 wait_for_subagents(client, notifications, session_id, stop).await;
-                let turn = notification.params.pointer("/turn").unwrap_or(&Value::Null);
-                let status = turn.get("status").and_then(Value::as_str).unwrap_or("");
-                if status == "failed" {
+                let turn = PublicTurn::read(&notification.params);
+                let budget_outcome = match turn.budget_stop_reason.as_deref() {
+                    Some("token_limit") => Some(RunOutcome::TokenLimit),
+                    Some("price_limit") => Some(RunOutcome::PriceLimit),
+                    _ => None,
+                };
+                if turn.status() == Some("failed") {
+                    // The turn has no output to write, but its denials still go in the report.
+                    let format = output.format();
+                    if format != OutputFormat::Streaming {
+                        let read = read_reported_history(
+                            client,
+                            session_id,
+                            Some(turn_id),
+                            &format,
+                            state,
+                        );
+                        if let Err(error) = read.await {
+                            tracing::warn!("Failed turn's denials not reported: {error}");
+                        }
+                    }
                     return TurnEnd::Failed {
-                        code: turn
-                            .pointer("/error/code")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        message: turn
-                            .pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Turn failed")
-                            .to_owned(),
+                        code: turn.error_code().map(str::to_owned),
+                        message: turn.error_message().unwrap_or("Turn failed").to_owned(),
                     };
                 }
-                let stop_reason = turn_stop_from_turn(turn);
+                let stop_reason = turn_stop_from_turn(&turn);
                 let final_response =
-                    match finalize_output(client, session_id, Some(turn_id), output).await {
+                    match finalize_output(client, session_id, Some(turn_id), output, state).await {
                         Ok(response) => response,
                         // The run cannot deliver its result, so it is an
                         // infrastructure failure.
@@ -141,6 +144,7 @@ pub(super) async fn run_turn_loop(
                         }
                     };
                 return TurnEnd::Completed {
+                    budget_outcome,
                     stop_reason,
                     final_response,
                 };
@@ -171,6 +175,7 @@ pub(super) async fn finalize_output(
     session_id: &str,
     turn_id: Option<&str>,
     output: &Output,
+    state: &Mutex<RunState>,
 ) -> Result<Option<String>, String> {
     let format = output.format();
     // Streaming delivered its result as entries arrived, so it never reads
@@ -179,12 +184,47 @@ pub(super) async fn finalize_output(
     if matches!(format, OutputFormat::Streaming) {
         return Ok(None);
     }
-    let entries = read_history(client, session_id)
-        .await
-        .map_err(|error| format!("read session history: {error:#}"))?;
+    let entries = read_reported_history(client, session_id, turn_id, &format, state).await?;
     output
         .finalize(entries, turn_id)
         .map_err(|error| format!("write final output: {error}"))
+}
+
+/// Read the session history and report the turn's denied tool calls.
+async fn read_reported_history(
+    client: &Arc<Client>,
+    session_id: &str,
+    turn_id: Option<&str>,
+    format: &OutputFormat,
+    state: &Mutex<RunState>,
+) -> Result<Value, String> {
+    let entries = read_history(client, session_id)
+        .await
+        .map_err(|error| format!("read session history: {error:#}"))?;
+    let turn = turn_entries(&entries, turn_id);
+    report_denials(state, format, turn.as_array().into_iter().flatten());
+    Ok(entries)
+}
+
+/// Report each denied tool call once on stderr, and keep it for the export.
+fn report_denials<'a>(
+    state: &Mutex<RunState>,
+    format: &OutputFormat,
+    entries: impl IntoIterator<Item = &'a Value>,
+) {
+    let mut state = state.lock().unwrap();
+    for entry in entries {
+        let Some(warning) = denied_tool_warning(entry) else {
+            continue;
+        };
+        if let Some(id) = entry["id"].as_str() {
+            if !state.reported_denials.insert(id.to_owned()) {
+                continue;
+            }
+        }
+        pre_turn::report_warning(format, &warning.message);
+        state.warnings.push(warning);
+    }
 }
 
 fn matches_turn(params: &Value, turn_id: &str) -> bool {

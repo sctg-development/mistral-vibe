@@ -1,4 +1,5 @@
 //! `vibe run-server`'s requests, refusals and protocol errors.
+#![allow(clippy::disallowed_methods)] // Tests drive tasks and real time directly; replay acks never run here.
 
 mod run_server_common;
 
@@ -73,6 +74,41 @@ fn invalid_params_name_fields_without_their_values() {
     for field in ["prompt", "agentSocket", "timeLimit"] {
         assert!(paths.contains(field), "{field}: {paths}");
     }
+}
+
+#[test]
+fn zero_cumulative_budgets_are_valid_run_server_limits() {
+    let mut server = RunServer::start("fake", &[]);
+    server.initialize();
+
+    let reply = server.start_run("zero", json!({"maxTokens": 0, "maxPrice": 0}));
+
+    assert_eq!(reply["result"], json!({}));
+}
+
+#[test]
+fn invalid_price_limit_has_a_field_specific_message() {
+    let mut server = RunServer::start("fake", &[]);
+    server.initialize();
+
+    let reply = server.request(
+        "run/start",
+        json!({
+            "runId": "negative-price",
+            "prompt": "hello",
+            "agentSocket": "socket",
+            "maxPrice": -1
+        }),
+    );
+
+    let issues = reply["error"]["data"]["issues"].as_array().unwrap();
+    assert_eq!(
+        issues,
+        &[json!({
+            "path": ["maxPrice"],
+            "message": "must be a nonnegative finite number"
+        })]
+    );
 }
 
 #[test]

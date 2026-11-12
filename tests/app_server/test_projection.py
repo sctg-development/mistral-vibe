@@ -13,12 +13,17 @@ from vibe.app_server._effect_output_cap import (
     TRUNCATION_MARKER,
 )
 from vibe.app_server._history_projection import project_message_history
-from vibe.app_server._projection import project_config_view
+from vibe.app_server._projection import (
+    project_config_view,
+    project_installed_skill_summaries,
+    project_skill_summaries,
+)
 from vibe.app_server.models import (
     AgentStatsSnapshot,
     CompletedEffectState,
     PublicEffectEntry,
 )
+from vibe.core.skills.models import InstalledSkill, SkillInfo, SkillScope, SkillSource
 from vibe.core.types import FunctionCall, LLMMessage, Role, ToolCall
 
 
@@ -69,12 +74,124 @@ def test_config_view_projects_cursor_blink(enabled: bool) -> None:
     assert type(config).model_validate(legacy_payload).cursor_blink is True
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_vim_keybindings(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(vim_keybindings=enabled))
+
+    assert config.model_dump(mode="json", by_alias=True)["vimKeybindings"] is enabled
+    legacy_payload = config.model_dump(mode="json", by_alias=True)
+    del legacy_payload["vimKeybindings"]
+    assert type(config).model_validate(legacy_payload).vim_keybindings is False
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_enable_sticky_prompt(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(enable_sticky_prompt=enabled))
+
+    assert (
+        config.model_dump(mode="json", by_alias=True)["enableStickyPrompt"] is enabled
+    )
+    legacy_payload = config.model_dump(mode="json", by_alias=True)
+    del legacy_payload["enableStickyPrompt"]
+    assert type(config).model_validate(legacy_payload).enable_sticky_prompt is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_enable_mouse_capture(enabled: bool) -> None:
+    config = project_config_view(build_test_vibe_config(enable_mouse_capture=enabled))
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["enableMouseCapture"] is enabled
+    del payload["enableMouseCapture"]
+    assert type(config).model_validate(payload).enable_mouse_capture is True
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_config_view_projects_enable_file_autocomplete(enabled: bool) -> None:
+    config = project_config_view(
+        build_test_vibe_config(enable_file_autocomplete=enabled)
+    )
+
+    payload = config.model_dump(mode="json", by_alias=True)
+    assert payload["enableFileAutocomplete"] is enabled
+    del payload["enableFileAutocomplete"]
+    assert type(config).model_validate(payload).enable_file_autocomplete is True
+
+
 def test_config_view_projects_the_tls_trust_policy() -> None:
     config = project_config_view(build_test_vibe_config(enable_system_trust_store=True))
 
     assert (
         config.model_dump(mode="json", by_alias=True)["enableSystemTrustStore"] is True
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "scope"),
+    [
+        (SkillSource.LOCAL, SkillScope.GLOBAL),
+        (SkillSource.LOCAL, SkillScope.PROJECT),
+        (SkillSource.PLUGIN, SkillScope.GLOBAL),
+        (SkillSource.REGISTRY, SkillScope.PROJECT),
+        (SkillSource.BUILTIN, SkillScope.BUILTIN),
+    ],
+)
+def test_skill_summaries_carry_the_origin_the_slash_menu_tags(
+    source: SkillSource, scope: SkillScope
+) -> None:
+    skill = SkillInfo(
+        name="deploy", description="Ship it.", prompt="", source=source, scope=scope
+    )
+
+    [summary] = project_skill_summaries([skill])
+
+    payload = summary.model_dump(mode="json", by_alias=True)
+    assert (payload["source"], payload["scope"]) == (source.value, scope.value)
+    assert payload["userInvocable"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "enabled", "disabled", "own", "expected"),
+    [
+        (SkillSource.LOCAL, [], [], None, (True, False)),
+        (SkillSource.PLUGIN, [], ["deploy"], None, (True, True)),
+        (SkillSource.LOCAL, ["other"], [], None, (False, True)),
+        (SkillSource.LOCAL, ["deploy"], [], None, (True, True)),
+        (SkillSource.LOCAL, [], ["dep*"], None, (False, True)),
+        (SkillSource.LOCAL, [], ["deploy"], ["deploy"], (False, False)),
+        (SkillSource.LOCAL, [], ["deploy"], [], (False, True)),
+    ],
+    ids=[
+        "plain",
+        "plugin",
+        "outside-the-allowlist",
+        "inside-the-allowlist",
+        "disabled-by-a-pattern",
+        "disabled-by-name-in-the-writable-layer",
+        "disabled-by-name-in-another-layer",
+    ],
+)
+def test_installed_rows_are_locked_where_the_browser_cannot_switch_them(
+    source: SkillSource,
+    enabled: list[str],
+    disabled: list[str],
+    own: list[str] | None,
+    expected: tuple[bool, bool],
+) -> None:
+    skill = SkillInfo(
+        name="deploy",
+        description="Ship it.",
+        prompt="",
+        source=source,
+        scope=SkillScope.GLOBAL,
+    )
+    config = build_test_vibe_config(enabled_skills=enabled, disabled_skills=disabled)
+
+    [row] = project_installed_skill_summaries(
+        [InstalledSkill(info=skill, active=True)], config, own
+    )
+
+    assert (row.enabled, row.locked) == expected
 
 
 def test_snapshot_session_cost_discounts_cached_tokens() -> None:
@@ -113,7 +230,7 @@ def test_snapshot_session_cost_never_negative_when_cached_exceeds_prompt() -> No
 def test_model_config_view_defaults_thinking_levels_for_older_clients() -> None:
     # A payload from an older server lacks thinkingLevels; the view's default
     # keeps such clients rendering the five (ADR 0014).
-    from vibe.app_server.config import THINKING_LEVELS, ModelConfigView
+    from vibe.app_server.config import DEFAULT_THINKING_LEVELS, ModelConfigView
 
     view = ModelConfigView.model_validate({
         "name": "model-a",
@@ -123,7 +240,7 @@ def test_model_config_view_defaults_thinking_levels_for_older_clients() -> None:
         "displayName": "alpha",
     })
 
-    assert list(view.thinking_levels) == list(THINKING_LEVELS)
+    assert list(view.thinking_levels) == list(DEFAULT_THINKING_LEVELS)
     assert view.auto_compact_threshold is None
     assert view.source is None
 
@@ -142,7 +259,8 @@ async def test_config_view_groups_models_by_their_highest_priority_source(
     defining layer. A setting without ``name`` and ``provider`` defines
     nothing: a user or admin tweak never moves a catalog or GrowthBook model,
     and the thinking level a pick writes for the session never moves the
-    picked model.
+    picked model. The built-in default model is not listed: the catalog
+    provides models, so it is not available anymore (VIBE-5548).
     """
     from vibe.core.config import build_default_orchestrator
     from vibe.core.config.layers.admin import AdminConfigLayer
@@ -155,7 +273,7 @@ async def test_config_view_groups_models_by_their_highest_priority_source(
         "models": [
             _mistral_model("session-model"),
             # What a /model pick writes for the session.
-            {"alias": "mistral-medium-3.5", "thinking": "off"},
+            {"alias": "mistral-medium-latest", "thinking": "off"},
         ]
     })
     admin = orchestrator.get_layer(AdminConfigLayer.NAME)
@@ -188,8 +306,7 @@ async def test_config_view_groups_models_by_their_highest_priority_source(
     config_file = config_dir / "config.toml"
     user_config = tomllib.loads(config_file.read_text(encoding="utf-8"))
     user_config.update(
-        # Unpinned: the fixture's pin names a model this list replaces.
-        active_model="",
+        active_model="local-model",
         models=[
             _mistral_model("local-model"),
             {"name": "zai-glm-5-3", "temperature": 0.9},
@@ -210,11 +327,12 @@ async def test_config_view_groups_models_by_their_highest_priority_source(
         ("mistral-medium-latest", "catalog"),
         ("session-model", "project"),
         ("local-model", "local"),
-        ("mistral-medium-3.5", "local"),
     ]
+    # The built-in default is not available while the catalog lists models.
+    assert "mistral-medium-3.5" not in config.models
     # Display only: the settings still apply.
     assert config.models["zai-glm-5-3"].temperature == 0.1
-    assert config.models["mistral-medium-3.5"].thinking == "off"
+    assert config.models["mistral-medium-latest"].thinking == "off"
     assert view.active_model.source == "local"
     serialized = view.model_dump(mode="json", by_alias=True)
     assert serialized["models"][0]["source"] == "admin"
@@ -256,18 +374,76 @@ def test_config_view_carries_each_model_compaction_threshold() -> None:
             provider="mistral",
             alias="beta",
             max_context_length=100_000,
-            auto_compact_threshold=50_000,
+            auto_compact_threshold=60_000,
         ),
     ]
     config = project_config_view(
         build_test_vibe_config(models=models, active_model="alpha")
     )
 
-    assert config.active_model.auto_compact_threshold == 80_000
+    # An unset threshold reports the default for the model's window, the one its
+    # sessions compact at, so a client can show usage against it.
+    assert config.active_model.auto_compact_threshold == 50_000
     assert {model.alias: model.auto_compact_threshold for model in config.models} == {
-        "alpha": 80_000,
-        "beta": 50_000,
+        "alpha": 50_000,
+        "beta": 60_000,
     }
+
+
+def test_config_view_offers_the_thinking_levels_the_model_accepts() -> None:
+    """*Prepare*: GLM 5.3, which always reasons, and a model with no known facts.
+    *Do*: Project the config view.
+    *Assert*: GLM offers only its levels, no off; the other keeps the config's.
+    The picker used to offer off for GLM, and Core refused it.
+    """
+    from vibe.core.config import ModelConfig
+
+    models = [
+        ModelConfig(name="zai-glm-5-3", provider="mistral", alias="glm"),
+        ModelConfig(name="model-a", provider="mistral", alias="alpha"),
+    ]
+
+    config = project_config_view(
+        build_test_vibe_config(models=models, active_model="glm")
+    )
+
+    assert config.active_model.thinking_levels == ["low", "high", "max"]
+    assert {model.alias: model.thinking_levels for model in config.models} == {
+        "glm": ["low", "high", "max"],
+        "alpha": ["off", "low", "medium", "high", "max"],
+    }
+
+
+@pytest.mark.parametrize(("written", "runs"), [(None, "low"), ("high", "high")])
+def test_config_view_reports_the_thinking_level_the_session_runs(
+    written: str | None, runs: str
+) -> None:
+    """*Prepare*: GLM 5.3, which always reasons at low, high or max, with no level
+    written or one of its own.
+    *Do*: Project the config view.
+    *Assert*: The view reports the level the session runs, one of those offered.
+    It used to report the raw config value, off, outside the options, so the
+    picker highlighted another level than the current one.
+    """
+    from vibe.acp.utils import make_thinking_response
+    from vibe.core.config import ModelConfig
+
+    fields: dict[str, str] = {"name": "zai-glm-5-3", "provider": "mistral"}
+    if written is not None:
+        fields["thinking"] = written
+    models = [ModelConfig.model_validate({**fields, "alias": "glm"})]
+
+    config = project_config_view(
+        build_test_vibe_config(models=models, active_model="glm")
+    )
+
+    assert config.active_model.thinking == runs
+    assert config.active_model.thinking in config.active_model.thinking_levels
+    assert config.models[0].thinking == runs
+    # ACP's thinking option reads the same view.
+    option = make_thinking_response(config)
+    assert option.current_value == runs
+    assert runs in {choice.value for choice in option.options}
 
 
 def test_config_view_default_alias_never_follows_the_active_model() -> None:
@@ -356,9 +532,8 @@ def test_config_view_image_support_widens_for_a_backend_that_can_fall_back() -> 
 
     The unified backend describes an image for a blind model, so it accepts an
     attachment ``active_model.supports_images`` would reject -- but only when a
-    describer is actually reachable. Core's resource-link projection alone is
-    not enough: it only exists for a file-backed image, so promising on its
-    strength would let a pasted one through to a model that cannot read it.
+    describer is actually reachable. Without one the model would get ``[Image]``
+    in place of the pixels, so the send is refused instead.
     """
     from vibe.core.config import ModelConfig
 
@@ -397,13 +572,15 @@ async def test_apply_cached_experiment_variants_sets_routed_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # End-to-end for the warm-cache startup path.
-    from vibe.app_server._runtime import _apply_cached_experiment_variants
+    from vibe.app_server._cached_layers import _apply_cached_experiment_variants
     from vibe.core.config import build_default_orchestrator
     from vibe.core.experiments import cache
     from vibe.core.experiments.active import ExperimentName
     from vibe.core.experiments.models import EvalResponse
 
-    monkeypatch.setattr(cache, "_cache_key", lambda _config: "user-abc")
+    monkeypatch.setattr(
+        cache, "_cache_key", lambda _config, _credentials=None: "user-abc"
+    )
     orchestrator = await build_default_orchestrator()
     routing = ExperimentName.CLI_MODEL_ROUTING.value
     response = EvalResponse.model_validate({
@@ -423,11 +600,13 @@ async def test_apply_cached_experiment_variants_sets_routed_model(
 async def test_apply_cached_experiment_variants_noop_on_cold_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vibe.app_server._runtime import _apply_cached_experiment_variants
+    from vibe.app_server._cached_layers import _apply_cached_experiment_variants
     from vibe.core.config import build_default_orchestrator
     from vibe.core.experiments import cache
 
-    monkeypatch.setattr(cache, "_cache_key", lambda _config: "user-abc")
+    monkeypatch.setattr(
+        cache, "_cache_key", lambda _config, _credentials=None: "user-abc"
+    )
     orchestrator = await build_default_orchestrator()
 
     await _apply_cached_experiment_variants(orchestrator)
@@ -450,7 +629,7 @@ async def test_a_cached_system_prompt_variant_is_not_applied_when_experiments_ar
     """An evaluation run turns experiments off, so a system prompt variant cached
     by an earlier interactive session must not change its prompt.
     """
-    from vibe.app_server._runtime import _apply_cached_experiment_variants
+    from vibe.app_server._cached_layers import _apply_cached_experiment_variants
     from vibe.core.config import build_default_orchestrator
     from vibe.core.experiments import cache
     from vibe.core.experiments.active import ExperimentName
@@ -458,7 +637,7 @@ async def test_a_cached_system_prompt_variant_is_not_applied_when_experiments_ar
 
     monkeypatch.setattr(
         "vibe.core.telemetry.send.mistral_credential_cache_key",
-        lambda _config: "user-abc",
+        lambda _config, _credentials=None: "user-abc",
     )
     interactive = await build_default_orchestrator({"enable_telemetry": True})
     default_prompt = interactive.config.system_prompt_id

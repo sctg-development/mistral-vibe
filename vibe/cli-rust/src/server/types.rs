@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::effect::EffectEntry;
@@ -33,6 +33,8 @@ pub mod method {
     pub const SESSION_SUBAGENTS_READ: &str = "session/subagents/read";
     pub const RUNTIME_READ: &str = "runtime/read";
     pub const CONFIG_READ: &str = "config/read";
+    /// The JSON schema of the user config, each builtin tool's settings included.
+    pub const CONFIG_SCHEMA: &str = "config/schema";
     pub const WORKSPACE_PROMPT_PREPARE: &str = "workspace/prompt/prepare";
     /// Whether the cwd is trusted, plus what the gate must show when it is not.
     pub const WORKSPACE_TRUST_STATUS: &str = "workspace/trust/status";
@@ -87,6 +89,8 @@ pub mod method {
     pub const SETUP_STORE_CREDENTIAL: &str = "setup/store-credential";
     pub const SETUP_SUBMIT_CHOICES: &str = "setup/submit-choices";
     pub const SESSION_LOG_READ: &str = "session/log/read";
+    /// The `/context` breakdown of what fills the context window.
+    pub const SESSION_CONTEXT_READ: &str = "session/context/read";
     /// Live session logs paged into the `/debug` console.
     pub const DIAGNOSTICS_LOGS_READ: &str = "diagnostics/logs/read";
     pub const SESSION_RENAME: &str = "session/rename";
@@ -118,6 +122,22 @@ pub mod method {
     pub const PLUGIN_CATALOG_READ: &str = "plugin_catalog/read";
     /// Re-pin the session's plugins (`/reload-plugins`).
     pub const PLUGIN_RELOAD: &str = "plugin/reload";
+    /// The session's installed skills browsed by `/skills`, one per pin.
+    pub const SKILLS_INSTALLED: &str = "skills/installed";
+    /// The shared skills `/skills` can import, and newer versions of frozen pins.
+    pub const SKILLS_CATALOG: &str = "skills/catalog";
+    /// The published versions of one registry skill and their aliases.
+    pub const SKILLS_VERSIONS: &str = "skills/versions";
+    /// One registry skill's body at a version.
+    pub const SKILLS_DETAIL: &str = "skills/detail";
+    /// Pinned skills with a newer version not announced yet.
+    pub const SKILLS_UPDATES: &str = "skills/updates";
+    /// Pin a registry skill into a scope at a version or alias, or re-pin it there.
+    pub const SKILLS_IMPORT: &str = "skills/import";
+    /// Unpin a registry skill from one scope.
+    pub const SKILLS_REMOVE: &str = "skills/remove";
+    /// Turn a skill on or off for every scope it is installed in.
+    pub const SKILLS_SET_ENABLED: &str = "skills/setEnabled";
     /// Install or uninstall an `install_required` agent such as `lean`.
     pub const AGENTS_INSTALL: &str = "agents/install";
     pub const AGENTS_UNINSTALL: &str = "agents/uninstall";
@@ -133,6 +153,12 @@ pub mod method {
     pub const NARRATION_SUMMARIZE: &str = "narration/summarize";
     /// Remove a managed worktree (app-server `WorkspaceWorktreeRemoveParams`).
     pub const WORKSPACE_WORKTREE_REMOVE: &str = "workspace/git/worktrees/remove";
+    /// The session's PR/MR artifacts (app-server `artifacts/list`).
+    pub const ARTIFACTS_LIST: &str = "artifacts/list";
+    /// Refresh the session's PR/MR statuses from their provider (app-server `artifacts/sync`).
+    pub const ARTIFACTS_SYNC: &str = "artifacts/sync";
+    /// Mark PR/MR artifacts as seen (app-server `artifacts/markViewed`).
+    pub const ARTIFACTS_MARK_VIEWED: &str = "artifacts/markViewed";
 }
 
 /// Callback kinds the client advertises at `initialize` and knows how to answer.
@@ -152,6 +178,8 @@ pub mod notification {
     pub const CALLBACK_RESULT_FAILED: &str = "__callback_result_failed";
     /// Replay-server only: every frame a request released has been written.
     pub const REPLAY_DRAINED: &str = "replay/drained";
+    /// Replay-server only: a harness fence, written after the gated event it follows.
+    pub const REPLAY_FENCE: &str = "replay/fence";
     pub const RUNTIME_UPDATED: &str = "runtime/updated";
     pub const SESSION_SNAPSHOT: &str = "session/snapshot";
     pub const SESSION_UPDATED: &str = "session/updated";
@@ -181,12 +209,14 @@ pub mod notification {
     /// Compatibility duplicate the catalog publishes alongside the canonical
     /// notification; consumed without acting on it.
     pub const MCP_AUTH_URL_LEGACY: &str = "mcp/authUrl";
-    /// Progress of a `vibeCode/teleport/start` operation.
-    pub const TELEPORT_EVENT: &str = "vibeCode/teleport/event";
     /// A session lease was acquired or released; `leaseHolder` is null on release.
     pub const SESSION_LEASE_UPDATED: &str = "session/lease/updated";
     /// The server's lease watch died; held locks can no longer be trusted.
     pub const SESSION_LEASE_ENDED: &str = "session/lease/ended";
+    /// A session artifact (PR/MR) was detected or discovered.
+    pub const ARTIFACTS_CREATED: &str = "artifacts/created";
+    /// A session artifact changed (markViewed, provider sync).
+    pub const ARTIFACTS_UPDATED: &str = "artifacts/updated";
 }
 
 // JSON-RPC envelopes.
@@ -316,7 +346,8 @@ pub struct InitializeParams {
 pub struct ClientInfo {
     pub name: String,
     /// App-server `ClientInfo.entrypoint`: `programmatic` in headless mode, `cli`
-    /// for the TUI. Drives analytics launch-context (ADR 0008).
+    /// for the TUI, `acp` for `vibe-acp --setup`. Drives analytics launch-context
+    /// (ADR 0008).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
     pub version: String,
@@ -343,6 +374,14 @@ pub struct ClientCapabilities {
 pub struct SessionStartParams {
     pub agent_config: AgentConfig,
     pub history_limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "skip_default_bool")]
+    pub session_only: bool,
+    /// `"ephemeral"` for a session started only to warm the engine up before a
+    /// resume: the server counts it as opened only once it gets a message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
 }
 
 /// `WorktreeInput` (app-server `protocol.py`): create-or-reuse a named worktree,
@@ -383,6 +422,8 @@ pub struct AgentConfig {
     pub max_price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_session_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     #[serde(skip_serializing_if = "skip_default_bool", default)]
     pub headless: bool,
     #[serde(skip_serializing_if = "skip_default_bool", default)]
@@ -391,6 +432,8 @@ pub struct AgentConfig {
     pub workspace_roots: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_key: Option<String>,
 }
 
 fn skip_default_bool(b: &bool) -> bool {
@@ -590,13 +633,22 @@ pub struct PublicSessionState {
     #[serde(default)]
     pub turns: Option<Vec<Value>>,
     #[serde(default)]
-    pub turn_queue: Option<Value>,
+    pub turn_queue: Option<crate::server::PublicTurnQueue>,
     /// Provider retry in flight (app-server `PublicRetryState`); `None` when idle.
     #[serde(default)]
     pub retrying: Option<PublicRetryState>,
     /// Child (subagent) sessions in creation order.
     #[serde(default)]
     pub child_sessions: Vec<crate::server::PublicChildSession>,
+    /// The session's background processes; only their status is read.
+    #[serde(default, deserialize_with = "crate::utils::json::lenient")]
+    pub background_processes: Vec<PublicBackgroundProcess>,
+}
+
+/// `PublicBackgroundProcess`: a process the agent started in the background.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PublicBackgroundProcess {
+    pub status: String,
 }
 
 /// A provider retry in progress: which turn, why, and the transport detail.
@@ -647,6 +699,17 @@ pub struct PublicSession {
     pub worktree: Option<Box<PublicSessionWorktree>>,
     #[serde(default)]
     pub token_usage: Option<TokenUsage>,
+    // Boxed like `worktree`: the state rides `UiEvent`, whose variant sizes clippy bounds.
+    #[serde(default)]
+    pub status: Option<Box<PublicSessionStatus>>,
+}
+
+/// `PublicSessionStatus`: only the turn a running or blocked session is on is read.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicSessionStatus {
+    #[serde(default)]
+    pub active_turn_id: Option<String>,
 }
 
 /// A history entry, typed by its `type` discriminator (app-server `PublicHistoryEntry`).
@@ -668,7 +731,7 @@ pub enum HistoryEntry {
 impl HistoryEntry {
     /// Parse a stored entry `Value`; unknown or invalid shapes render as `Unknown`.
     pub fn from_value(value: &Value) -> Self {
-        serde_json::from_value(value.clone()).unwrap_or(Self::Unknown)
+        Self::deserialize(value).unwrap_or(Self::Unknown)
     }
 
     /// `generation_status == "in_progress"`: the entry is still streaming.
@@ -697,10 +760,21 @@ pub struct MessageEntry {
     pub role: String,
     #[serde(default)]
     pub source: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_message_content")]
+    #[serde(default, deserialize_with = "crate::utils::json::lenient")]
     pub content: Vec<MessageContent>,
     #[serde(default)]
     pub user_display_content: Option<serde_json::Value>,
+}
+
+impl MessageEntry {
+    /// The text blocks joined with `separator`.
+    pub fn text(&self, separator: &str) -> String {
+        let texts = self.content.iter().filter_map(|content| match content {
+            MessageContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        texts.collect::<Vec<_>>().join(separator)
+    }
 }
 
 fn assistant_role() -> String {
@@ -718,19 +792,6 @@ pub enum MessageContent {
     },
     #[serde(other)]
     Other,
-}
-
-fn deserialize_message_content<'de, D>(deserializer: D) -> Result<Vec<MessageContent>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    Ok(value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|item| serde_json::from_value(item.clone()).ok())
-        .collect())
 }
 
 #[derive(Debug, Clone, Deserialize)]

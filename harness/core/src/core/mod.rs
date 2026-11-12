@@ -7,6 +7,7 @@
 mod action_id;
 mod capabilities;
 mod checkpoint;
+mod compiled_config;
 pub(crate) mod config;
 mod conversation;
 mod error;
@@ -33,9 +34,12 @@ pub(crate) use checkpoint::Checkpoint;
 #[allow(unused_imports)]
 pub(crate) use checkpoint::decode_checkpoint;
 pub(crate) use config::HarnessConfig;
-pub(crate) use conversation::ConversationSeed;
+pub(crate) use conversation::{ConversationSeed, SpawnContext};
+#[cfg(feature = "python-binding")]
+pub(crate) use features::file_system::{BashTimeout, BashTimeoutSettings, restored_bash_call};
 #[cfg(test)]
 pub(crate) use features::large_output::Policy as LargeOutputPolicy;
+pub(crate) use features::permissions::{PermissionPolicy, UnmatchedToolPattern};
 pub(crate) use session::HarnessSession;
 pub(crate) use step_protocol::{HarnessApplyResult, HarnessInput, Inspection};
 pub(crate) use wire::content::ContentBlock;
@@ -55,39 +59,73 @@ pub(crate) use testing::{
     CommandState, CompactionBudget, CompactionPolicy, CompactionTrigger, CompletionActionKind,
     CompletionCandidate, CompletionFinishReason, CompletionHookOutput, CompletionPurpose,
     CompletionResult, CompletionResultPart, CompletionResultSemanticPart, ContextSettings,
-    ExternalTool, ExternalToolCall, HarnessConfigurationChange, HarnessSettings, HookBinding,
-    HookCall, HookPoint, HookResult, HookSelector, HookToolCall, HookToolKey, HookToolTarget,
-    ImageDeliveryMode, ImageDeliverySettings, ImageTokenCost, ModelInputUpdate, ModelMessageUpdate,
-    ModelToolCatalogUpdate, Notification, NotificationLevel, NotificationSource,
-    PendingActionInspection, PendingCompletionPurpose, PendingLifecycleHook, PreAgentTurnOutput,
-    PreToolCallOutput, ProcessTerminalStatus, ProgramExecution, ProgrammaticToolSettings,
-    ProtocolError, ProvidedToolCall, ProvidedToolDefinition, ProvidedToolExposure, QueuedTurn,
-    ReasoningContent, RuntimeBuiltinToolCall, RuntimeBuiltinToolName, SessionStatus,
-    SkillDefinition, StateInspection, StoredMessageSource, StructuredContent, SubagentMode,
-    TokenUsage, ToolArguments, ToolBatch, ToolCall, ToolContext, ToolDefinition, ToolExecution,
-    ToolExecutionState, ToolGroupDefinition, ToolGroupMetadata, ToolOrigin, ToolOutcome,
-    ToolResult, ToolSettings, ToolTarget, Turn, TurnOutcome, TurnSettings, UserMessageMode,
+    ExternalCallStage, ExternalTool, ExternalToolCall, HarnessConfigurationChange, HarnessSettings,
+    HookBinding, HookCall, HookPoint, HookResult, HookSelector, HookToolCall, HookToolKey,
+    HookToolTarget, ImageCostRule, ImageDeliveryMode, ImageDeliverySettings, InputModality,
+    ModelFacts, ModelInputUpdate, ModelMessageUpdate, ModelToolCatalogUpdate, Notification,
+    NotificationLevel, NotificationSource, PendingActionInspection, PendingCompletionPurpose,
+    PendingLifecycleHook, PreAgentTurnOutput, PreToolCallOutput, ProcessTerminalStatus,
+    ProgramExecution, ProgrammaticToolSettings, ProtocolError, ProvidedToolCall,
+    ProvidedToolDefinition, ProvidedToolExposure, ReasoningContent, RuntimeBuiltinToolCall,
+    RuntimeBuiltinToolName, SessionStatus, SkillDefinition, StateInspection, StoredMessageSource,
+    StructuredContent, SubagentMode, TokenUsage, ToolArguments, ToolBatch, ToolCall, ToolContext,
+    ToolDefinition, ToolExecution, ToolExecutionState, ToolGroupDefinition, ToolGroupMetadata,
+    ToolOrigin, ToolOutcome, ToolResult, ToolSettings, ToolTarget, Turn, TurnOutcome, TurnSettings,
+    UserMessageMode,
 };
 
+use std::sync::Arc;
+
+use crate::core::compiled_config::CompiledConfig;
 use crate::core::config::HarnessConfigUpdate;
 use crate::core::error::CoreError;
-use crate::core::features::compaction::prompt_message;
+use crate::core::features::compaction::{
+    CompactionLimits, EstimateCorrection, RequestMeasurements, corrected_request_tokens,
+    next_turn_compaction_unfit,
+};
 use crate::core::features::notifications::NotificationState;
-use crate::core::features::skills;
 use crate::core::features::subagents;
 use crate::core::model_context::ModelContext;
-use crate::core::model_input_budget::estimate_model_input_tokens;
 use crate::core::prompt::{build_system_prompt, configuration_update_changes_system_prompt};
 use crate::core::router::reduce;
 use crate::core::state::{HarnessState, TurnState};
 use crate::core::step_protocol::DeterminismContext;
 use crate::core::step_protocol::HarnessCommand;
-use crate::core::step_protocol::{Outcome, Transition, TurnCompletion};
+use crate::core::step_protocol::{Outcome, Transition};
 use crate::core::tools::resolved::ResolvedTools;
 use crate::core::wire::message::StoredMessage;
 
 pub(crate) fn hook_tool_catalog(config: &HarnessConfig) -> Vec<hooks::HookToolKey> {
     tools::resolved::hook_tool_catalog(config)
+}
+
+/// The key of the tool a top-level model call named `name` reaches, or `None`
+/// when no top-level tool has that name.
+pub(crate) fn direct_tool_key(config: &HarnessConfig, name: &str) -> Option<hooks::HookToolKey> {
+    tools::resolved::direct_tool_key(config, name)
+}
+
+/// Checks one permission rule pattern with the same glob syntax that policy
+/// evaluation uses, so a Runtime can reject it before it creates a Session.
+/// An argument pattern must also use one separator spelling.
+pub(crate) fn validate_permission_pattern(pattern: &str, arguments: bool) -> Result<(), String> {
+    let field = if arguments {
+        features::permissions::PermissionPatternField::Arguments
+    } else {
+        features::permissions::PermissionPatternField::Tools
+    };
+    features::permissions::validate_permission_pattern(pattern, field)
+}
+
+/// The `tools` patterns of `policy` that name a namespace of `tool_ids` but
+/// match none of its tools, read with the glob syntax that policy evaluation
+/// uses, so a Runtime can reject a rule that never applies.
+pub(crate) fn unmatched_permission_tool_patterns(
+    policy: &PermissionPolicy,
+    tool_ids: &[String],
+    open_namespaces: &[String],
+) -> Vec<UnmatchedToolPattern> {
+    policy.unmatched_tool_patterns(tool_ids, open_namespaces)
 }
 
 pub(crate) fn initial_state(config: HarnessConfig) -> Result<HarnessState, CoreError> {
@@ -104,27 +142,22 @@ pub(crate) fn initial_state_with_history(
             "task_id must not be empty",
         ));
     }
-    config::validate_settings(&config.settings)?;
-    config::validate_skill_catalog_fingerprint(config.skill_catalog_fingerprint.as_deref())?;
-    let resolved_tools = ResolvedTools::compile(&config)?;
-    validate_compaction_budget(&config, &resolved_tools)?;
-    skills::validate(config.skills())
-        .map_err(|detail| CoreError::invalid_configuration("skills", detail))?;
-    capabilities::validate(&config)
-        .map_err(|detail| CoreError::invalid_configuration("capabilities", detail))?;
+    let compiled = CompiledConfig::compile(config)?;
     let messages = import_initial_history(
-        &config,
-        resolved_tools.tool_group_inventory_prompt_section(),
+        compiled.config(),
+        compiled
+            .resolved_tools()
+            .tool_group_inventory_prompt_section(),
         initial_history,
     )?;
-    let hook_binding_index = capabilities::HookBindingIndex::from_config(&config);
     Ok(HarnessState {
-        config,
-        resolved_tools,
-        hook_binding_index,
+        compiled: Arc::new(compiled),
         context: ModelContext::new(messages),
         compaction_count: 0,
         last_reported_context_tokens: None,
+        estimate_correction: EstimateCorrection::NONE,
+        exact_request_tokens: None,
+        rebuilt_since_reply: false,
         turn: TurnState::Idle,
         last_finished_turn_id: None,
         notifications: NotificationState::default(),
@@ -154,40 +187,169 @@ pub(crate) fn reconfigure_in_place(
     state: &mut HarnessState,
     update: HarnessConfigUpdate,
 ) -> Result<(), CoreError> {
-    let rebuild_system_prompt = configuration_update_changes_system_prompt(&state.config, &update);
+    let rebuild_system_prompt = configuration_update_changes_system_prompt(state.config(), &update);
     // Build and validate the whole next configuration before touching state so
     // this operation remains locally atomic as well as session-atomic.
-    let (next_config, next_resolved_tools) = planned_config(&state.config, update)?;
-    // Settings can add or remove direct tools such as `wait`, so compare the
-    // compiled model tool list as well as the prompt and capability sources.
-    let tool_catalog_changed = tool_catalog_source_changed(&state.config, &next_config)
-        || state.resolved_tools.top_level_tools() != next_resolved_tools.top_level_tools();
-    let agent_image_delivery_changed = state.config.settings.context.image_delivery.agent
-        != next_config.settings.context.image_delivery.agent;
-    state.config = next_config;
-    state
-        .notifications
-        .retain_recent(state.config.settings.context.notifications.recent_ids);
-    state.resolved_tools = next_resolved_tools;
-    state.hook_binding_index = capabilities::HookBindingIndex::from_config(&state.config);
-    if tool_catalog_changed {
-        state.mark_tool_catalog_changed();
-    }
-    if rebuild_system_prompt && !state.context.is_empty() {
+    let next = planned_config(state.config(), update)?;
+    // Settings such as `model_wait` add or remove direct-only tools, which the
+    // tool section of the system prompt names.
+    let rebuild_system_prompt = rebuild_system_prompt
+        || state.resolved_tools().tool_group_inventory_prompt_section()
+            != next.resolved_tools().tool_group_inventory_prompt_section();
+    let patched_messages = if rebuild_system_prompt && !state.context.is_empty() {
         // Rewriting the system prompt in place invalidates the provider KV cache for
         // the whole history. A skill catalog change takes this path because the
         // catalog lives in the system prompt. It stops once catalog changes are
         // delivered as appended context with a KV-cache-friendly context upsert.
         let system_prompt = build_system_prompt(
-            &state.config,
-            state.resolved_tools.tool_group_inventory_prompt_section(),
+            next.config(),
+            next.resolved_tools().tool_group_inventory_prompt_section(),
         );
-        let messages = patched_system_prompt(state.context.messages(), system_prompt)?;
+        Some(patched_system_prompt(
+            state.context.messages(),
+            system_prompt,
+        )?)
+    } else {
+        None
+    };
+    let measurements = carried_measurements(
+        &state.config().settings.context,
+        next.config(),
+        next.resolved_tools(),
+        patched_messages
+            .as_deref()
+            .unwrap_or_else(|| state.context.messages()),
+        RequestMeasurements::of(state),
+    )?;
+    // Settings can add or remove direct tools such as `wait`, so compare the
+    // compiled model tool list as well as the prompt and capability sources.
+    let tool_catalog_changed = tool_catalog_source_changed(state.config(), next.config())
+        || state.resolved_tools().top_level_tools() != next.resolved_tools().top_level_tools();
+    let current_image_delivery = state.config().settings.context.effective_image_delivery();
+    let next_image_delivery = next.config().settings.context.effective_image_delivery();
+    let agent_image_delivery_changed = current_image_delivery.agent != next_image_delivery.agent;
+    store_measurements(state, measurements);
+    state.compiled = Arc::new(next);
+    state
+        .notifications
+        .retain_recent(state.config().settings.context.notifications.recent_ids);
+    if tool_catalog_changed {
+        state.mark_tool_catalog_changed();
+    }
+    if let Some(messages) = patched_messages {
         state.context.replace_messages(messages);
     } else if agent_image_delivery_changed && !state.context.is_empty() {
         state.context.mark_projection_replacement();
     }
     Ok(())
+}
+
+/// Applies to a Session restored under new settings the rule a reconfiguration
+/// applies, from `previous`, the context settings its checkpoint was taken
+/// under.
+pub(crate) fn move_from_settings(
+    state: &mut HarnessState,
+    previous: &config::ContextSettings,
+) -> Result<(), CoreError> {
+    let measurements = carried_measurements(
+        previous,
+        state.config(),
+        state.resolved_tools(),
+        state.context.messages(),
+        RequestMeasurements::of(state),
+    )?;
+    store_measurements(state, measurements);
+    Ok(())
+}
+
+/// What a Session keeps of its request measurements when its context settings
+/// move from `current` to those of `next`, once the move is checked.
+///
+/// The correction, the provider's last reported size and an exact count all
+/// measured requests under the old model facts and image delivery, so new ones
+/// start over with none of them. So does the guard against compacting twice:
+/// a compaction under the old facts says nothing about whether one under the
+/// new facts fits, so the new model's first refusal compacts. New model facts are refused when the next
+/// turn could not carry `messages` under them, counted as that turn's check
+/// will count them.
+fn carried_measurements(
+    current: &config::ContextSettings,
+    next: &HarnessConfig,
+    next_tools: &ResolvedTools,
+    messages: &[StoredMessage],
+    measured: RequestMeasurements,
+) -> Result<RequestMeasurements, CoreError> {
+    let measurements = if CompactionLimits::model_facts_changed(current, &next.settings.context) {
+        RequestMeasurements {
+            last_reported: None,
+            correction: EstimateCorrection::NONE,
+            exact: None,
+            rebuilt_since_reply: false,
+        }
+    } else {
+        measured
+    };
+    if next.settings.context.model_facts != current.model_facts {
+        validate_model_switch(next, next_tools, messages, measurements)?;
+    }
+    Ok(measurements)
+}
+
+fn store_measurements(state: &mut HarnessState, measurements: RequestMeasurements) {
+    state.last_reported_context_tokens = measurements.last_reported;
+    state.estimate_correction = measurements.correction;
+    state.exact_request_tokens = measurements.exact;
+    state.rebuilt_since_reply = measurements.rebuilt_since_reply;
+}
+
+/// Refuses new model facts only when the Session's context could not be carried
+/// under them: the context is at or above the new compaction threshold and the
+/// automatic compaction the next Turn would start cannot fit the new budgets.
+/// Context the next Turn can compact is accepted. Without compaction nothing
+/// shrinks the context, so it must fit the new context window as it is.
+pub(crate) fn validate_model_switch(
+    config: &HarnessConfig,
+    resolved_tools: &ResolvedTools,
+    messages: &[StoredMessage],
+    measurements: RequestMeasurements,
+) -> Result<(), CoreError> {
+    let facts = &config.settings.context.model_facts;
+    if config.settings.context.compaction_threshold().is_none() {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let tokens = corrected_request_tokens(
+            &config.settings,
+            resolved_tools.top_level_tools(),
+            messages,
+            measurements,
+        )?;
+        if tokens < facts.context_window {
+            return Ok(());
+        }
+        return Err(CoreError::invalid_configuration(
+            "settings.context.model_facts",
+            format!(
+                "the Session's context cannot move to a model with a {}-token context window \
+                 and compaction disabled: the context needs about {tokens} tokens",
+                facts.context_window
+            ),
+        ));
+    }
+    let Some(unfit) = next_turn_compaction_unfit(config, resolved_tools, messages, measurements)?
+    else {
+        return Ok(());
+    };
+    Err(CoreError::invalid_configuration(
+        "settings.context.model_facts",
+        format!(
+            "the Session's context cannot move to a model with a {}-token context window \
+             and a compaction threshold of {}: {}",
+            facts.context_window,
+            facts.compaction_threshold,
+            unfit.error().message
+        ),
+    ))
 }
 
 fn patched_system_prompt(
@@ -248,7 +410,7 @@ fn tool_catalog_source_changed(current: &HarnessConfig, next: &HarnessConfig) ->
 fn planned_config(
     current: &HarnessConfig,
     update: HarnessConfigUpdate,
-) -> Result<(HarnessConfig, ResolvedTools), CoreError> {
+) -> Result<CompiledConfig, CoreError> {
     let mut next = current.clone();
     if let Some(settings) = update.settings {
         if current.settings.tools.permissions != settings.tools.permissions {
@@ -278,15 +440,7 @@ fn planned_config(
         next.system_instructions = system_instructions;
     }
 
-    config::validate_settings(&next.settings)?;
-    config::validate_skill_catalog_fingerprint(next.skill_catalog_fingerprint.as_deref())?;
-    let resolved_tools = ResolvedTools::compile(&next)?;
-    validate_compaction_budget(&next, &resolved_tools)?;
-    skills::validate(next.skills())
-        .map_err(|detail| CoreError::invalid_configuration("skills", detail))?;
-    capabilities::validate(&next)
-        .map_err(|detail| CoreError::invalid_configuration("capabilities", detail))?;
-    Ok((next, resolved_tools))
+    CompiledConfig::compile(next)
 }
 
 /// Built-in feature switches shape the model tool catalog and system prompt, so
@@ -298,7 +452,7 @@ fn validate_builtin_reconfiguration(
     let unchanged = [
         (
             "settings.tools.file_system",
-            current.file_system == next.file_system,
+            current.file_system.is_enabled() == next.file_system.is_enabled(),
         ),
         ("settings.tools.skills", current.skills == next.skills),
         (
@@ -321,35 +475,6 @@ fn validate_builtin_reconfiguration(
     Ok(())
 }
 
-fn validate_compaction_budget(
-    config: &HarnessConfig,
-    resolved_tools: &ResolvedTools,
-) -> Result<(), CoreError> {
-    let Some(token_threshold) = config.settings.context.compaction.token_threshold() else {
-        return Ok(());
-    };
-    let messages = vec![
-        StoredMessage::generated_system(Message::system_text(build_system_prompt(
-            config,
-            resolved_tools.tool_group_inventory_prompt_section(),
-        ))),
-        prompt_message(""),
-    ];
-    if estimate_model_input_tokens(
-        &messages,
-        resolved_tools.top_level_tools(),
-        config.settings.context.image_delivery.compaction,
-        config.settings.context.image_token_cost,
-    )? >= token_threshold
-    {
-        return Err(CoreError::invalid_configuration(
-            "settings.context.compaction.token_threshold",
-            "token threshold cannot fit the generated system prompt, tool catalog, and compaction prompt",
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn advance_in_place(
     state: &mut HarnessState,
     command: HarnessCommand,
@@ -358,31 +483,12 @@ pub(crate) fn advance_in_place(
     let Outcome {
         actions,
         observations,
-        completed,
     } = reduce(state, command, determinism)?;
     state.commit_model_input_changes()?;
-    // A completion produced by this command wins over the one recorded in
-    // state: `complete_output` can finish a turn and immediately start a queued
-    // one, leaving state active while the transition still reports the turn
-    // that just ended.
-    let completed = completed.or_else(|| terminal_completion(&state.turn));
     Ok(Transition {
-        completed,
         effects: actions,
         observations,
     })
-}
-
-/// The terminal result already recorded in state, for commands that did not end
-/// a turn themselves but are reported while a finished turn is still current.
-fn terminal_completion(turn: &TurnState) -> Option<TurnCompletion> {
-    match turn {
-        TurnState::Terminal { turn_id, outcome } => Some(TurnCompletion {
-            turn_id: turn_id.clone(),
-            outcome: outcome.clone(),
-        }),
-        TurnState::Idle | TurnState::Compacting { .. } | TurnState::Active(_) => None,
-    }
 }
 
 pub(crate) fn require_action_id(expected: &str, actual: &str) -> Result<(), CoreError> {
@@ -511,9 +617,8 @@ mod tests {
     fn reconfigure_updates_runtime_limits_and_existing_system_message() {
         let mut settings = config().settings;
         settings.turn.max_iterations = Some(2);
-        settings.context.compaction = CompactionPolicy::Automatic {
-            token_threshold: 40_000,
-        };
+        settings.context.compaction = CompactionPolicy::Automatic;
+        settings.context.model_facts.compaction_threshold = 40_000;
         settings.tools.programmatic.max_effects = 64;
         settings.tools.programmatic.max_operations = 512;
         let state = reconfigure(
@@ -528,16 +633,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.config.system_instructions, "updated system");
-        assert_eq!(state.config.settings.turn.max_iterations, Some(2));
+        assert_eq!(state.config().system_instructions, "updated system");
+        assert_eq!(state.config().settings.turn.max_iterations, Some(2));
         assert_eq!(
-            state.config.settings.context.compaction,
-            CompactionPolicy::Automatic {
-                token_threshold: 40_000
-            }
+            state.config().settings.context.compaction_threshold(),
+            Some(40_000)
         );
-        assert_eq!(state.config.settings.tools.programmatic.max_effects, 64);
-        assert_eq!(state.config.settings.tools.programmatic.max_operations, 512);
+        assert_eq!(state.config().settings.tools.programmatic.max_effects, 64);
+        assert_eq!(
+            state.config().settings.tools.programmatic.max_operations,
+            512
+        );
         assert_eq!(
             message_role(&state.context.messages()[0].message),
             Role::System
@@ -567,7 +673,7 @@ mod tests {
         };
         assert_eq!(
             state
-                .hook_binding_index
+                .hook_binding_index()
                 .select(HookPoint::PreToolCall, Some(&write_key)),
             ["write-hook"]
         );
@@ -592,13 +698,13 @@ mod tests {
 
         assert!(
             state
-                .hook_binding_index
+                .hook_binding_index()
                 .select(HookPoint::PreToolCall, Some(&write_key))
                 .is_empty()
         );
         assert_eq!(
             state
-                .hook_binding_index
+                .hook_binding_index()
                 .select(HookPoint::PreToolCall, Some(&read_key)),
             ["read-hook"]
         );
@@ -607,7 +713,7 @@ mod tests {
     #[test]
     fn reconfigure_does_not_make_subagents_mutable() {
         let state = started();
-        let mut settings = state.config.settings.clone();
+        let mut settings = state.config().settings.clone();
         settings.tools.subagents = SubagentMode::Disabled;
 
         let error = reconfigure(
@@ -629,7 +735,7 @@ mod tests {
     fn reconfigure_rejects_an_operation_limit_below_the_effect_limit_without_mutation() {
         let state = started();
         let before = state.clone();
-        let mut settings = before.config.settings.clone();
+        let mut settings = before.config().settings.clone();
         settings.tools.programmatic.max_effects = 64;
         settings.tools.programmatic.max_operations = 63;
 
@@ -646,9 +752,9 @@ mod tests {
             error.detail(),
             "settings.tools.programmatic.max_operations must be greater than or equal to settings.tools.programmatic.max_effects"
         );
-        assert_eq!(before.config.settings.tools.programmatic.max_effects, 128);
+        assert_eq!(before.config().settings.tools.programmatic.max_effects, 128);
         assert_eq!(
-            before.config.settings.tools.programmatic.max_operations,
+            before.config().settings.tools.programmatic.max_operations,
             1024
         );
     }

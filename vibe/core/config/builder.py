@@ -7,8 +7,9 @@ import copy
 from dataclasses import dataclass
 from typing import Any, cast
 
-from pydantic import BeforeValidator
+from pydantic import BeforeValidator, ValidationError
 from pydantic.fields import FieldInfo
+from pydantic_core import ErrorDetails
 
 from vibe.core.config.layer import (
     ConfigLayer,
@@ -32,6 +33,28 @@ class ConfigMergeError(ValueError):
         if field_name == "mcp_servers" and isinstance(value, dict):
             message += " Use [[mcp_servers]] instead of [mcp_servers.<name>]."
         super().__init__(message)
+
+
+class InvalidConfigError(ValueError):
+    """The merged config breaks a rule of its schema, which the user can fix.
+
+    Carries pydantic's errors as one readable issue per problem, without the
+    error type and input dump of ``str(ValidationError)``, so a client can show
+    it as a configuration error.
+    """
+
+    @classmethod
+    def from_validation_error(cls, err: ValidationError) -> InvalidConfigError:
+        return cls("; ".join(_config_issue(issue) for issue in err.errors()))
+
+
+def _config_issue(issue: ErrorDetails) -> str:
+    """One refused setting, named once, without pydantic's ``Value error,``."""
+    message = issue["msg"].removeprefix("Value error, ")
+    setting = ".".join(str(part) for part in issue["loc"])
+    if not setting or message.startswith(f"{setting}:"):
+        return message
+    return f"{setting}: {message}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,16 +121,25 @@ class ConfigBuilder[S: ConfigSchema]:
                         data = await layer.load(force=force_load)
                     raw = data.model_dump()
                     if raw:
+                        layer.check_lower_layers([
+                            (below.name, below.data) for below in layer_dicts
+                        ])
                         layer_dicts.append(_LayerData(name=layer.name, data=raw))
                 except (UntrustedLayerError, EmptyLayerError):
                     continue
 
+            prepared = self._schema.prepare_layers([
+                (ld.name, ld.data) for ld in layer_dicts
+            ])
             merged, origins, defined_entries = self._merge_fields(
-                self._schema, layer_dicts
+                self._schema,
+                [_LayerData(name=name, data=data) for name, data in prepared],
             )
-            return self._schema.validate_merged(
+            config = self._schema.validate_merged(
                 merged, origins=origins, defined_entries=defined_entries
             )
+            config.check_layer_keys([(ld.name, ld.data) for ld in layer_dicts])
+            return config
 
     def _merge_fields(
         self, schema: type[S], layer_dicts: list[_LayerData]

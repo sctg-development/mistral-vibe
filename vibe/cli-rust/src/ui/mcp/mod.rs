@@ -7,10 +7,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
 
+use super::visual_lines::VisualLine;
 use super::{hint_line, scrollbar, search_field, theme};
 use crate::app::App;
 use crate::mcp::{help_text, rows};
-use layout::VisualLine;
 
 /// Columns the option list loses to the border, the padding and its own gutter.
 const GUTTER: u16 = 6;
@@ -67,9 +67,7 @@ fn draw_box(app: &mut App, f: &mut Frame, area: Rect, lines: &[VisualLine]) {
     f.render_widget(Clear, area);
     f.buffer_mut()
         .set_style(area, Style::default().bg(theme::background()));
-    let border = Style::default()
-        .fg(theme::popup_border())
-        .bg(theme::background());
+    let border = theme::border_style().bg(theme::background());
     f.render_widget(
         Block::default().borders(Borders::ALL).border_style(border),
         area,

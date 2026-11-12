@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from vibe.app_server._account import AccountGateway
 from vibe.app_server._identity import IdentityGateway
@@ -10,9 +10,22 @@ from vibe.app_server.models import PublicCallbackEntry
 from vibe.app_server.protocol import (
     ClientCapabilities,
     ClientInfo,
+    SessionPeerArchiveParams,
+    SessionPeerArchiveResponse,
+    SessionPeerListParams,
+    SessionPeerListResponse,
+    SessionPeerMarkSeenParams,
+    SessionPeerMarkSeenResponse,
+    SessionPeerReadParams,
+    SessionPeerReadResponse,
+    SessionPeerRestoreParams,
+    SessionPeerRestoreResponse,
+    SessionPeerSendParams,
+    SessionPeerSendResponse,
     SessionSpawnParams,
     SessionSpawnResponse,
 )
+from vibe.core.platform_auth import PlatformCredentialProvider
 
 
 class SessionBackendServices(Protocol):
@@ -35,3 +48,34 @@ class SessionBackendServices(Protocol):
     async def spawn_session(
         self, params: SessionSpawnParams
     ) -> SessionSpawnResponse: ...
+
+    async def list_peer_sessions(
+        self, params: SessionPeerListParams
+    ) -> SessionPeerListResponse: ...
+
+    async def read_peer_session(
+        self, params: SessionPeerReadParams
+    ) -> SessionPeerReadResponse: ...
+
+    async def send_to_peer_session(
+        self, params: SessionPeerSendParams
+    ) -> SessionPeerSendResponse: ...
+
+    async def archive_peer_sessions(
+        self, params: SessionPeerArchiveParams
+    ) -> SessionPeerArchiveResponse: ...
+
+    async def restore_peer_sessions(
+        self, params: SessionPeerRestoreParams
+    ) -> SessionPeerRestoreResponse: ...
+
+    async def mark_peer_sessions_seen(
+        self, params: SessionPeerMarkSeenParams
+    ) -> SessionPeerMarkSeenResponse: ...
+
+
+@runtime_checkable
+class SessionBackendPlatformCredentials(Protocol):
+    def platform_credentials(
+        self, api_key_env_var: str
+    ) -> PlatformCredentialProvider: ...

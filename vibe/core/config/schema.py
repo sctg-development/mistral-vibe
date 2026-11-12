@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 from pydantic.fields import FieldInfo
 
+from vibe.core.config.patch import PatchOp
 from vibe.core.utils.merge import MergeStrategy
 
 
@@ -48,6 +49,41 @@ class ConfigSchema(BaseModel):
         also adjust an entry another layer defines.
         """
         return True
+
+    @classmethod
+    def prepare_layers(
+        cls, layers: list[tuple[str, dict[str, Any]]]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Rewrite each layer's data before the merge; unchanged by default.
+
+        ``layers`` are (layer name, raw data) pairs in stack order; the result
+        keeps them in that order.
+        """
+        return layers
+
+    def expand_layer_write(
+        self, op: PatchOp, layer_data: Mapping[str, Any]
+    ) -> list[PatchOp]:
+        """The ops a write takes in a layer holding ``layer_data``. One by default."""
+        del layer_data
+        return [op]
+
+    def layer_write_op(self, op: PatchOp, layer_data: Mapping[str, Any]) -> PatchOp:
+        """The op a write takes in a layer holding ``layer_data``.
+
+        Unchanged by default; a schema whose ``prepare_layers`` re-keys entries
+        maps the merged key back to the key the layer uses.
+        """
+        del layer_data
+        return op
+
+    def check_layer_keys(self, layers: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
+        """Look at each layer's raw keys once the merged config is valid.
+
+        The merge reads only declared keys; a schema overrides this to say
+        what it makes of the rest. ``layers`` are (layer name, raw data) pairs
+        in stack order.
+        """
 
     @classmethod
     def validate_merged(

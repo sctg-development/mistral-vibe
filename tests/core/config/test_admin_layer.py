@@ -104,7 +104,7 @@ async def test_admin_global_compaction_threshold_cannot_be_bypassed_by_model() -
     alias = orchestrator.config.get_active_model().alias
 
     failures = await orchestrator.set_field(
-        f"/models/{alias}/auto_compact_threshold", 0
+        f"/models/{alias}/auto_compact_threshold", 120_000
     )
 
     assert failures == []
@@ -113,7 +113,7 @@ async def test_admin_global_compaction_threshold_cannot_be_bypassed_by_model() -
 
 @pytest.mark.asyncio
 async def test_admin_global_compaction_threshold_overrides_a_declared_window() -> None:
-    # Accepted as-is for now: an admin-set global wins over the 80% the
+    # Accepted as-is for now: an admin-set global wins over the default the
     # model's own window would derive.
     defaults = DefaultConfigLayer(schema=VibeConfigSchema)
     overrides = OverridesLayer(
@@ -182,6 +182,26 @@ async def test_admin_enable_auto_approve_false_shadows_lower_layers() -> None:
     # A lower-layer write cannot re-enable the mode.
     await orchestrator.set_field("/enable_auto_approve", True)
     assert orchestrator.config.enable_auto_approve is False
+
+
+@pytest.mark.asyncio
+async def test_admin_enable_pr_monitoring_false_shadows_lower_layers() -> None:
+    defaults = DefaultConfigLayer(schema=VibeConfigSchema)
+    overrides = OverridesLayer(data={"enable_pr_monitoring": True})
+    admin = AdminConfigLayer()
+    admin.load_managed_toml("enable_pr_monitoring = false\n")
+
+    orchestrator = await ConfigOrchestrator.create(
+        schema=VibeConfigSchema,
+        layers=[defaults, overrides, admin],
+        default_layer_resolver=lambda: overrides,
+    )
+
+    assert orchestrator.config.enable_pr_monitoring is False
+
+    # A lower-layer write cannot turn monitoring back on.
+    await orchestrator.set_field("/enable_pr_monitoring", True)
+    assert orchestrator.config.enable_pr_monitoring is False
 
 
 @pytest.mark.asyncio

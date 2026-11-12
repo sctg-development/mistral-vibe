@@ -28,6 +28,88 @@ fn deserialization_rejects_rule_without_decision() {
     assert!(error.to_string().contains("missing field `decision`"));
 }
 
+#[test]
+fn deserialization_error_names_rule_field_and_pattern() {
+    let policy = serde_json::json!({
+        "default": "allow",
+        "rules": [
+            {
+                "tools": ["linear.*"],
+                "decision": "allow",
+                "allowlist": [],
+                "denylist": [],
+                "sensitive": [],
+            },
+            {
+                "tools": ["client.deploy_service"],
+                "decision": "deny",
+                "allowlist": [],
+                "denylist": ["[production"],
+                "sensitive": [],
+            },
+        ],
+    });
+
+    let error = serde_json::from_value::<PermissionPolicy>(policy)
+        .expect_err("an invalid argument pattern must be rejected");
+
+    assert_eq!(
+        error.to_string(),
+        "permission rule 1 for tools [\"client.deploy_service\"]: invalid denylist pattern \
+         \"[production\": Pattern syntax error near position 0: invalid range pattern"
+    );
+}
+
+#[test]
+fn deserialization_accepts_an_argument_pattern_that_mixes_separator_spellings() {
+    let policy = serde_json::json!({
+        "default": "allow",
+        "rules": [{
+            "tools": ["client.deploy_service"],
+            "decision": "allow",
+            "allowlist": [],
+            "denylist": [r#"*"environment":"production", "region": "eu"*"#],
+            "sensitive": [],
+        }],
+    });
+
+    serde_json::from_value::<PermissionPolicy>(policy)
+        .expect("policy loading checks only the glob syntax");
+}
+
+#[rstest]
+#[case::invalid_glob(
+    "[production",
+    PermissionPatternField::Arguments,
+    "is not a valid glob: Pattern syntax error near position 0: invalid range pattern"
+)]
+#[case::mixed_separator_spellings(
+    r#"*"environment":"production", "region": "eu"*"#,
+    PermissionPatternField::Arguments,
+    "has a space after some JSON ':' or ',' separators but not after others, so it matches no \
+     arguments. Use one spelling for the whole pattern"
+)]
+fn validate_permission_pattern_explains_the_rejection(
+    #[case] pattern: &str,
+    #[case] field: PermissionPatternField,
+    #[case] message: &str,
+) {
+    assert_eq!(
+        validate_permission_pattern(pattern, field),
+        Err(message.to_owned())
+    );
+}
+
+#[rstest]
+#[case::tools_pattern_with_separators(r#"client."a":"b", "c""#, PermissionPatternField::Tools)]
+#[case::one_spelling(r#"*"environment": "production"*"#, PermissionPatternField::Arguments)]
+fn validate_permission_pattern_accepts(
+    #[case] pattern: &str,
+    #[case] field: PermissionPatternField,
+) {
+    assert_eq!(validate_permission_pattern(pattern, field), Ok(()));
+}
+
 fn build_permission_pattern(source: &str) -> PermissionPattern {
     PermissionPattern::new(source).unwrap()
 }
@@ -82,6 +164,7 @@ fn build_provided_call(
         call: ExternalTool::Provided {
             group_name: group_name.to_string(),
             tool_name: tool_name.to_string(),
+            invocation_name: tool_name.to_string(),
             arguments,
         },
     }
@@ -454,4 +537,132 @@ mod argument_filters {
 
         assert_eq!(policy.evaluate(&call), PermissionDecision::Ask);
     }
+
+    #[rstest]
+    #[case::spaced(r#"*"environment": "production"*"#)]
+    #[case::compact(r#"*"environment":"production"*"#)]
+    fn denylist_matches_either_json_spelling(#[case] pattern: &str) {
+        let policy = PermissionPolicy {
+            rules: vec![PermissionRule {
+                denylist: vec![build_permission_pattern(pattern)],
+                ..build_permission_rule("client.deploy_service", PermissionDecision::Allow)
+            }],
+            default: PermissionDecision::Allow,
+        };
+        let production = build_provided_call(
+            ToolOrigin::TopLevel,
+            "client",
+            "deploy_service",
+            serde_json::json!({"environment": "production", "version": 2}),
+        );
+        let staging = build_provided_call(
+            ToolOrigin::TopLevel,
+            "client",
+            "deploy_service",
+            serde_json::json!({"environment": "staging", "version": 2}),
+        );
+
+        assert_eq!(policy.evaluate(&production), PermissionDecision::Deny);
+        assert_eq!(policy.evaluate(&staging), PermissionDecision::Allow);
+    }
+
+    #[rstest]
+    #[case::spaced(r#"{"environment": "staging", "version": *}"#)]
+    #[case::compact(r#"{"environment":"staging","version":*}"#)]
+    fn allowlist_matches_either_json_spelling(#[case] pattern: &str) {
+        let policy = PermissionPolicy {
+            rules: vec![PermissionRule {
+                allowlist: vec![build_permission_pattern(pattern)],
+                ..build_permission_rule("client.deploy_service", PermissionDecision::Deny)
+            }],
+            default: PermissionDecision::Deny,
+        };
+        let staging = build_provided_call(
+            ToolOrigin::TopLevel,
+            "client",
+            "deploy_service",
+            serde_json::json!({"version": 2, "environment": "staging"}),
+        );
+        let production = build_provided_call(
+            ToolOrigin::TopLevel,
+            "client",
+            "deploy_service",
+            serde_json::json!({"version": 2, "environment": "production"}),
+        );
+
+        assert_eq!(policy.evaluate(&staging), PermissionDecision::Allow);
+        assert_eq!(policy.evaluate(&production), PermissionDecision::Ask);
+    }
+}
+
+fn deny_policy(pattern: &str) -> PermissionPolicy {
+    serde_json::from_value(serde_json::json!({
+        "default": "allow",
+        "rules": [{
+            "tools": [pattern],
+            "decision": "deny",
+            "allowlist": [],
+            "denylist": [],
+            "sensitive": [],
+        }],
+    }))
+    .expect("the test policy must be valid")
+}
+
+fn catalog() -> Vec<String> {
+    [
+        "client.echo",
+        "client.deploy",
+        "github.summarize",
+        "file_system.bash",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+
+#[rstest]
+#[case::mistyped_name("client.ecko", "client")]
+#[case::bracketed_separator("client[.]ecko", "client")]
+#[case::single_character_class("[c]lient.ecko", "client")]
+#[case::name_glob("client.delete_*", "client")]
+#[case::built_in("file_system.reed_file", "file_system")]
+fn reports_a_pattern_that_matches_no_tool_of_its_namespace(
+    #[case] pattern: &str,
+    #[case] namespace: &str,
+) {
+    let unmatched =
+        deny_policy(pattern).unmatched_tool_patterns(&catalog(), &["github".to_owned()]);
+
+    let namespace_tool_ids = catalog()
+        .into_iter()
+        .filter(|tool_id| tool_id.starts_with(&format!("{namespace}.")))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        unmatched,
+        vec![UnmatchedToolPattern {
+            rule_index: 0,
+            pattern: pattern.to_owned(),
+            namespace: namespace.to_owned(),
+            namespace_tool_ids,
+        }]
+    );
+}
+
+#[rstest]
+#[case::matching_name("client.echo")]
+#[case::namespace_glob("client.*")]
+#[case::leading_glob("*.ecko")]
+#[case::wildcard_namespace("cl*.ecko")]
+#[case::character_range_namespace("[a-z]lient.ecko")]
+#[case::negated_class_namespace("[!x]lient.ecko")]
+#[case::no_namespace("echo")]
+#[case::unknown_namespace("inventory.delte_item")]
+#[case::open_namespace("github.create_issue")]
+fn does_not_report_a_pattern_the_catalog_cannot_disprove(#[case] pattern: &str) {
+    let unmatched =
+        deny_policy(pattern).unmatched_tool_patterns(&catalog(), &["github".to_owned()]);
+
+    assert_eq!(unmatched, Vec::new());
 }

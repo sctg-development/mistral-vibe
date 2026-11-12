@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import time
+from typing import TYPE_CHECKING
 import weakref
 
 from vibe.app_server._session_backend_port import (
@@ -42,6 +43,11 @@ from vibe.core.config import (
     MCPStreamableHttp,
 )
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
+
+# The MCP SDK is imported where used: its package import loads ~230 modules.
+if TYPE_CHECKING:
+    from mcp.shared.auth import AuthorizationCodeResult
+
 
 type RemoteMCPServer = MCPHttp | MCPStreamableHttp
 type AuthURLSink = Callable[[str], Awaitable[None]]
@@ -390,7 +396,7 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
         async def reject_redirect(_url: str) -> None:
             raise OAuthFlowError("Interactive MCP OAuth login is required")
 
-        async def reject_callback() -> tuple[str, str | None]:
+        async def reject_callback() -> AuthorizationCodeResult:
             raise OAuthFlowError("Interactive MCP OAuth login is required")
 
         provider = build_oauth_provider(
@@ -402,6 +408,7 @@ class MCPAuthenticationService(MCPAuthorizationProvider):
                 timeout=server.startup_timeout_sec,
                 verify=build_ssl_context(),
             ) as client:
+                await provider.discover_authorization_server(client)
                 await client.get(server.url)
         except Exception as exc:
             classified = unwrap_oauth_refresh_error(exc)

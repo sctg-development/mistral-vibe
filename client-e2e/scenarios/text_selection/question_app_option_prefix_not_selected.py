@@ -10,15 +10,8 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-# The turn stays open: the tool blocks on the callback until the user answers.
-env = {
-    "VIBE_REPLAY_SETTLE_BUSY": "1",
-    "VIBE_TYPING_GRACE_PERIOD_MS": "0",
-    "SSH_TTY": "/dev/pts/0",
-}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0", "SSH_TTY": "/dev/pts/0"}
 handshake = {"callback/result": {"accepted": True}}
-capture_startup = False
-capture_steps = {1, 2, 3}
 # The drag starts on the question title and ends on the first option's label,
 # so the copy crosses the prefix cells without ever including them.
 clipboard_contains = (
@@ -55,6 +48,3 @@ timeline: Timeline = [
     _PREFIX_DRAG,
     _DRAG_ACROSS_OPTION,
 ]
-
-# Each key must land on a settled UI: batching changes the outcome here.
-settle_per_key = True

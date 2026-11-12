@@ -46,6 +46,7 @@ async fn run() -> Result<std::process::ExitCode> {
         }
         Err(error) => error.exit(),
     };
+    let acp_setup = vibe_rs::startup::init_entrypoint(cli.setup);
     let invocation_cwd = std::env::current_dir().ok();
     // Resolve the headless paths right after parse, before --workdir changes
     // directory, so relative paths name what the caller meant.
@@ -61,6 +62,13 @@ async fn run() -> Result<std::process::ExitCode> {
     // Built as soon as the arguments are parsed, so every later failure can
     // leave an export and the time limit counts from process start.
     let headless = vibe_rs::headless_run::HeadlessRun::for_cli(&cli);
+    if let Some(message) = vibe_rs::headless_run::invalid_price_limit(cli.max_price) {
+        if let Some(run) = &headless {
+            return Ok(run.fail(RunOutcome::UsageError, &message).into());
+        }
+        eprintln!("Error: {message}");
+        std::process::exit(1);
+    }
     // `--agent-socket` usage errors, before `--workdir` is looked at.
     if let Some(message) = vibe_rs::agent_socket::usage_error(&cli, cfg!(windows)) {
         if let Some(run) = &headless {
@@ -114,6 +122,9 @@ async fn run() -> Result<std::process::ExitCode> {
     if let Some(vibe_rs::cli::CliCommand::Mcp { command }) = &cli.command {
         return Ok(vibe_rs::mcp_command::run(command, launch).await);
     }
+    if let Some(vibe_rs::cli::CliCommand::Config { command }) = &cli.command {
+        return Ok(vibe_rs::config_command::run(command, launch).await);
+    }
     if let Some(vibe_rs::cli::CliCommand::RunServer {
         max_runs,
         runs_per_app_server,
@@ -154,7 +165,12 @@ async fn run() -> Result<std::process::ExitCode> {
     // Piped stdin is read once, before choosing interactive vs headless, so
     // `echo hi | vibe` feeds the TUI initial prompt while /dev/tty (which
     // crossterm reads for events) keeps terminal input interactive.
-    let stdin_prompt = headless_prompt::read_stdin_prompt().await;
+    // A given prompt skips the read: a caller may hold stdin open without EOF (Modal's exec does).
+    let stdin_prompt = if cli.prompt_given() {
+        None
+    } else {
+        headless_prompt::read_stdin_prompt().await
+    };
 
     // Headless (programmatic) mode: no TUI, no terminal init.
     if cli.is_headless() {
@@ -200,8 +216,11 @@ async fn run() -> Result<std::process::ExitCode> {
     } else {
         cli.worktree_request(cli.interactive_initial_prompt(stdin_prompt.clone()))
     };
-    let interactive_agent_config =
-        cli.interactive_agent_config(Some(cwd_text.clone()), worktree_request)?;
+    let interactive_agent_config = cli.interactive_agent_config(
+        Some(cwd_text.clone()),
+        worktree_request,
+        vibe_rs::terminal_key::current(),
+    )?;
     // After argument errors; before anything spawns or draws.
     terminal::require_interactive_terminal();
 
@@ -210,7 +229,6 @@ async fn run() -> Result<std::process::ExitCode> {
     let startup_config = cached_startup_config.unwrap_or_default();
     let resolved_auto = vibe_rs::theme_detection::resolve_auto_theme();
     ui::theme::prepare_active(&startup_config.theme, resolved_auto);
-
     // The worktree is prepared before the TUI exists: wait the server's
     // preparation out right here, with its two stderr lines, and let the
     // terminal start only once the
@@ -256,25 +274,29 @@ async fn run() -> Result<std::process::ExitCode> {
     };
     // The startup update prompt runs after the worktree settle and before
     // the terminal is taken over. A non-worktree run settles
-    // nothing, so its prompt timing is unchanged.
-    update_flow::maybe_run_startup_update_prompt(
-        &startup_config,
-        early.as_ref().map(|start| &start.child),
-    )
-    .await;
+    // nothing, so its prompt timing is unchanged. An IDE-launched setup
+    // (`vibe-acp --setup`) cannot act on a `vibe` update, so it skips it.
+    if !acp_setup {
+        update_flow::maybe_run_startup_update_prompt(
+            &startup_config,
+            early.as_ref().map(|start| &start.child),
+        )
+        .await;
+    }
     // Install before the TUI owns the terminal, so a failure exits cleanly.
     let mut shutdown = match shutdown {
         Some(signals) => signals,
         None => vibe_rs::server::signal::install().context("install signal handlers")?,
     };
+    // The probe only queries the terminal, so capture can be turned on later with pixel reports.
     vibe_rs::mouse::pixels::probe();
-    let (mut terminal, mut terminal_guard) = terminal::init()?;
+    // The cached setting decides capture from the first frame; each redraw then follows the live config.
+    let (mut terminal, mut terminal_guard) = terminal::init(startup_config.enable_mouse_capture)?;
     timings.record("terminal_ready");
 
     // `@` completions follow the move into the worktree: the gate's settle
-    // is that moment, and
-    // the index watches the worktree from the first frame. A settle that
-    // never came (deadline, old server) keeps watching the startup cwd.
+    // is that moment. A settle that never came (deadline, old server) keeps
+    // the startup cwd.
     let index_root = early
         .as_ref()
         .and_then(|start| {
@@ -284,15 +306,30 @@ async fn run() -> Result<std::process::ExitCode> {
             })
         })
         .or_else(|| cwd.clone());
-    let (files, file_changes) = utils::file_index::FileIndex::start(index_root);
     let cached_tokens = (0, startup_config.context_window);
     let mut app = App::default();
+    // The index starts only from a warm cache that enables it; a cold start
+    // defers to the Ready event's authoritative config. The env check is a
+    // read-only shortcut so a single-run opt-out never pays for a build.
+    let launch_index = !show_unready_config
+        && startup_config.enable_file_autocomplete
+        && !vibe_rs::utils::file_index::env_opt_out();
+    app.completion.files = if launch_index {
+        vibe_rs::utils::file_index::FileIndexHandle::start(
+            index_root.unwrap_or_default(),
+            startup_config.file_watcher_for_autocomplete,
+        )
+    } else {
+        match index_root {
+            Some(root) => vibe_rs::utils::file_index::FileIndexHandle::parked(root),
+            None => vibe_rs::utils::file_index::FileIndexHandle::default(),
+        }
+    };
     app.terminal_notifier
         .enable_program_reports(vibe_rs::program_status::supported());
     // Hold the positional prompt until startup converges. An empty positional
     // (`vibe ""`) yields to the piped prompt.
     app.session.initial_prompt = cli.interactive_initial_prompt(stdin_prompt);
-    app.session.teleport_on_start = cli.teleport;
     // One agent config for the process, resent on every resume.
     app.session.agent_config = interactive_agent_config.clone();
     app.chat_input.history = utils::history_manager::HistoryManager::load();
@@ -302,7 +339,6 @@ async fn run() -> Result<std::process::ExitCode> {
     // trust gate never fires for it either.
     app.session.cwd = Some(cwd_text.clone());
     app.session.startup_resume = startup_resume;
-    app.completion.files = files;
     app.completion.skills = startup_config.skills.clone();
     agents::show_startup_agents(&mut app, &startup_config);
     app.view.banner.sync_model_variant(&startup_config);
@@ -428,10 +464,7 @@ async fn run() -> Result<std::process::ExitCode> {
                     match vibe_rs::server::Client::spawn(launch.clone()).await {
                         Ok(spawned) => spawned,
                         Err(error) => {
-                            // The Sentry bridge only carries ERROR records,
-                            // so the startup window's own failure sites log
-                            // their own fatal errors.
-                            tracing::error!(vibe_boundary = "startup", fatal = true, "{error:#}");
+                            vibe_rs::startup::failure::log_spawn(&error);
                             return Err(error.context("spawn app-server"));
                         }
                     };
@@ -443,7 +476,7 @@ async fn run() -> Result<std::process::ExitCode> {
                 // key is present, so no pre-session status is asked).
                 let (ready_tx, ready_rx) = mpsc::channel::<StartupEvent>(1);
                 let (trust_tx, trust_rx) = mpsc::channel::<String>(1);
-                tokio::spawn(setup::boot::background_boot(
+                vibe_rs::work::spawn_daemon(setup::boot::background_boot(
                     client.clone(),
                     ready_tx.clone(),
                     trust_rx,
@@ -470,10 +503,11 @@ async fn run() -> Result<std::process::ExitCode> {
             }
         };
     app.trust.tx = trust_tx;
+    app.credential_client = Some(client.clone());
     let channels = vibe_rs::channels::connect(&mut app);
     let config_tx = channels.config_tx.clone();
 
-    let sources = channels.sources(notifications, ready_rx, file_changes);
+    let sources = channels.sources(notifications, ready_rx);
     let mut run = event_loop::EventLoop {
         terminal,
         terminal_guard,
@@ -520,7 +554,7 @@ async fn run() -> Result<std::process::ExitCode> {
 
     timings.flush();
     if let Err(error) = &result {
-        // Only ERROR crosses the Sentry bridge, so WARN keeps the fault in the
+        // Only fatal ERROR crosses the Sentry bridge, so WARN keeps the fault in the
         // log without reporting a terminal that simply went away.
         if observability::sentry::is_environmental(error) {
             tracing::warn!(vibe_boundary = "event_loop", "{error}");

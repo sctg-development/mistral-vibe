@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Mapping
 import functools
 import ipaddress
 import os
@@ -11,10 +11,11 @@ from urllib.parse import urlparse
 from urllib.request import getproxies
 
 import certifi
-import httpx
+import httpx2
 import truststore
 
 from vibe import __version__
+from vibe.utils.oidc_marker import is_oidc_authorization, oidc_enabled
 
 _use_system_trust_store = False
 # Set by `pin_ssl_context`: the trust store no longer follows each config load.
@@ -43,6 +44,11 @@ def pin_ssl_context(*, enable_system_trust_store: bool) -> None:
     _pinned = False
     configure_ssl_context(enable_system_trust_store=enable_system_trust_store)
     _pinned = True
+
+
+def system_trust_store_enabled() -> bool:
+    """Whether the process's TLS uses the system trust store."""
+    return _use_system_trust_store
 
 
 @functools.lru_cache(maxsize=1)
@@ -87,18 +93,18 @@ def build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-class _EnvProxyTransport(httpx.AsyncBaseTransport):
+class _EnvProxyTransport(httpx2.AsyncBaseTransport):
     def __init__(
         self, proxies: dict[str, str], no_proxy: tuple[str, ...], **kwargs: Any
     ) -> None:
         self._no_proxy = no_proxy
-        self._direct = httpx.AsyncHTTPTransport(**kwargs)
+        self._direct = httpx2.AsyncHTTPTransport(**kwargs)
         self._proxies = {
-            scheme: httpx.AsyncHTTPTransport(proxy=proxy, **kwargs)
+            scheme: httpx2.AsyncHTTPTransport(proxy=proxy, **kwargs)
             for scheme, proxy in proxies.items()
         }
 
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
         if _should_bypass_proxy(request.url, self._no_proxy):
             return await self._direct.handle_async_request(request)
 
@@ -113,18 +119,10 @@ class _EnvProxyTransport(httpx.AsyncBaseTransport):
             await transport.aclose()
 
 
-class VibeAsyncHTTPClient(httpx.AsyncClient):
-    """HTTPX client that works around HTTPX's CIDR NO_PROXY limitation."""
+class VibeAsyncHTTPClient(httpx2.AsyncClient):
+    """HTTPX2 client that works around HTTPX2's CIDR NO_PROXY limitation."""
 
-    def __init__(
-        self,
-        *,
-        transport_wrapper: Callable[
-            [httpx.AsyncBaseTransport], httpx.AsyncBaseTransport
-        ]
-        | None = None,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         kwargs["trust_env"] = False
         if (
             kwargs.get("transport") is None
@@ -152,10 +150,33 @@ class VibeAsyncHTTPClient(httpx.AsyncClient):
                     **transport_kwargs,
                 )
         super().__init__(**kwargs)
-        if transport_wrapper is not None:
-            # Wrap what the client built (default or env-proxy transport) so
-            # the wrapper sits under the client's event hooks.
-            self._transport = transport_wrapper(self._transport)
+        self.event_hooks["request"].append(_swap_oidc_authorization)
+
+    async def send(
+        self,
+        request: httpx2.Request,
+        *,
+        stream: bool = False,
+        auth: Any = httpx2.USE_CLIENT_DEFAULT,
+        follow_redirects: Any = httpx2.USE_CLIENT_DEFAULT,
+    ) -> httpx2.Response:
+        if oidc_enabled() and is_oidc_authorization(
+            request.headers.get("Authorization")
+        ):
+            follow_redirects = False
+        return await super().send(
+            request, stream=stream, auth=auth, follow_redirects=follow_redirects
+        )
+
+
+async def _swap_oidc_authorization(request: httpx2.Request) -> None:
+    if not oidc_enabled() or not is_oidc_authorization(
+        request.headers.get("Authorization")
+    ):
+        return
+    from vibe.setup.auth._oidc_runtime import oidc_headers
+
+    request.headers.update(await oidc_headers(str(request.url)))
 
 
 def _normalize_proxy_url(value: str | None) -> str | None:
@@ -166,7 +187,7 @@ def _normalize_proxy_url(value: str | None) -> str | None:
     return f"http://{value}"
 
 
-def _should_bypass_proxy(url: httpx.URL, no_proxy: tuple[str, ...]) -> bool:
+def _should_bypass_proxy(url: httpx2.URL, no_proxy: tuple[str, ...]) -> bool:
     host = url.host
     if host is None:
         return False
@@ -269,6 +290,14 @@ def get_user_agent(backend: str | None) -> str:
     return user_agent
 
 
+def with_user_agent(headers: Mapping[str, str], backend: str | None) -> dict[str, str]:
+    """``headers`` plus Vibe's User-Agent, unless they already set one."""
+    merged = dict(headers)
+    if not any(name.lower() == "user-agent" for name in merged):
+        merged["user-agent"] = get_user_agent(backend)
+    return merged
+
+
 def get_server_url_from_api_base(api_base: str) -> str | None:
     match = re.match(r"(https?://.+)(/v\d+.*)", api_base)
     return match.group(1) if match else None
@@ -281,4 +310,6 @@ __all__ = [
     "get_server_url_from_api_base",
     "get_user_agent",
     "pin_ssl_context",
+    "system_trust_store_enabled",
+    "with_user_agent",
 ]

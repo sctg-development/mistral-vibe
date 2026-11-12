@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 
 def _session(index: int) -> dict[str, object]:
@@ -28,8 +28,6 @@ handshake = {
         "items": [_session(index) for index in range(1, 25)],
         "nextCursor": None,
         "previousCursor": None,
-        "continueSessionId": "00000000-0000-4000-8000-000000000001",
     }
 }
-timeline: Timeline = ["/resume\r"]
-capture_startup = False
+timeline: Timeline = ["/resume\r", take_snapshot()]

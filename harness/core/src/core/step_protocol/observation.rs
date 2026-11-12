@@ -1,11 +1,11 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::core::features::compaction::CompactionTrigger;
 use crate::core::features::notifications::Notification;
 use crate::core::step_protocol::Action;
 use crate::core::tools::external::ExternalTool;
-use crate::core::turn::TurnOutcome;
 use crate::core::wire::completion::{CompletionCandidate, TokenUsage};
 use crate::core::wire::content::ContentBlock;
 use crate::core::wire::tool::{ProtocolError, ToolResult};
@@ -14,7 +14,14 @@ use crate::core::wire::tool::{ProtocolError, ToolResult};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TurnStopReason {
     IterationLimit,
+    /// A `pre_agent_turn` or `pre_llm_call` hook skipped the work; the Turn's output is the hook's reason.
     Skipped,
+    /// A `post_llm_call` or `post_agent_turn` hook rejected the reply; the Turn's output is the hook's reason.
+    Rejected,
+    /// The model's final reply stopped at the output limit (`finish_reason` `length`), and
+    /// output-limit recovery was off, out of retries, or at the Turn's last iteration; the Turn's
+    /// output is the cut-off reply, or a hook's replacement of it.
+    OutputLimit,
 }
 
 /// What one Core feature function produced: actions for the Runtime to run and
@@ -27,24 +34,10 @@ pub(crate) enum TurnStopReason {
 pub(crate) struct Outcome {
     pub actions: Vec<Action>,
     pub observations: Vec<Observation>,
-    /// Set when this command ended a turn.
-    ///
-    /// Separate from `TurnState::Terminal` because a queued follow-up turn can
-    /// start within the same command: state is `Active` again by the time the
-    /// transition is built, but the Runtime still needs to hear that the
-    /// previous turn finished and with what.
-    pub completed: Option<TurnCompletion>,
-}
-
-/// A turn reaching its end, as reported to the Runtime for one command.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct TurnCompletion {
-    pub turn_id: String,
-    pub outcome: TurnOutcome,
 }
 
 impl Outcome {
-    /// The command was accepted and produced no action, e.g. a queued message.
+    /// The command was accepted and produced no action.
     pub(crate) fn quiet() -> Self {
         Self::default()
     }
@@ -67,21 +60,11 @@ impl Outcome {
         self.observations.push(observation);
     }
 
-    /// Records the turn this command ended.
-    pub(crate) fn complete_turn(&mut self, turn_id: String, outcome: TurnOutcome) {
-        self.completed = Some(TurnCompletion { turn_id, outcome });
-    }
-
     /// Folds a callee's outcome into this one, keeping emission order: whatever
     /// this outcome already observed happened before the callee ran.
-    ///
-    /// A callee's completion wins, because the callee ran later: when
-    /// `complete_output` finishes one turn and starts a queued one, the queued
-    /// turn's own path is what decides the final report.
     pub(crate) fn absorb(&mut self, other: Self) {
         self.actions.extend(other.actions);
         self.observations.extend(other.observations);
-        self.completed = other.completed.or(self.completed.take());
     }
 
     /// Same as `absorb`, for the common tail-call shape where the callee's
@@ -105,10 +88,6 @@ pub(crate) struct AcceptedToolResult {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Transition {
     pub effects: Vec<Action>,
-    /// The turn this command ended, if any. Replaces a pair of `output` and
-    /// `rejection_reason` options that could disagree with each other and with
-    /// the phase they sat beside.
-    pub completed: Option<TurnCompletion>,
     pub observations: Vec<Observation>,
 }
 
@@ -145,6 +124,24 @@ pub(crate) struct ToolDiscoverySummary {
     pub tool_count: usize,
     pub connector_notice_count: usize,
     pub group_namespaces: Vec<String>,
+}
+
+/// What a warning is about. Warnings report a degraded but handled situation;
+/// the session continues.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WarningCode {
+    /// The provider refused a request as too long. Core counts requests as
+    /// larger from now on and makes room.
+    RequestTooLong,
+    /// The summary was cut off twice and is kept truncated.
+    CompactionSummaryCutOff,
+    /// Items after the summary did not fit and are shown reduced.
+    CompactionInputsReduced,
+    /// Post-tool-call hooks turned a tool result whose `content` held its
+    /// `structured_content` into one whose `content` does not. Core uses the
+    /// result as returned.
+    PostToolCallResultInconsistent,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -184,6 +181,10 @@ pub(crate) enum Observation {
     ToolExecutionStarted {
         turn_id: String,
         call_id: String,
+        /// Core runs this tool itself (`run_typescript`, `search_tool_functions`):
+        /// no tool call Action reaches the Runtime for it. Omitted when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        executed_by_core: bool,
     },
     ToolExecutionFinished {
         turn_id: String,
@@ -206,6 +207,14 @@ pub(crate) enum Observation {
         attempt: u32,
         trigger: CompactionTrigger,
         error: ProtocolError,
+    },
+    Warning {
+        /// Null for a warning outside a turn, such as from a between-turn
+        /// compaction.
+        turn_id: Option<String>,
+        code: WarningCode,
+        message: String,
+        details: Value,
     },
     TurnFailed {
         turn_id: String,

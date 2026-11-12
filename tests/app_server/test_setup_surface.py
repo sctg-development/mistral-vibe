@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 import tomllib
 from typing import Any, Never
 
 import keyring
 import pytest
+import tomli_w
 
 from tests.app_server._helpers import setup_client
 from tests.conftest import get_base_config
 from vibe.app_server._model import validate_wire
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server.client import AppServerClient
 from vibe.app_server.protocol import (
     SERVER_METHODS,
@@ -23,11 +26,14 @@ from vibe.app_server.protocol import (
     SetupSubmitChoicesParams,
     SetupSubmitChoicesResponse,
 )
+from vibe.app_server.provider_auth import ProviderCredentialSourceKind
 from vibe.core.config import (
     DEFAULT_CONSOLE_BASE_URL,
     DEFAULT_THEME,
     DEFAULT_VIBE_BASE_URL,
+    load_dotenv_values,
 )
+from vibe.core.paths import GLOBAL_ENV_FILE
 from vibe.setup.auth.api_key_persistence import ProviderCredentialsPersistResult
 from vibe.utils.keyring import clear_api_key_keyring_cache
 
@@ -40,10 +46,12 @@ async def _status(client: AppServerClient) -> SetupStatusResponse:
 
 @pytest.mark.asyncio
 async def test_setup_status_seeds_the_wizard_from_the_resolved_config(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     monkeypatch.delenv("VIBE_API_KEY", raising=False)
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         response = await _status(client)
     finally:
@@ -68,7 +76,7 @@ async def test_setup_status_seeds_the_wizard_from_the_resolved_config(
 
 @pytest.mark.asyncio
 async def test_setup_status_has_api_key_true_from_process_env(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     monkeypatch.setenv("VIBE_API_KEY", "env-key")
 
@@ -77,7 +85,9 @@ async def test_setup_status_has_api_key_true_from_process_env(
 
     monkeypatch.setattr(keyring, "get_password", _fail)
     clear_api_key_keyring_cache()
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         response = await _status(client)
     finally:
@@ -89,7 +99,7 @@ async def test_setup_status_has_api_key_true_from_process_env(
 
 @pytest.mark.asyncio
 async def test_setup_status_has_api_key_true_from_keyring_only(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     monkeypatch.delenv("VIBE_API_KEY", raising=False)
 
@@ -97,7 +107,9 @@ async def test_setup_status_has_api_key_true_from_keyring_only(
         keyring, "get_password", lambda service, username: "keyring-key"
     )
     clear_api_key_keyring_cache()
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         response = await _status(client)
     finally:
@@ -107,9 +119,138 @@ async def test_setup_status_has_api_key_true_from_keyring_only(
     assert response.has_api_key is True
 
 
+@pytest.fixture
+def restore_env_value_origins() -> Iterator[None]:
+    import vibe.core.config.vibe_schema as vibe_schema
+
+    snapshot = dict(vibe_schema._ENV_VALUE_ORIGINS)
+    yield
+    vibe_schema._ENV_VALUE_ORIGINS.clear()
+    vibe_schema._ENV_VALUE_ORIGINS.update(snapshot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("restore_env_value_origins")
+async def test_setup_status_reports_a_shell_key_over_a_different_env_file_key(
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    """The shell key wins over ``.env``: a key setup saves would be shadowed."""
+    GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
+    GLOBAL_ENV_FILE.path.write_text("VIBE_API_KEY=file-key\n")
+    monkeypatch.setenv("VIBE_API_KEY", "shell-key")
+    load_dotenv_values(GLOBAL_ENV_FILE.path)
+
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.active_credential_source is ProviderCredentialSourceKind.PROCESS_ENV
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("restore_env_value_origins")
+async def test_setup_status_reports_a_key_loaded_from_the_env_file(
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    GLOBAL_ENV_FILE.path.parent.mkdir(parents=True, exist_ok=True)
+    GLOBAL_ENV_FILE.path.write_text("VIBE_API_KEY=file-key\n")
+    monkeypatch.delenv("VIBE_API_KEY", raising=False)
+    load_dotenv_values(GLOBAL_ENV_FILE.path)
+
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+        monkeypatch.delenv("VIBE_API_KEY", raising=False)
+
+    assert (
+        response.active_credential_source
+        is ProviderCredentialSourceKind.VIBE_HOME_ENV_FILE
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_status_carries_the_pinned_console_url(
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    # The admin pin is normalized to an origin (the trailing slash drops).
+    monkeypatch.setenv("VIBE_CUSTOM_CONSOLE_URL", "https://console.acme.internal/")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.pinned_console_url == "https://console.acme.internal"
+
+
+@pytest.mark.asyncio
+async def test_setup_status_normalizes_a_scheme_less_pinned_console_url(
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    # A bare domain is upgraded to https:// before it rides the wire.
+    monkeypatch.setenv("VIBE_CUSTOM_CONSOLE_URL", "console.acme.internal")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.pinned_console_url == "https://console.acme.internal"
+
+
+@pytest.mark.asyncio
+async def test_setup_status_pinned_console_url_defaults_to_none(
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    monkeypatch.delenv("VIBE_CUSTOM_CONSOLE_URL", raising=False)
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.pinned_console_url is None
+
+
+@pytest.mark.asyncio
+async def test_setup_status_ignores_an_invalid_pinned_console_url(
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    monkeypatch.setenv("VIBE_CUSTOM_CONSOLE_URL", "not a url")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.pinned_console_url is None
+
+
 @pytest.mark.asyncio
 async def test_setup_submit_choices_writes_nothing_without_drift(
-    monkeypatch: pytest.MonkeyPatch, config_dir: Path
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, process_services: ProcessServices
 ) -> None:
     async def _unexpected(*args: Any, **kwargs: Any) -> Never:
         raise AssertionError("no drift must not write config")
@@ -117,7 +258,9 @@ async def test_setup_submit_choices_writes_nothing_without_drift(
     monkeypatch.setattr(
         "vibe.app_server._setup.persist_provider_credentials", _unexpected
     )
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         status = await _status(client)
         response = validate_wire(
@@ -142,9 +285,11 @@ async def test_setup_submit_choices_writes_nothing_without_drift(
 
 @pytest.mark.asyncio
 async def test_setup_submit_choices_persists_only_drifted_fields(
-    config_dir: Path,
+    config_dir: Path, process_services: ProcessServices
 ) -> None:
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         status = await _status(client)
         response = validate_wire(
@@ -179,12 +324,14 @@ async def test_setup_submit_choices_persists_only_drifted_fields(
 
 @pytest.mark.asyncio
 async def test_setup_submit_choices_unknown_provider_persists_fresh_view(
-    config_dir: Path,
+    config_dir: Path, process_services: ProcessServices
 ) -> None:
     """A provider name absent from config starts a fresh provider merged from
     the six wizard-visible fields; exclude_defaults pins nothing else.
     """
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         response = validate_wire(
             SetupSubmitChoicesResponse,
@@ -218,8 +365,142 @@ async def test_setup_submit_choices_unknown_provider_persists_fresh_view(
 
 
 @pytest.mark.asyncio
+async def test_setup_submit_choices_preserves_pinned_api_base(
+    config_dir: Path, process_services: ProcessServices
+) -> None:
+    """A provider with preserve_api_base = true keeps its configured api_base
+    even when the wizard view carries the whoami-overwritten one (the thin
+    client resolves tenant domains before submitting).
+    """
+    config_file = config_dir / "config.toml"
+    base = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    base["providers"][0]["api_base"] = "https://connector.internal.example:443/v1"
+    base["providers"][0]["preserve_api_base"] = True
+    config_file.write_text(tomli_w.dumps(base), encoding="utf-8")
+
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        status = await _status(client)
+        response = validate_wire(
+            SetupSubmitChoicesResponse,
+            await client.request(
+                "setup/submit-choices",
+                SetupSubmitChoicesParams(
+                    # The client's whoami resolution overwrote api_base with
+                    # the tenant's public host; the flag must veto it.
+                    provider=status.provider.model_copy(
+                        update={"api_base": "https://api.tenant.example/v1"}
+                    ),
+                    vibe_base_url="https://chat.tenant.example",
+                ),
+            ),
+        )
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.outcome == "completed"
+    persisted = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    assert persisted["providers"][0]["api_base"] == (
+        "https://connector.internal.example:443/v1"
+    )
+    assert persisted["providers"][0]["preserve_api_base"] is True
+    assert persisted["vibe_base_url"] == "https://chat.tenant.example"
+
+
+@pytest.mark.asyncio
+async def test_setup_submit_choices_preserves_pinned_api_base_with_other_drift(
+    config_dir: Path, process_services: ProcessServices
+) -> None:
+    """With preserve_api_base = true and another view field drifting, the
+    provider persist still runs, keeps the pinned api_base, and round-trips
+    the flag itself.
+    """
+    config_file = config_dir / "config.toml"
+    base = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    base["providers"][0]["api_base"] = "https://connector.internal.example:443/v1"
+    base["providers"][0]["preserve_api_base"] = True
+    config_file.write_text(tomli_w.dumps(base), encoding="utf-8")
+
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        status = await _status(client)
+        response = validate_wire(
+            SetupSubmitChoicesResponse,
+            await client.request(
+                "setup/submit-choices",
+                SetupSubmitChoicesParams(
+                    provider=status.provider.model_copy(
+                        update={
+                            "api_base": "https://api.tenant.example/v1",
+                            "browser_auth_base_url": "https://console.internal.example",
+                        }
+                    )
+                ),
+            ),
+        )
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.outcome == "completed"
+    persisted = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    assert persisted["providers"][0]["api_base"] == (
+        "https://connector.internal.example:443/v1"
+    )
+    assert persisted["providers"][0]["preserve_api_base"] is True
+    assert persisted["providers"][0]["browser_auth_base_url"] == (
+        "https://console.internal.example"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_submit_choices_preserves_pinned_api_base_when_view_is_blank(
+    config_dir: Path, process_services: ProcessServices
+) -> None:
+    """A blank view api_base must neither crash the merge nor un-pin the
+    configured value: the veto drops the key whatever the wizard sent.
+    """
+    config_file = config_dir / "config.toml"
+    base = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    base["providers"][0]["api_base"] = "https://connector.internal.example:443/v1"
+    base["providers"][0]["preserve_api_base"] = True
+    config_file.write_text(tomli_w.dumps(base), encoding="utf-8")
+
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        status = await _status(client)
+        response = validate_wire(
+            SetupSubmitChoicesResponse,
+            await client.request(
+                "setup/submit-choices",
+                SetupSubmitChoicesParams(
+                    provider=status.provider.model_copy(update={"api_base": ""}),
+                    vibe_base_url="https://chat.tenant.example",
+                ),
+            ),
+        )
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.outcome == "completed"
+    persisted = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    assert persisted["providers"][0]["api_base"] == (
+        "https://connector.internal.example:443/v1"
+    )
+    assert persisted["vibe_base_url"] == "https://chat.tenant.example"
+
+
+@pytest.mark.asyncio
 async def test_setup_submit_choices_reports_each_failed_field(
-    monkeypatch: pytest.MonkeyPatch, config_dir: Path
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, process_services: ProcessServices
 ) -> None:
     async def _failing(request: Any, *, reason: str = "onboarding") -> Any:
         return ProviderCredentialsPersistResult(
@@ -227,7 +508,9 @@ async def test_setup_submit_choices_reports_each_failed_field(
         )
 
     monkeypatch.setattr("vibe.app_server._setup.persist_provider_credentials", _failing)
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         response = validate_wire(
             SetupSubmitChoicesResponse,
@@ -245,8 +528,167 @@ async def test_setup_submit_choices_reports_each_failed_field(
 
 
 @pytest.mark.asyncio
+async def test_setup_submit_choices_pin_wins_over_a_drifted_console_url(
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, process_services: ProcessServices
+) -> None:
+    # A drifted client cannot persist another deployment: the pin is forced
+    # over the submitted console URL (and derived onto the provider).
+    monkeypatch.setenv("VIBE_CUSTOM_CONSOLE_URL", "https://console.acme.internal")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        status = await _status(client)
+        response = validate_wire(
+            SetupSubmitChoicesResponse,
+            await client.request(
+                "setup/submit-choices",
+                SetupSubmitChoicesParams(
+                    provider=status.provider, console_base_url="https://evil.example"
+                ),
+            ),
+        )
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.outcome == "completed"
+    persisted = tomllib.loads((config_dir / "config.toml").read_text())
+    assert persisted["console_base_url"] == "https://console.acme.internal"
+    assert persisted["providers"][0]["browser_auth_base_url"] == (
+        "https://console.acme.internal"
+    )
+    assert persisted["providers"][0]["browser_auth_api_base_url"] == (
+        "https://console.acme.internal/api"
+    )
+    # The pin never touches the LLM API base.
+    assert persisted["providers"][0]["api_base"] == "https://api.mistral.ai/v1"
+
+
+@pytest.mark.asyncio
+async def test_setup_submit_choices_pin_wins_over_drifted_provider_urls(
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, process_services: ProcessServices
+) -> None:
+    # The provider view's browser-auth URLs are pinned too: they choose where
+    # the browser sign-in lands. A scheme-less pin upgrades to https://.
+    monkeypatch.setenv("VIBE_CUSTOM_CONSOLE_URL", "console.acme.internal")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        status = await _status(client)
+        response = validate_wire(
+            SetupSubmitChoicesResponse,
+            await client.request(
+                "setup/submit-choices",
+                SetupSubmitChoicesParams(
+                    provider=status.provider.model_copy(
+                        update={
+                            "browser_auth_base_url": "https://evil.example",
+                            "browser_auth_api_base_url": "https://evil.example/api",
+                            "browser_auth_allow_origin_rewrite": True,
+                        }
+                    ),
+                    console_base_url="https://evil.example",
+                ),
+            ),
+        )
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.outcome == "completed"
+    persisted = tomllib.loads((config_dir / "config.toml").read_text())
+    assert persisted["console_base_url"] == "https://console.acme.internal"
+    assert persisted["providers"][0]["browser_auth_base_url"] == (
+        "https://console.acme.internal"
+    )
+    assert persisted["providers"][0]["browser_auth_api_base_url"] == (
+        "https://console.acme.internal/api"
+    )
+    # Same-origin pin: no rewrite, so the default is simply not written.
+    assert (
+        persisted["providers"][0].get("browser_auth_allow_origin_rewrite") is not True
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_submit_choices_pin_forces_the_console_url_when_absent(
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, process_services: ProcessServices
+) -> None:
+    # Even a client that submits no console URL lands on the pin: the admin
+    # pin is the deployment, not a prefill suggestion.
+    monkeypatch.setenv("VIBE_CUSTOM_CONSOLE_URL", "https://console.acme.internal")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = validate_wire(
+            SetupSubmitChoicesResponse,
+            await client.request("setup/submit-choices", SetupSubmitChoicesParams()),
+        )
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.outcome == "completed"
+    persisted = tomllib.loads((config_dir / "config.toml").read_text())
+    assert persisted["console_base_url"] == "https://console.acme.internal"
+    # No provider view: the merged seed provider still gets the pin's
+    # browser-auth URLs, so the persisted config points at the pin end to end.
+    assert persisted["providers"][0]["browser_auth_base_url"] == (
+        "https://console.acme.internal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_submit_choices_pin_preserves_a_split_horizon_api_base(
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, process_services: ProcessServices
+) -> None:
+    # A split-horizon deployment behind the pin keeps its CLI-reachable
+    # connector: the pin fixes the browser sign-in host, not the API base.
+    config = get_base_config()
+    config["providers"][0].update({
+        "browser_auth_base_url": "https://console.acme.internal",
+        "browser_auth_api_base_url": "https://connector.acme.internal/api",
+        "browser_auth_allow_origin_rewrite": True,
+    })
+    (config_dir / "config.toml").write_text(tomli_w.dumps(config), encoding="utf-8")
+    monkeypatch.setenv("VIBE_CUSTOM_CONSOLE_URL", "https://console.acme.internal")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        status = await _status(client)
+        response = validate_wire(
+            SetupSubmitChoicesResponse,
+            await client.request(
+                "setup/submit-choices",
+                SetupSubmitChoicesParams(provider=status.provider),
+            ),
+        )
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.outcome == "completed"
+    persisted = tomllib.loads((config_dir / "config.toml").read_text())
+    provider = persisted["providers"][0]
+    assert provider["browser_auth_base_url"] == "https://console.acme.internal"
+    assert (
+        provider["browser_auth_api_base_url"] == "https://connector.acme.internal/api"
+    )
+    assert provider["browser_auth_allow_origin_rewrite"] is True
+    # Account calls keep the CLI-reachable connector origin, not the
+    # browser-only console host.
+    assert persisted["console_base_url"] == "https://connector.acme.internal"
+    # The pin never touches the LLM API base.
+    assert provider["api_base"] == "https://api.mistral.ai/v1"
+
+
+@pytest.mark.asyncio
 async def test_setup_status_seeds_the_named_provider_not_the_active_one(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> None:
     """The failed session's handshake names the provider on ``setup/status``.
 
@@ -255,7 +697,9 @@ async def test_setup_status_seeds_the_named_provider_not_the_active_one(
     resolved through the runtime's own ``_named_provider`` path.
     """
     monkeypatch.delenv("VIBE_API_KEY", raising=False)
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         response = validate_wire(
             SetupStatusResponse,
@@ -273,8 +717,100 @@ async def test_setup_status_seeds_the_named_provider_not_the_active_one(
 
 
 @pytest.mark.asyncio
-async def test_setup_status_rejects_an_unknown_named_provider() -> None:
-    client, client_transport, server_transport = await setup_client()
+async def test_setup_status_offers_mistral_next_to_a_non_mistral_active_provider(
+    config_dir: Path, process_services: ProcessServices
+) -> None:
+    config = get_base_config()
+    config["providers"].append({
+        "name": "litellm",
+        "api_base": "http://localhost:4000/v1",
+        "api_key_env_var": "LITELLM_API_KEY",
+    })
+    config["models"].append({
+        "name": "gpt-5",
+        "provider": "litellm",
+        "alias": "litellm-gpt",
+    })
+    config["active_model"] = "litellm-gpt"
+    (config_dir / "config.toml").write_text(tomli_w.dumps(config), encoding="utf-8")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.provider.name == "litellm"
+    assert response.supports_browser_sign_in is False
+    assert response.mistral_provider is not None
+    assert response.mistral_provider.name == "mistral"
+    assert response.mistral_provider.browser_auth_base_url == (
+        "https://console.mistral.ai"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("restore_env_value_origins")
+async def test_setup_status_reports_the_offered_mistral_provider_shell_key(
+    config_dir: Path, monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
+) -> None:
+    """The offered Mistral provider's own shell key, not the seeded one's."""
+    config = get_base_config()
+    config["providers"].append({
+        "name": "litellm",
+        "api_base": "http://localhost:4000/v1",
+        "api_key_env_var": "LITELLM_API_KEY",
+    })
+    config["models"].append({
+        "name": "gpt-5",
+        "provider": "litellm",
+        "alias": "litellm-gpt",
+    })
+    config["active_model"] = "litellm-gpt"
+    (config_dir / "config.toml").write_text(tomli_w.dumps(config), encoding="utf-8")
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    monkeypatch.setenv("VIBE_API_KEY", "shell-key")
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.active_credential_source is None
+    assert (
+        response.mistral_active_credential_source
+        is ProviderCredentialSourceKind.PROCESS_ENV
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_status_offers_no_extra_provider_for_mistral(
+    process_services: ProcessServices,
+) -> None:
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
+    try:
+        response = await _status(client)
+    finally:
+        await client_transport.close()
+        await server_transport.close()
+
+    assert response.mistral_provider is None
+
+
+@pytest.mark.asyncio
+async def test_setup_status_rejects_an_unknown_named_provider(
+    process_services: ProcessServices,
+) -> None:
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         with pytest.raises(AppServerResponseError) as exc_info:
             await client.request(
@@ -289,7 +825,7 @@ async def test_setup_status_rejects_an_unknown_named_provider() -> None:
 
 @pytest.mark.asyncio
 async def test_server_without_setup_methods_answers_method_not_found(
-    monkeypatch: pytest.MonkeyPatch, config_dir: Path
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, process_services: ProcessServices
 ) -> None:
     """The old-server half of the ``setup/*`` version skew (ADR 0014).
 
@@ -302,7 +838,9 @@ async def test_server_without_setup_methods_answers_method_not_found(
         "vibe.app_server.server.SERVER_METHODS",
         tuple(method for method in SERVER_METHODS if not method.startswith("setup/")),
     )
-    client, client_transport, server_transport = await setup_client()
+    client, client_transport, server_transport = await setup_client(
+        process_services=process_services
+    )
     try:
         with pytest.raises(AppServerResponseError) as exc_info:
             await client.request("setup/status", SetupStatusParams())

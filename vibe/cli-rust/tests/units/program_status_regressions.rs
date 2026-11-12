@@ -1,11 +1,11 @@
 //! Status survives session transitions and either shell event order.
 
-use serde_json::{json, Value};
-use std::sync::Arc;
-use std::time::Instant;
+use serde_json::json;
 use vibe_rs::app::{App, Status};
 use vibe_rs::program_status::{self, encode_report, BlockedKind, ProgramState};
-use vibe_rs::server::{notification, Client, Notification};
+use vibe_rs::server::notification;
+
+use crate::support::notify;
 
 fn app() -> App {
     let mut app = App::default();
@@ -14,17 +14,6 @@ fn app() -> App {
     app.set_session_id("session".into());
     app.set_status(Status::Ready);
     app
-}
-
-fn notify(app: &mut App, method: &str, params: Value) {
-    assert!(vibe_rs::event_handler::apply_notification(
-        app,
-        &Arc::new(Client::stub()),
-        &Notification {
-            method: method.into(),
-            params
-        },
-    ));
 }
 
 fn report(app: &mut App, state: ProgramState, message: &str) {
@@ -72,7 +61,10 @@ fn status_transitions_preserve_open_dialogs_and_their_messages() {
         let mut app = app();
         if permission {
             let mut callback = vibe_rs::server::ApprovalCallback {
-                callback_id: "a".into(),
+                address: vibe_rs::server::CallbackAddress {
+                    callback_id: "a".into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             callback.detail.effect.display.status_text = "Approve?".into();
@@ -101,7 +93,7 @@ fn status_transitions_preserve_open_dialogs_and_their_messages() {
         for status in [
             Status::Ready,
             Status::Generating {
-                since: Instant::now(),
+                since: vibe_rs::clock::now(),
             },
             Status::Ready,
         ] {
@@ -121,7 +113,12 @@ fn status_transitions_preserve_open_dialogs_and_their_messages() {
         } else {
             vibe_rs::question_app::dismiss(
                 &mut app,
-                &vibe_rs::question_app::QuestionSource::Callback("q".into()),
+                &vibe_rs::question_app::QuestionSource::Callback(
+                    vibe_rs::server::CallbackAddress {
+                        callback_id: "q".into(),
+                        ..Default::default()
+                    },
+                ),
             );
         }
         report(&mut app, ProgramState::Error, "");
@@ -138,7 +135,7 @@ fn shell_completion_waits_for_its_final_effect_in_either_event_order() {
         for rpc_first in [false, true] {
             let mut app = app();
             app.session.shell_operation_id = Some("shell-1".into());
-            app.session.shell_started_at = Some(Instant::now());
+            app.session.shell_started_at = Some(vibe_rs::clock::now());
             app.view.command_loading = true;
             report(&mut app, ProgramState::Working, "");
             if rpc_first {
@@ -215,7 +212,7 @@ fn session_handoff_abandons_the_old_shell_and_ignores_its_late_reply() {
     for rpc_completed in [false, true] {
         let mut app = app();
         app.session.shell_operation_id = Some("old-shell".into());
-        app.session.shell_started_at = Some(Instant::now());
+        app.session.shell_started_at = Some(vibe_rs::clock::now());
         app.session.shell_request_started = true;
         app.session.shell_rpc_completed = rpc_completed;
         app.session.shell_interrupt_requested = true;
@@ -260,7 +257,10 @@ fn crash_error_survives_dialog_dismissal_and_pending_work() {
         );
         app.approval
             .enqueue(vibe_rs::server::ApprovalCallback {
-                callback_id: "a".into(),
+                address: vibe_rs::server::CallbackAddress {
+                    callback_id: "a".into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             })
             .unwrap();
@@ -283,7 +283,10 @@ fn crash_error_survives_dialog_dismissal_and_pending_work() {
         assert!(vibe_rs::terminal_notifier::take_program_report(&mut app).is_none());
         vibe_rs::question_app::dismiss(
             &mut app,
-            &vibe_rs::question_app::QuestionSource::Callback("q".into()),
+            &vibe_rs::question_app::QuestionSource::Callback(vibe_rs::server::CallbackAddress {
+                callback_id: "q".into(),
+                ..Default::default()
+            }),
         );
         assert!(vibe_rs::terminal_notifier::take_program_report(&mut app).is_none());
         assert!(!app.terminal_notifier.take_bell());

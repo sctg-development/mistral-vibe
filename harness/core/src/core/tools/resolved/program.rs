@@ -6,10 +6,11 @@ use crate::core::config::{
 use crate::core::features::background_processes;
 use crate::core::features::file_system;
 use crate::core::features::programmatic_tool_calling::{
-    ProgrammaticName, TypeScriptTool, tool_group_inventory_prompt,
+    ProgrammaticName, TypeScriptTool, direct_tools_prompt, tool_group_inventory_prompt,
 };
 use crate::core::features::subagents;
 use crate::core::features::tool_discovery::{DiscoveryTool, ToolDiscovery};
+use crate::core::step_protocol::ToolDefinition;
 use crate::core::tools::command_environment::CommandEnvironment;
 use crate::core::tools::external::ToolTarget;
 use crate::core::tools::resolved::assembly::{SELF_NAMESPACE, ToolBinding};
@@ -37,7 +38,7 @@ impl ResolvedProgramTools {
             );
         }
         let accepted = AcceptedProgramGroups::compose(config);
-        let tool_group_inventory_prompt_section = render_tool_group_inventory_prompt(
+        let mut tool_group_inventory_prompt_section = render_tool_group_inventory_prompt(
             &accepted,
             &config.settings.prompts.programs.tool_groups,
         );
@@ -73,6 +74,20 @@ impl ResolvedProgramTools {
                 descriptors.push(descriptor);
             }
         }
+        let top_level_tools = super::build_top_level_tools(config);
+        if let Some(direct_tools) = direct_tools_prompt(
+            direct_only_tool_names(
+                &top_level_tools,
+                &super::assembly::direct_routes(config),
+                &routes,
+            ),
+            &config.settings.prompts.programs.direct_tools,
+        ) {
+            if !tool_group_inventory_prompt_section.is_empty() {
+                tool_group_inventory_prompt_section.push_str("\n\n");
+            }
+            tool_group_inventory_prompt_section.push_str(&direct_tools);
+        }
         for notice in accepted.notices {
             discovery.add_integration_notice(
                 notice.integration_name,
@@ -107,6 +122,25 @@ impl ResolvedProgramTools {
     }
 }
 
+/// The model's top-level tools that `run_typescript` cannot call, in tool-list order: caller
+/// tools with `model_access="direct"` and built-ins such as `wait` and `skill`. A top-level tool
+/// without a route, such as `run_typescript` itself, is not one of them.
+fn direct_only_tool_names<'a>(
+    top_level_tools: &'a [ToolDefinition],
+    direct_routes: &'a [(String, ToolTarget)],
+    program_routes: &'a [(String, ToolTarget)],
+) -> impl Iterator<Item = &'a str> {
+    top_level_tools.iter().filter_map(move |tool| {
+        let (_, target) = direct_routes
+            .iter()
+            .find(|(route_name, _)| route_name == &tool.name)?;
+        let in_programs = program_routes
+            .iter()
+            .any(|(_, program_target)| program_target == target);
+        (!in_programs).then_some(tool.name.as_str())
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct AcceptedProgramGroups {
     callable: Vec<CallableProgramGroup>,
@@ -125,7 +159,12 @@ impl AcceptedProgramGroups {
                 prompt: PromptContribution::Listed,
                 search_description: file_system::search_description(command_environment),
                 connector_icon_url: configured_icon(&provided_groups, file_system::NAMESPACE),
-                tools: filesystem_program_tools(command_environment),
+                tools: filesystem_program_tools(
+                    command_environment,
+                    super::assembly::bash_timeout(config),
+                    config.settings.tools.background_processes.is_enabled(),
+                    config.settings.tools.file_system.read_file(),
+                ),
             });
         }
         if config.settings.tools.programmatic.offers_sleep() {
@@ -257,6 +296,7 @@ impl ProgramTool {
             description,
             input_schema,
             output_schema,
+            runtime_builtin: _,
         } = tool.descriptor;
         Self {
             runtime_name: name,
@@ -279,21 +319,31 @@ impl ProgramTool {
                 description: self.description,
                 input_schema: self.input_schema,
                 output_schema: self.output_schema,
+                runtime_builtin: match self.target {
+                    ToolTarget::RuntimeBuiltin { name } => Some(name),
+                    ToolTarget::Provided { .. } => None,
+                },
             },
             self.target,
         )
     }
 }
 
-fn filesystem_program_tools(environment: CommandEnvironment) -> Vec<ProgramTool> {
-    file_system::tools(environment)
+fn filesystem_program_tools(
+    environment: CommandEnvironment,
+    timeout: file_system::BashTimeout,
+    background: bool,
+    read_file: file_system::ReadFileSupport,
+) -> Vec<ProgramTool> {
+    let exposure = file_system::Exposure::Programmatic;
+    file_system::exposed_tools(environment, timeout, background, read_file, exposure)
         .into_iter()
         .map(|spec| {
             let function_name = spec.direct_name.to_string();
             ProgramTool {
                 runtime_name: function_name.clone(),
                 function_name,
-                description: spec.description.to_string(),
+                description: spec.description,
                 input_schema: spec.input_schema,
                 output_schema: Some(spec.output_schema),
                 target: ToolTarget::RuntimeBuiltin {

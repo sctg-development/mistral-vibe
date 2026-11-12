@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::now_unix;
-use crate::server::{AgentSafety, AgentSummary};
+use crate::server::{AgentSafety, AgentSummary, RuntimeSnapshot};
+use crate::skill::Skill;
 use crate::utils::paths;
 
 const SCHEMA_VERSION: u32 = 9;
@@ -40,28 +41,17 @@ fn builtin_agents() -> Vec<AgentSummary> {
     .collect()
 }
 
-pub fn read_skills(response: &Value) -> Vec<(String, String)> {
+pub fn read_skills(response: &Value) -> Vec<Skill> {
     let Some(skills) = response
         .pointer("/runtime/skills")
         .and_then(Value::as_array)
     else {
         return Vec::new();
     };
-    skills
-        .iter()
-        .filter(|skill| skill.get("userInvocable").and_then(Value::as_bool) == Some(true))
-        .filter_map(|skill| {
-            let name = skill.get("name").and_then(Value::as_str)?;
-            let description = skill
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            Some((name.to_owned(), description.to_owned()))
-        })
-        .collect()
+    skills.iter().filter_map(Skill::from_wire).collect()
 }
 
-fn cached_skills(response: &Value) -> Vec<(String, String)> {
+fn cached_skills(response: &Value) -> Vec<Skill> {
     read_skills(response)
         .into_iter()
         .take(MAX_CACHED_SKILLS)
@@ -77,6 +67,15 @@ pub struct StartupConfig {
     pub disable_welcome_banner_animation: bool,
     /// Whether a mouse selection copies itself on release.
     pub autocopy_to_clipboard: bool,
+    /// Whether the TUI captures the mouse; older caches keep capturing.
+    #[serde(default = "default_enable_mouse_capture")]
+    pub enable_mouse_capture: bool,
+    /// Whether `@` completion runs; older caches keep it on (ADR 0014).
+    #[serde(default = "default_enable_file_autocomplete")]
+    pub enable_file_autocomplete: bool,
+    /// Whether the file index watches the filesystem; older caches keep watching.
+    #[serde(default = "default_file_watcher_for_autocomplete")]
+    pub file_watcher_for_autocomplete: bool,
     /// Main input blink preference; older caches keep the default blinking caret.
     #[serde(default = "default_cursor_blink")]
     pub cursor_blink: bool,
@@ -89,7 +88,7 @@ pub struct StartupConfig {
     /// The cycleable agents, so Shift+Tab works before the snapshot lands.
     pub agents: Vec<AgentSummary>,
     /// Bounded user-invocable skill metadata for `/` completion before readiness.
-    pub skills: Vec<(String, String)>,
+    pub skills: Vec<Skill>,
     pub context_window: u64,
     /// Whether the narrator requests turn summaries.
     pub narrator_enabled: bool,
@@ -113,6 +112,9 @@ impl Default for StartupConfig {
             theme: "auto".into(),
             disable_welcome_banner_animation: false,
             autocopy_to_clipboard: true,
+            enable_mouse_capture: default_enable_mouse_capture(),
+            enable_file_autocomplete: default_enable_file_autocomplete(),
+            file_watcher_for_autocomplete: default_file_watcher_for_autocomplete(),
             cursor_blink: default_cursor_blink(),
             active_model: String::new(),
             active_model_display_name: String::new(),
@@ -130,6 +132,18 @@ impl Default for StartupConfig {
 }
 
 fn default_cursor_blink() -> bool {
+    true
+}
+
+fn default_enable_mouse_capture() -> bool {
+    true
+}
+
+fn default_enable_file_autocomplete() -> bool {
+    true
+}
+
+fn default_file_watcher_for_autocomplete() -> bool {
     true
 }
 
@@ -202,67 +216,35 @@ impl StartupConfig {
     }
 
     pub fn from_runtime(server_version: &str, response: &Value) -> Option<Self> {
-        let runtime = response.get("runtime")?;
-        let config = runtime.get("config")?;
-        let model = config.get("activeModel")?;
-        let model_name = model.get("displayName")?.as_str()?;
-        let thinking = model.get("thinking")?.as_str()?;
+        let runtime = RuntimeSnapshot::read(response)?;
+        let config = runtime.config?;
+        let model = config.active_model?;
+        let model_name = model.display_name?;
+        let thinking = model.thinking?;
         Some(Self {
             schema_version: SCHEMA_VERSION,
             server_version: server_version.to_owned(),
             cached_at: now_unix(),
-            theme: config.get("theme")?.as_str()?.to_owned(),
-            disable_welcome_banner_animation: config
-                .get("disableWelcomeBannerAnimation")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            autocopy_to_clipboard: config
-                .get("autocopyToClipboard")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            cursor_blink: config
-                .get("cursorBlink")
-                .and_then(Value::as_bool)
-                .unwrap_or_else(default_cursor_blink),
+            theme: config.theme?,
+            disable_welcome_banner_animation: config.disable_welcome_banner_animation,
+            autocopy_to_clipboard: config.autocopy_to_clipboard,
+            enable_mouse_capture: config.enable_mouse_capture,
+            enable_file_autocomplete: config.enable_file_autocomplete,
+            file_watcher_for_autocomplete: config.file_watcher_for_autocomplete,
+            cursor_blink: config.cursor_blink,
             active_model: format!("{model_name}[{thinking}]"),
-            active_model_display_name: model_name.to_owned(),
+            active_model_display_name: model_name,
             images_supported: config
-                .get("imagesSupported")
-                .or_else(|| model.get("supportsImages"))
-                .and_then(Value::as_bool)
+                .images_supported
+                .or(model.supports_images)
                 .unwrap_or(false),
-            default_agent: config
-                .get("defaultAgent")
-                .and_then(Value::as_str)
-                .unwrap_or(DEFAULT_AGENT)
-                .to_owned(),
-            agents: runtime
-                .get("agents")
-                .and_then(Value::as_array)
-                .map(|agents| {
-                    agents
-                        .iter()
-                        .filter_map(|agent| serde_json::from_value(agent.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_else(builtin_agents),
+            default_agent: config.default_agent.unwrap_or_else(|| DEFAULT_AGENT.into()),
+            agents: runtime.agents.unwrap_or_else(builtin_agents),
             skills: cached_skills(response),
-            context_window: runtime
-                .get("contextWindow")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            narrator_enabled: config
-                .get("narratorEnabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            enable_update_checks: config
-                .get("enableUpdateChecks")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            enable_system_trust_store: config
-                .get("enableSystemTrustStore")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            context_window: runtime.context_window,
+            narrator_enabled: config.narrator_enabled,
+            enable_update_checks: config.enable_update_checks,
+            enable_system_trust_store: config.enable_system_trust_store,
         })
     }
 }

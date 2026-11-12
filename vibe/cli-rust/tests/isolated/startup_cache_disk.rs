@@ -109,6 +109,20 @@ fn cursor_preference_survives_runtime_updates_and_cached_startup() {
 }
 
 #[test]
+fn the_cached_mouse_capture_setting_is_loaded_for_terminal_init() {
+    with_isolated_home("mouse-capture", |_home| {
+        let mut runtime = runtime();
+        runtime["runtime"]["config"]["enableMouseCapture"] = false.into();
+        let config = StartupConfig::from_runtime(CLIENT_VERSION, &runtime).unwrap();
+        assert!(config.update_cache().unwrap());
+        assert!(!StartupConfig::load().unwrap().enable_mouse_capture);
+
+        assert!(fresh_config().update_cache().unwrap());
+        assert!(StartupConfig::load().unwrap().enable_mouse_capture);
+    });
+}
+
+#[test]
 fn a_fresh_cache_file_is_loaded() {
     with_isolated_home("load-fresh", |_home| {
         let config = fresh_config();
@@ -206,5 +220,20 @@ fn update_cache_rewrites_a_stale_disk_copy() {
         let fresh = fresh_config();
         assert!(fresh.update_cache().unwrap());
         assert_eq!(StartupConfig::load().unwrap(), fresh);
+    });
+}
+
+#[test]
+fn file_autocomplete_flags_round_trip_through_the_cache() {
+    with_isolated_home("file-autocomplete", |_home| {
+        let mut runtime = runtime();
+        runtime["runtime"]["config"]["enableFileAutocomplete"] = false.into();
+        runtime["runtime"]["config"]["fileWatcherForAutocomplete"] = false.into();
+        let config = StartupConfig::from_runtime(CLIENT_VERSION, &runtime).unwrap();
+        assert!(config.update_cache().unwrap());
+
+        let loaded = StartupConfig::load().unwrap();
+        assert!(!loaded.enable_file_autocomplete);
+        assert!(!loaded.file_watcher_for_autocomplete);
     });
 }

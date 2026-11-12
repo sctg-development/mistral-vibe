@@ -21,12 +21,15 @@ from vibe.app_server.models import (
     validate_history_entry,
 )
 from vibe.app_server.protocol import (
+    ArtifactCreatedParams,
+    ArtifactUpdatedParams,
     ChildSessionUpdatedParams,
     ConnectorAuthRequiredParams,
     HistoryEntryAddedParams,
     HistoryEntryUpdatedParams,
     MCPAuthRequiredParams,
     Notification,
+    PublicSessionArtifact,
     ServerErrorParams,
     ServerWarningParams,
     SessionCompactedParams,
@@ -132,6 +135,20 @@ class ConnectorAuthorizationRequiredEvent:
     action: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactCreated:
+    """A session artifact (PR/MR) was detected and recorded."""
+
+    artifact: PublicSessionArtifact
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactUpdated:
+    """A session artifact changed (Phase 3+: markViewed, provider sync)."""
+
+    artifact: PublicSessionArtifact
+
+
 type AppServerEvent = (
     HistoryEntryAdded
     | HistoryEntryUpdated
@@ -150,6 +167,8 @@ type AppServerEvent = (
     | ServerError
     | MCPAuthorizationRequiredEvent
     | ConnectorAuthorizationRequiredEvent
+    | ArtifactCreated
+    | ArtifactUpdated
 )
 
 _STREAMING_TEXT_PATHS = {"/content/0/text", "/text", "/state/outputText"}
@@ -258,6 +277,8 @@ type _KnownEventParams = (
     | TurnCompletedParams
     | TurnQueueUpdatedParams
     | TurnStartedParams
+    | ArtifactCreatedParams
+    | ArtifactUpdatedParams
 )
 
 
@@ -396,6 +417,10 @@ class ClientProjection:
                 f"Turn belongs to session {turn.session_id!r}, "
                 f"expected {self.state.session.id!r}"
             )
+        # The turn/start response can land after notifications already moved
+        # this turn on (e.g. to interrupted); never roll it back to its start.
+        if any(existing.id == turn.id for existing in self.state.turns or []):
+            return
         self._replace_turn(turn)
 
     def consume(self, notification: Notification) -> AppServerEvent | None:
@@ -443,6 +468,12 @@ class ClientProjection:
             case ChildSessionUpdatedParams():
                 self._replace_child_session(params.child_session)
                 event = ChildSessionUpdated(params.child_session)
+            case ArtifactCreatedParams():
+                # Artifacts live outside the projected session state; the
+                # notification is forwarded as-is.
+                event = ArtifactCreated(params.artifact)
+            case ArtifactUpdatedParams():
+                event = ArtifactUpdated(params.artifact)
             case SessionCompactedParams() | SessionContextClearedParams():
                 raise AssertionError("Session handoffs are reduced before events")
         return event
@@ -661,6 +692,10 @@ def _parse_event_params(notification: Notification) -> _KnownEventParams:
             params = validate_wire(StatsUpdatedParams, notification.params)
         case "session/childSessionUpdated":
             params = validate_wire(ChildSessionUpdatedParams, notification.params)
+        case "artifacts/created":
+            params = validate_wire(ArtifactCreatedParams, notification.params)
+        case "artifacts/updated":
+            params = validate_wire(ArtifactUpdatedParams, notification.params)
         case _:
             raise UnknownNotificationError(
                 f"Unknown app-server notification: {notification.method}"

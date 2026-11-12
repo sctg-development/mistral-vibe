@@ -1,8 +1,8 @@
-"""A startup skill config issue surfaces as a toast (VIBE-4622)."""
+"""A startup skill config issue lands in the startup warnings box (VIBE-4099)."""
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 # The config issue rides the startup runtime snapshot, not a server event.
 handshake = {
@@ -18,7 +18,7 @@ handshake = {
     }
 }
 
-# A lone keystroke yields a settled frame; the startup toast is still up (10s).
-timeline: Timeline = ["a"]
+# A lone keystroke yields a settled frame.
+timeline: Timeline = ["a", take_snapshot()]
 
 screen_contains = ("Failed to load: bad frontmatter",)

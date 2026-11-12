@@ -14,15 +14,15 @@ import subprocess
 import tempfile
 
 from e2e.app_server.config import (
-    BATCH_KEYS,
+    ACK_PREFIX,
     CLIENT_BIN,
     COLUMNS,
-    IDLE_MARKER,
+    FENCE_KEY,
     MINIMAL_HOME_CONFIG,
     REPLAY_BIN,
     REPLAY_NOW_MS,
     ROWS,
-    VIBE_DIR,
+    WORKSPACE_DIR,
 )
 from e2e.app_server.replay import replay_fixture
 from e2e.app_server.scenario import Action, AppServerEvent, Request, Scenario
@@ -80,6 +80,9 @@ class Capture:
     snapshots: list[Snapshot]
     actions: list[Action]
     requests: list[Request]
+    final: Snapshot
+    """The last settled frame, which screen and clipboard expectations check."""
+    titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -104,14 +107,15 @@ def capture_scenario(scenario: Scenario, launch: Launcher = exec_launch) -> Capt
             env["VIBE_REPLAY_STEP_FIFO"] = step_fifo
         spec = CaptureSpec(
             command=(os.fspath(CLIENT_BIN), *scenario.client_args),
-            cwd=os.fspath(VIBE_DIR),
+            cwd=os.fspath(WORKSPACE_DIR),
             env=env,
             rows=ROWS,
             columns=COLUMNS,
-            idle_marker=IDLE_MARKER,
+            ack_prefix=ACK_PREFIX,
+            fence_key=FENCE_KEY,
             steps=tuple(step.text for step in scenario.steps),
             resizes=tuple(step.resize for step in scenario.steps),
-            batch_keys=None if scenario.settle_per_key else BATCH_KEYS,
+            settle_per_key=scenario.settle_per_key,
             exit_after_last_step=scenario.exit_after_last_step,
             terminal_responses=tuple(
                 (query.encode(), response.encode())
@@ -126,19 +130,21 @@ def capture_scenario(scenario: Scenario, launch: Launcher = exec_launch) -> Capt
             ),
         )
         try:
-            snapshots = capture(
+            frames = capture(
                 spec,
                 releases=tuple(step.release for step in scenario.steps),
                 releases_after=tuple(step.release_after for step in scenario.steps),
-                capture_startup=scenario.capture_startup,
-                capture_steps=scenario.capture_steps,
+                startup_label=scenario.startup_snapshot,
+                step_labels=tuple(step.snapshot for step in scenario.steps),
                 step_fd=step_fd,
                 launch=launch,
             )
             return Capture(
-                snapshots,
+                frames.snapshots,
                 _read_actions(action_log),
                 _read_requests(request_log, scenario.request_methods),
+                frames.final,
+                frames.titles,
             )
         finally:
             if step_fd is not None:
@@ -172,7 +178,7 @@ def capture_headless_scenario(scenario: Scenario) -> HeadlessCapture:
         env["VIBE_REPLAY_STEP_FIFO"] = step_fifo
         process = subprocess.Popen(
             (CLIENT_BIN, *scenario.client_args),
-            cwd=VIBE_DIR,
+            cwd=WORKSPACE_DIR,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -242,6 +248,11 @@ def _environment(
     request_log: Path,
 ) -> dict[str, str]:
     environment = os.environ.copy()
+    # The pin is server-owned (clients learn it via setup/status); a host-set value would leak into goldens.
+    environment.pop("VIBE_CUSTOM_CONSOLE_URL", None)
+    # A host tmux would receive copies through `tmux load-buffer` instead of the PTY.
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
     environment.update({
         "TERM": "xterm-256color",
         # Pin truecolor so the host's COLORTERM never decides the rendered colors.
@@ -262,6 +273,10 @@ def _environment(
         "VIBE_REPLAY_NOW_MS": str(REPLAY_NOW_MS),
         "VIBE_E2E_ACTION_LOG": os.fspath(action_log),
         "VIBE_REPLAY_REQUEST_LOG": os.fspath(request_log),
+        # Replay types at machine speed, so the trust gate answers at once.
+        "VIBE_TEST_TRUST_GRACE_MS": "0",
+        # Pin the terminal key so the PTY's device name never reaches a golden.
+        "VIBE_TERMINAL_KEY": "e2e-terminal",
         **overrides,
         # Keep clipboard assertions inside the PTY instead of mutating the host.
         "SSH_TTY": "/dev/pts/0",

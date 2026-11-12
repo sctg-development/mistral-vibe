@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 mod assembly;
 mod contracts;
@@ -14,13 +14,13 @@ use self::contracts::{ToolContracts, validate_model_input};
 use self::program::ResolvedProgramTools;
 use crate::core::config::{HarnessConfig, ToolGroupMetadata};
 use crate::core::error::CoreError;
+use crate::core::features::large_output;
 use crate::core::features::programmatic_tool_calling;
 use crate::core::features::programmatic_tool_calling::{Settings, TypeScriptTool};
 use crate::core::features::skills::{self, SkillDefinition};
 use crate::core::features::tool_discovery::{
     self, SearchRequest, ToolDiscovery, ToolDiscoveryResult,
 };
-use crate::core::features::{file_system, large_output};
 use crate::core::step_protocol::ToolDefinition;
 use crate::core::tools::external::{
     ExternalTool, ExternalToolCall, RuntimeBuiltinToolName, ToolTarget,
@@ -31,6 +31,19 @@ use serde_json::Value;
 
 pub(crate) fn hook_tool_catalog(config: &HarnessConfig) -> Vec<crate::core::hooks::HookToolKey> {
     assembly::hook_tool_catalog(config)
+}
+
+/// The key of the tool that a top-level model call named `name` reaches, by the
+/// same routes `ResolvedTools::resolve_direct_call` uses, or `None` when no
+/// top-level tool has that name.
+pub(crate) fn direct_tool_key(
+    config: &HarnessConfig,
+    name: &str,
+) -> Option<crate::core::hooks::HookToolKey> {
+    assembly::direct_routes(config)
+        .into_iter()
+        .find(|(route_name, _)| route_name == name)
+        .map(|(_, target)| target.hook_tool_key())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,13 +109,10 @@ impl ResolvedTools {
                     echoed_tool_name(&call.name)
                 ))
             })?;
-        if matches!(
-            target,
-            ToolTarget::RuntimeBuiltin {
-                name: RuntimeBuiltinToolName::FileSystemSearchReplace
-                    | RuntimeBuiltinToolName::SelfWait
-            }
-        ) {
+        if let ToolTarget::RuntimeBuiltin {
+            name: name @ RuntimeBuiltinToolName::SelfWait,
+        } = target
+        {
             let input_schema = self
                 .top_level_tools
                 .iter()
@@ -114,9 +124,10 @@ impl ResolvedTools {
                         call.name
                     ))
                 })?;
-            validate_model_input(input_schema, &call.arguments)?;
+            validate_model_input(Some(name), &call.name, input_schema, &call.arguments)?;
         } else {
-            self.contracts.validate_input(&target, &call.arguments)?;
+            self.contracts
+                .validate_input(&target, &call.name, &call.arguments)?;
         }
         if matches!(
             target,
@@ -125,11 +136,9 @@ impl ResolvedTools {
             skills::validate_request(&self.skills, &call.arguments)
                 .map_err(CoreError::invalid_command)?;
         }
-        Ok(resolve_external_tool(
-            target,
-            &call.name,
-            call.arguments.clone(),
-        ))
+        Ok(self
+            .contracts
+            .external_tool(target, &call.name, call.arguments.clone()))
     }
 
     #[cfg(test)]
@@ -168,7 +177,7 @@ impl ResolvedTools {
         arguments: Value,
     ) -> Option<ExternalTool> {
         let target = self.program.target(name)?;
-        Some(resolve_external_tool(target, name, arguments))
+        Some(self.contracts.external_tool(target, name, arguments))
     }
 
     pub(crate) fn validate_runtime_builtin_output(
@@ -178,20 +187,6 @@ impl ResolvedTools {
     ) -> Result<(), String> {
         self.contracts.validate_runtime_builtin_output(name, value)
     }
-}
-
-fn resolve_external_tool(
-    target: ToolTarget,
-    invocation_name: &str,
-    arguments: Value,
-) -> ExternalTool {
-    let arguments = match &target {
-        ToolTarget::RuntimeBuiltin {
-            name: RuntimeBuiltinToolName::FileSystemSearchReplace,
-        } => file_system::edit_runtime_arguments(arguments),
-        ToolTarget::RuntimeBuiltin { .. } | ToolTarget::Provided { .. } => arguments,
-    };
-    ExternalTool::from_target(target, invocation_name, arguments)
 }
 
 fn validate_tool_groups(config: &HarnessConfig) -> Result<(), CoreError> {
@@ -257,26 +252,52 @@ fn validate_tool_groups(config: &HarnessConfig) -> Result<(), CoreError> {
                 ));
             }
             let qualified_name = provided_tool_qualified_name(&group.name, &tool.name);
+            if type_is_not_object(&tool.input_schema) {
+                return Err(CoreError::invalid_configuration(
+                    "tool_groups",
+                    format!(
+                        "tool {qualified_name:?}: input schema type must be \"object\", got {}",
+                        tool.input_schema
+                    ),
+                ));
+            }
             if !qualified_names.insert(qualified_name.clone()) {
                 return Err(CoreError::invalid_configuration(
                     "tool_groups",
                     format!("duplicate stable tool ID {qualified_name:?}"),
                 ));
             }
-            if tool.exposure.is_direct() {
-                if is_reserved_direct_name(config, &tool.name) {
+            if let Some(direct_name) = &tool.direct_name {
+                if !tool.exposure.is_direct() {
                     return Err(CoreError::invalid_configuration(
                         "tool_groups",
                         format!(
-                            "direct tool name {:?} conflicts with a built-in tool",
-                            tool.name
+                            "programmatic-only tool {qualified_name:?} must not set direct_name"
                         ),
                     ));
                 }
-                if !direct_names.insert(tool.name.clone()) {
+                if !tool_discovery::is_identifier(direct_name) {
                     return Err(CoreError::invalid_configuration(
                         "tool_groups",
-                        format!("ambiguous duplicate direct tool name {:?}", tool.name),
+                        format!(
+                            "direct tool name {direct_name:?} in group {:?} must be a valid TypeScript identifier",
+                            group.name
+                        ),
+                    ));
+                }
+            }
+            if tool.exposure.is_direct() {
+                let direct_name = tool.direct_function_name();
+                if is_reserved_direct_name(config, direct_name) {
+                    return Err(CoreError::invalid_configuration(
+                        "tool_groups",
+                        format!("direct tool name {direct_name:?} conflicts with a built-in tool"),
+                    ));
+                }
+                if !direct_names.insert(direct_name.to_string()) {
+                    return Err(CoreError::invalid_configuration(
+                        "tool_groups",
+                        format!("ambiguous duplicate direct tool name {direct_name:?}"),
                     ));
                 }
             }
@@ -285,8 +306,134 @@ fn validate_tool_groups(config: &HarnessConfig) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// A tool call's arguments are an object, and the MCP specification requires a
+/// tool's `inputSchema` to have `"type": "object"`. So a tool whose input schema
+/// sets top-level types other than `object` is refused: by its `type`, by the
+/// branches of an `anyOf` or `oneOf` (also nested), or by a local `$ref` (`#/…`),
+/// which is read in place of the keywords next to it. `{"type": "string"}`,
+/// `{"type": ["object", "null"]}` and `{"anyOf": [{"type": "string"}, {"type":
+/// "object"}]}` are refused. A schema that sets no type, such as `{}`, passes,
+/// and so does a `$ref` that does not resolve in the schema.
+/// The Runtimes drop a tool that an MCP server or a connector lists with such a
+/// schema by the same rule; `fixtures/tool-input-schema-types.json` holds the
+/// cases they all check.
+fn type_is_not_object(schema: &Value) -> bool {
+    TopLevelTypes::new(schema)
+        .of(schema)
+        .is_some_and(|types| types != ["object"])
+}
+
+/// The types a schema allows at its top level, sorted, or `None` when it sets
+/// none. Each local `$ref` target is read once, so a schema that refers to the
+/// same target many times, as an `anyOf` of two `$ref` per level does, takes
+/// time in its size, not exponential in its depth. A `$ref` to a target that is
+/// being read is a cycle, and sets no type. The branches of an `anyOf` or
+/// `oneOf` are read until the first one that sets no type.
+struct TopLevelTypes<'a> {
+    /// The whole schema, against which a local `$ref` resolves.
+    root: &'a Value,
+    /// The pointers of the `$ref` targets being read, the root first.
+    reading: Vec<&'a str>,
+    /// The types of each `$ref` target already read.
+    read: HashMap<&'a str, Option<Vec<String>>>,
+}
+
+impl<'a> TopLevelTypes<'a> {
+    /// A `$ref` chain longer than this sets no type.
+    const MAX_REF_DEPTH: usize = 32;
+
+    fn new(root: &'a Value) -> Self {
+        Self {
+            root,
+            reading: vec![""],
+            read: HashMap::new(),
+        }
+    }
+
+    fn of(&mut self, schema: &'a Value) -> Option<Vec<String>> {
+        let schema = schema.as_object()?;
+        if let Some(reference) = schema.get("$ref") {
+            return self.of_ref(reference);
+        }
+        let mut types = match schema.get("type") {
+            Some(Value::String(name)) => Some(vec![name.clone()]),
+            Some(Value::Array(names)) if !names.is_empty() => Some(
+                names
+                    .iter()
+                    .map(|name| name.as_str().unwrap_or_default().to_string())
+                    .collect(),
+            ),
+            _ => None,
+        };
+        for keyword in ["anyOf", "oneOf"] {
+            let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+                continue;
+            };
+            if branches.is_empty() {
+                continue;
+            }
+            let mut union: Vec<String> = Vec::new();
+            let mut all_typed = true;
+            for branch in branches {
+                let Some(found) = self.of(branch) else {
+                    all_typed = false;
+                    break;
+                };
+                union.extend(found);
+            }
+            if !all_typed {
+                continue;
+            }
+            types = Some(match types {
+                Some(types) => types
+                    .into_iter()
+                    .filter(|name| union.contains(name))
+                    .collect(),
+                None => union,
+            });
+        }
+        types.map(|mut types| {
+            types.sort();
+            types.dedup();
+            types
+        })
+    }
+
+    fn of_ref(&mut self, reference: &'a Value) -> Option<Vec<String>> {
+        let pointer = reference.as_str()?.strip_prefix('#')?;
+        if self.reading.contains(&pointer) || self.reading.len() > Self::MAX_REF_DEPTH {
+            return None;
+        }
+        if let Some(types) = self.read.get(pointer) {
+            return types.clone();
+        }
+        let types = match self.root.pointer(pointer) {
+            Some(target) => {
+                self.reading.push(pointer);
+                let types = self.of(target);
+                self.reading.pop();
+                types
+            }
+            None => None,
+        };
+        self.read.insert(pointer, types.clone());
+        types
+    }
+}
+
 fn build_top_level_tools(config: &HarnessConfig) -> Vec<ToolDefinition> {
-    let mut tools = Vec::new();
+    // Caller direct tools come first: placed after `run_typescript`, models such as
+    // `mistral-large-4` treat them as program functions and never call them directly.
+    let mut tools: Vec<ToolDefinition> = config
+        .tool_groups()
+        .flat_map(|group| &group.tools)
+        .filter(|tool| tool.exposure.is_direct())
+        .map(|tool| ToolDefinition {
+            name: tool.direct_function_name().to_string(),
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+        })
+        .collect();
     if config.settings.tools.programmatic.is_enabled() {
         tools.push(tool_discovery::direct_tool(
             &config.settings.prompts.discovery_description,
@@ -295,7 +442,7 @@ fn build_top_level_tools(config: &HarnessConfig) -> Vec<ToolDefinition> {
             &config.settings.prompts.programs.description,
         ));
     }
-    tools.extend(assembly::direct_tools(config));
+    tools.extend(assembly::builtin_direct_tools(config));
     tools
 }
 
@@ -327,6 +474,7 @@ mod tests {
     };
     use crate::core::features::programmatic_tool_calling::ProgrammaticName;
     use crate::core::features::tool_discovery::{SearchMode, SearchRequest};
+    use crate::core::hooks::{HookToolKey, HookToolTarget};
     use crate::core::testing::CommandEnvironment;
     use crate::core::tools::resolved::testing::{config, qualified_name};
     use serde_json::json;
@@ -382,6 +530,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 output_schema: Some(json!({"type": "array"})),
                 exposure: ProvidedToolExposure::Programmatic,
+                direct_name: None,
             }],
         }];
         let mut config = config();
@@ -501,6 +650,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
                 output_schema: Some(json!({"type": "object"})),
                 exposure: ProvidedToolExposure::Direct,
+                direct_name: None,
             }],
         }];
 
@@ -520,5 +670,221 @@ mod tests {
         );
         assert!(result.contains("<name>clientInteraction</name>"));
         assert!(result.contains("<status>not_callable</status>"));
+    }
+
+    ///
+    /// *Prepare*: A direct-only caller tool with a tool-list name, a caller tool that is also a
+    /// program function, the file system tools and `wait`.
+    /// *Do*: Compile the resolved tools.
+    /// *Assert*: The prompt names, in tool-list order, only the top-level tools that
+    /// `run_typescript` cannot call: the direct-only caller tool by its tool-list name, then
+    /// `wait`.
+    ///
+    #[test]
+    fn the_prompt_names_every_top_level_tool_that_programs_cannot_call() {
+        // Prepare
+        let mut config = config();
+        config.settings.tools.model_wait = crate::core::features::model_wait::Mode::Enabled {
+            external_input: true,
+        };
+        config.capabilities.tool_groups = vec![
+            direct_named_group(
+                "inventory",
+                ProvidedToolExposure::Direct,
+                Some("inventory_delete_item"),
+            ),
+            direct_named_group(
+                "archive",
+                ProvidedToolExposure::DirectAndProgrammatic,
+                Some("archive_delete_item"),
+            ),
+        ];
+
+        // Do
+        let tools = ResolvedTools::compile(&config).unwrap();
+
+        // Assert
+        assert!(tools.tool_group_inventory_prompt_section().ends_with(
+            "\n\nHere are tools that are NOT available in `run_typescript` and \
+             `search_tool_functions`, call them directly: `inventory_delete_item`, `wait`"
+        ));
+    }
+
+    fn direct_named_group(
+        group_name: &str,
+        exposure: ProvidedToolExposure,
+        direct_name: Option<&str>,
+    ) -> ToolGroupDefinition {
+        ToolGroupDefinition {
+            name: group_name.to_string(),
+            description: String::new(),
+            metadata: None,
+            icon_url: None,
+            tools: vec![ProvidedToolDefinition {
+                name: "delete_item".to_string(),
+                description: "Delete an item".to_string(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                exposure,
+                direct_name: direct_name.map(str::to_string),
+            }],
+        }
+    }
+
+    ///
+    /// *Prepare*: Two groups each expose a direct tool named `delete_item` with distinct direct names.
+    /// *Do*: Compile the resolved tools.
+    /// *Assert*: The top-level catalog lists the direct names, and each routes to its own stable ID.
+    ///
+    #[test]
+    fn direct_names_keep_same_named_tools_from_different_groups_distinct() {
+        // Prepare
+        let mut config = config();
+        config.capabilities.tool_groups = vec![
+            direct_named_group(
+                "inventory",
+                ProvidedToolExposure::Direct,
+                Some("inventory_delete_item"),
+            ),
+            direct_named_group(
+                "archive",
+                ProvidedToolExposure::DirectAndProgrammatic,
+                Some("archive_delete_item"),
+            ),
+        ];
+
+        // Do
+        let tools = ResolvedTools::compile(&config).unwrap();
+        let call = |name: &str| ToolCall {
+            id: format!("{name}-call"),
+            name: name.to_string(),
+            arguments: json!({}),
+            argument_error: None,
+        };
+
+        // Assert
+        let names = tools
+            .top_level_tools()
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"inventory_delete_item"));
+        assert!(names.contains(&"archive_delete_item"));
+        assert!(!names.contains(&"delete_item"));
+        for (direct_name, group_name) in [
+            ("inventory_delete_item", "inventory"),
+            ("archive_delete_item", "archive"),
+        ] {
+            let external = tools.resolve_direct_call(&call(direct_name)).unwrap();
+            assert_eq!(
+                external.hook_tool_key().qualified_name,
+                format!("{group_name}.delete_item")
+            );
+        }
+    }
+
+    ///
+    /// *Prepare*: Tool groups set `direct_name` on a programmatic-only tool, reuse one direct name, or use an invalid one.
+    /// *Do*: Compile the resolved tools for each.
+    /// *Assert*: Each configuration is rejected.
+    ///
+    #[test]
+    fn rejects_invalid_direct_names() {
+        let cases = [
+            vec![direct_named_group(
+                "inventory",
+                ProvidedToolExposure::Programmatic,
+                Some("inventory_delete_item"),
+            )],
+            vec![
+                direct_named_group("inventory", ProvidedToolExposure::Direct, Some("delete")),
+                direct_named_group("archive", ProvidedToolExposure::Direct, Some("delete")),
+            ],
+            vec![direct_named_group(
+                "inventory",
+                ProvidedToolExposure::Direct,
+                Some("inventory.delete_item"),
+            )],
+        ];
+        for tool_groups in cases {
+            // Prepare
+            let mut config = config();
+            config.capabilities.tool_groups = tool_groups;
+
+            // Do
+            let result = ResolvedTools::compile(&config);
+
+            // Assert
+            assert!(result.is_err(), "{:?}", config.capabilities.tool_groups);
+        }
+    }
+
+    ///
+    /// *Prepare*: A config with the built-in direct tools, `wait`, a provided group that
+    /// exposes one tool directly, and one whose direct tool has its own direct name.
+    /// *Do*: Look up the tool behind each model-facing name.
+    /// *Assert*: Each name reaches its full tool ID; a name no top-level tool has reaches none.
+    ///
+    #[test]
+    fn direct_tool_key_names_the_tool_a_model_call_reaches() {
+        // Prepare
+        let mut config = config();
+        config.settings.tools.model_wait =
+            serde_json::from_value(json!({"mode": "enabled"})).unwrap();
+        config.capabilities.tool_groups = vec![ToolGroupDefinition {
+            name: "clientInteraction".to_string(),
+            description: "Request structured participation from the connected client.".to_string(),
+            metadata: None,
+            icon_url: None,
+            tools: vec![ProvidedToolDefinition {
+                name: "askUser".to_string(),
+                description: "Ask the user to choose one of a bounded set of options.".to_string(),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                exposure: ProvidedToolExposure::Direct,
+                direct_name: None,
+            }],
+        }];
+        config.capabilities.tool_groups.push(direct_named_group(
+            "inventory",
+            ProvidedToolExposure::Direct,
+            Some("inventory_delete_item"),
+        ));
+
+        // Do
+        let keys = [
+            "read_file",
+            "wait",
+            "askUser",
+            "inventory_delete_item",
+            "delete_item",
+            "no_such_tool",
+        ]
+        .map(|name| direct_tool_key(&config, name));
+
+        // Assert
+        assert_eq!(
+            keys,
+            [
+                Some(HookToolKey {
+                    target: HookToolTarget::Filesystem,
+                    qualified_name: "file_system.read_file".to_string(),
+                }),
+                Some(HookToolKey {
+                    target: HookToolTarget::SelfTool,
+                    qualified_name: "self.wait".to_string(),
+                }),
+                Some(HookToolKey {
+                    target: HookToolTarget::Provided,
+                    qualified_name: "clientInteraction.askUser".to_string(),
+                }),
+                Some(HookToolKey {
+                    target: HookToolTarget::Provided,
+                    qualified_name: "inventory.delete_item".to_string(),
+                }),
+                None,
+                None,
+            ]
+        );
     }
 }

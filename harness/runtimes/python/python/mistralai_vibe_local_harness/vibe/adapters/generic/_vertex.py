@@ -28,6 +28,10 @@ from mistralai_vibe_local_harness.vibe.adapters.generic._model import (
     StrToolChoice,
 )
 from mistralai_vibe_local_harness.vibe.adapters.generic._provider import ProviderView
+from mistralai_vibe_local_harness.vibe.completion_profile import (
+    ReasoningSetting,
+    ReasoningSupport,
+)
 
 
 def build_vertex_base_url(region: str) -> str:
@@ -65,10 +69,19 @@ class VertexCredentials:
                 )
             return creds.token
 
+    def invalidate(self) -> None:
+        """Drop the credential so the next read mints a new one.
+
+        A token is refreshed only once invalid, so a token a provider refused
+        while still unexpired would otherwise be sent again unchanged.
+        """
+        with self._lock:
+            self._credentials = None
+
 
 # The adapter is built per request, so the access token is cached out here to keep
 # credential refreshes process-wide rather than once per call.
-_CREDENTIALS = VertexCredentials()
+VERTEX_CREDENTIALS = VertexCredentials()
 
 
 class VertexAnthropicAdapter(AnthropicAdapter):
@@ -79,7 +92,7 @@ class VertexAnthropicAdapter(AnthropicAdapter):
 
     def __init__(self) -> None:
         super().__init__()
-        self.credentials = _CREDENTIALS
+        self.credentials = VERTEX_CREDENTIALS
 
     def prepare_request(  # noqa: PLR0913 - one keyword per request setting
         self,
@@ -93,8 +106,9 @@ class VertexAnthropicAdapter(AnthropicAdapter):
         enable_streaming: bool,
         provider: ProviderView,
         api_key: str | None = None,
-        thinking: str = "off",
+        thinking: ReasoningSetting | None = None,
         top_p: float | None = None,
+        reasoning_support: ReasoningSupport | None = None,
     ) -> PreparedRequest:
         project_id = provider.project_id
         region = provider.region
@@ -114,9 +128,9 @@ class VertexAnthropicAdapter(AnthropicAdapter):
         }
         self._apply_thinking_config(
             payload,
-            messages=converted_messages,
             max_tokens=max_tokens,
             thinking=thinking,
+            reasoning_support=reasoning_support,
         )
         self._apply_top_p(payload, top_p)
 
@@ -150,6 +164,7 @@ class VertexAnthropicAdapter(AnthropicAdapter):
 
 
 __all__ = [
+    "VERTEX_CREDENTIALS",
     "VertexAnthropicAdapter",
     "VertexCredentials",
     "build_vertex_base_url",

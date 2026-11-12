@@ -4,9 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::app::App;
 use crate::server::{method, Client, TelemetryRecordParams};
+
+pub mod install;
 
 /// Queued events awaiting the event loop. Overflow drops the emission attempt:
 /// telemetry must never stall the UI thread or grow without bound.
@@ -34,21 +37,24 @@ pub fn enqueue(
     let Some(tx) = tx else {
         return;
     };
-    if tx.try_send(TelemetryEvent { name, properties }).is_err() {
-        tracing::warn!(name, "telemetry queue full; dropping event");
+    if let Err(error) = tx.try_send(TelemetryEvent { name, properties }) {
+        match error {
+            TrySendError::Full(_) => {
+                tracing::warn!(name, "telemetry queue full; dropping event");
+            }
+            TrySendError::Closed(_) => {
+                tracing::debug!(name, "telemetry channel closed; dropping event");
+            }
+        }
     }
 }
 
 /// Effect side: detached, so no caller ever waits on an analytics round-trip.
 pub fn send(client: &Arc<Client>, session_id: &str, event: TelemetryEvent) {
-    client.telemetry_spawned();
+    // Tracked, so the replay ack waits until the frame is sent and answered.
     let client = client.clone();
     let session_id = session_id.to_owned();
-    tokio::spawn(async move {
-        let answer = deliver(&client, &session_id, event);
-        client.telemetry_written();
-        answer.await;
-    });
+    crate::work::spawn(async move { deliver(&client, &session_id, event).await });
 }
 
 /// Send what is still queued, concurrently, so the last actions (such as
@@ -104,6 +110,19 @@ pub fn slash_command_used(app: &App, command: &str, command_type: &str) {
     );
 }
 
+/// A builtin command opened by a click instead of typed; `entry_point` names the control.
+pub fn slash_command_clicked(app: &App, command: &str, entry_point: &str) {
+    record(
+        app,
+        event::SLASH_COMMAND_USED,
+        bmap(json!({
+            "command": command.trim_start_matches('/'),
+            "command_type": "builtin",
+            "entry_point": entry_point,
+        })),
+    );
+}
+
 pub fn user_copied_text(app: &App, text: &str) {
     record(
         app,
@@ -130,6 +149,11 @@ pub fn session_branched(app: &App, source_session_id: &str, new_session_id: &str
             "new_session_id": new_session_id,
         })),
     );
+}
+
+/// The first Normal-mode entry since `vim_keybindings` turned on.
+pub fn vim_normal_mode_entered(app: &App) {
+    record(app, event::VIM_NORMAL_MODE_ENTERED, BTreeMap::new());
 }
 
 pub fn voice_mode_toggled(app: &App, enabled: bool) {
@@ -186,12 +210,16 @@ pub fn bmap(value: Value) -> BTreeMap<String, Value> {
 /// stream per event regardless of which client produced it.
 pub mod event {
     pub const STARTUP: &str = "vibe.startup";
+    pub const VERSION_UPDATED: &str = "vibe.version.updated";
     pub const SLASH_COMMAND_USED: &str = "vibe.slash_command_used";
+    pub const MODEL_SELECTION_OPENED: &str = "vibe.model_selection.opened";
+    pub const MODEL_SELECTION_SELECTED: &str = "vibe.model_selection.selected";
     pub const AT_MENTION_INSERTED: &str = "vibe.at_mention_inserted";
     pub const USER_COPIED_TEXT: &str = "vibe.user_copied_text";
     pub const USER_CANCELLED_ACTION: &str = "vibe.user_cancelled_action";
     pub const SESSION_BRANCHED: &str = "vibe.session_branched";
     pub const VOICE_MODE_TOGGLED: &str = "vibe.voice_mode_toggled";
+    pub const VIM_NORMAL_MODE_ENTERED: &str = "vibe.vim_normal_mode_entered";
     pub const TRANSCRIPTION_START: &str = "vibe.audio.transcription.start";
     pub const TRANSCRIPTION_CANCEL: &str = "vibe.audio.transcription.cancel_recording";
     pub const TRANSCRIPTION_DONE: &str = "vibe.audio.transcription.done";

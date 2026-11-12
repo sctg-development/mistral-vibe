@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 import hashlib
-from typing import Literal
+from typing import Literal, NamedTuple
 
+from vibe.app_server._skill_toggles import SkillToggles
 from vibe.app_server.config import (
     AudioProviderView,
     ConfigView,
@@ -20,6 +21,7 @@ from vibe.app_server.models import (
     DebugLogPage,
     SkillSummary,
 )
+from vibe.config_values import ThinkingLevel
 from vibe.core.agents import AgentProfile
 from vibe.core.config import (
     ModelConfig,
@@ -42,8 +44,15 @@ from vibe.core.config.layers.project import ProjectConfigLayer
 from vibe.core.config.layers.user import SuppliedUserConfigLayer, UserConfigLayer
 from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.log_reader import PaginatedLogs
-from vibe.core.skills.models import SkillInfo, SkillSource
-from vibe.core.utils import name_matches
+from vibe.core.skills.models import InstalledSkill, SkillInfo, SkillSource
+
+
+class _RouteFacts(NamedTuple):
+    compaction_threshold: int | None
+    thinking: ThinkingLevel
+    thinking_levels: list[ThinkingLevel]
+    threshold_warning: str | None = None
+
 
 # Model picker display priority, each layer with the group it lists models
 # under: org-curated sources first, the user's own last. Display only -- which
@@ -76,20 +85,21 @@ def project_config_view(
     transcribe_model = config.get_active_transcribe_model()
     tts_model = config.get_active_tts_model()
     active_model = config.get_active_model()
-    # A describer, not Core's resource-link projection, is what makes the
-    # promise good for every source kind: the link only exists for a
-    # file-backed image, so an inline one would still reach a blind model.
+    # Only a describer makes the promise good: without one a blind model gets
+    # ``[Image]`` in place of the pixels, so the send is refused instead.
     describable = image_fallback and config.get_vision_fallback_model() is not None
     sources = _model_sources(config)
     available = config.available_models()
     # Grouped by source; a model no known layer defines keeps its place, last.
     models = [available[alias] for alias in sources if alias in available]
     models += [model for alias, model in available.items() if alias not in sources]
+    active_facts = _route_facts(config, active_model)
     return ConfigView(
         active_model=_project_model_config(
             active_model,
             image_fallback=image_fallback,
             source=sources.get(active_model.alias),
+            route_facts=active_facts,
         ),
         active_model_pinned=active_model_pinned,
         images_supported=active_model.supports_images or describable,
@@ -103,8 +113,12 @@ def project_config_view(
         log_level=config.log_level,
         disable_welcome_banner_animation=config.disable_welcome_banner_animation,
         cursor_blink=config.cursor_blink,
+        vim_keybindings=config.vim_keybindings,
         show_greeting=config.show_greeting,
         autocopy_to_clipboard=config.autocopy_to_clipboard,
+        enable_mouse_capture=config.enable_mouse_capture,
+        enable_sticky_prompt=config.enable_sticky_prompt,
+        enable_file_autocomplete=config.enable_file_autocomplete,
         file_watcher_for_autocomplete=config.file_watcher_for_autocomplete,
         ask_confirmation_on_exit=config.ask_confirmation_on_exit,
         voice_mode_enabled=config.voice_mode_enabled,
@@ -118,9 +132,16 @@ def project_config_view(
         experimental_enable_tab_status=config.experimental_enable_tab_status,
         enable_telemetry=config.enable_telemetry,
         experimental_enable_registry_skills=config.experimental_enable_registry_skills,
+        experimental_enable_local_projects=config.experimental_enable_local_projects,
+        enable_pr_monitoring=config.enable_pr_monitoring,
         models=[
             _project_model_config(
-                model, image_fallback=image_fallback, source=sources.get(model.alias)
+                model,
+                image_fallback=image_fallback,
+                source=sources.get(model.alias),
+                route_facts=active_facts
+                if model == active_model
+                else _route_facts(config, model),
             )
             for model in models
         ],
@@ -138,7 +159,10 @@ def project_config_view(
                 config.get_tts_provider_for_model(tts_model)
             ),
         ),
-        validation_warnings=list(config.validation_warnings),
+        validation_warnings=[
+            *config.validation_warnings,
+            *filter(None, [active_facts.threshold_warning]),
+        ],
     )
 
 
@@ -166,9 +190,49 @@ def _model_sources(config: VibeConfigSchema) -> dict[str, ModelSource]:
     return sources
 
 
+def offered_levels(config: VibeConfigSchema, model: ModelConfig) -> list[ThinkingLevel]:
+    return _route_facts(config, model).thinking_levels
+
+
+def _route_facts(config: VibeConfigSchema, model: ModelConfig) -> _RouteFacts:
+    """Where ``model`` compacts, unset thresholds included, the thinking level
+    it runs, the levels a picker offers, and the warning when its threshold
+    was fitted into its window.
+
+    Clients show context usage against the threshold, so an unset one reports
+    the model's default rather than nothing. The level shown is the one the
+    session runs, always among the offered ones. A model whose settings no
+    profile can hold reports its configured values: opening a session with it
+    says why.
+    """
+    from vibe.app_server._completion_facts import (
+        ModelFactsError,
+        compile_agent_route_facts,
+    )
+
+    try:
+        facts = compile_agent_route_facts(config.get_provider_for_model(model), model)
+    except (ModelFactsError, ValueError):
+        levels = list(model.thinking_levels)
+        if model.thinking not in levels:
+            levels.append(model.thinking)
+        return _RouteFacts(model.auto_compact_threshold, model.thinking, levels)
+    return _RouteFacts(
+        facts.compaction_threshold,
+        facts.thinking,
+        list(facts.thinking_levels),
+        facts.threshold_warning,
+    )
+
+
 def _project_model_config(
-    model: ModelConfig, *, image_fallback: bool, source: ModelSource | None
+    model: ModelConfig,
+    *,
+    image_fallback: bool,
+    source: ModelSource | None,
+    route_facts: _RouteFacts,
 ) -> ModelConfigView:
+    compaction_threshold, thinking, thinking_levels, _ = route_facts
     image_delivery: Literal["native", "resource_link"] | None = None
     if model.supports_images:
         image_delivery = "native"
@@ -177,13 +241,13 @@ def _project_model_config(
     return ModelConfigView(
         name=model.name,
         alias=model.alias,
-        thinking=model.thinking,
-        supports_images=model.supports_images,
+        thinking=thinking,
+        supports_images=model.supports_images is True,
         display_name=model.display_name or model.alias,
         max_context_length=model.max_context_length,
-        auto_compact_threshold=model.auto_compact_threshold,
+        auto_compact_threshold=compaction_threshold,
         image_delivery=image_delivery,
-        thinking_levels=list(model.thinking_levels),
+        thinking_levels=thinking_levels,
         source=source,
     )
 
@@ -237,7 +301,7 @@ def project_skill_summaries(skills: Iterable[SkillInfo]) -> list[SkillSummary]:
 
 
 def _skill_summary(
-    skill: SkillInfo, enabled: bool = True, locked: bool = False
+    skill: SkillInfo, *, enabled: bool = True, locked: bool = False, active: bool = True
 ) -> SkillSummary:
     return SkillSummary.model_validate({
         "name": skill.name,
@@ -249,17 +313,25 @@ def _skill_summary(
         "registry": skill.registry.model_dump() if skill.registry else None,
         "enabled": enabled,
         "locked": locked,
+        "active": active,
     })
 
 
 def writable_disabled_skills(
     orchestrator: ConfigOrchestrator[VibeConfigSchema],
 ) -> Sequence[str] | None:
-    """The writable layer's own ``disabled_skills``, or None when unavailable.
+    """The writable layer's own ``disabled_skills``, or None when unavailable."""
+    return writable_list_field(orchestrator, "disabled_skills")
 
-    ``disabled_skills`` concat-merges, so the effective list is every layer at
-    once while a toggle can only add to or remove from the writable one. Reads
-    the cached layer rather than loading, to stay usable from sync projection.
+
+def writable_list_field(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema], field: str
+) -> Sequence[str] | None:
+    """The writable layer's own value of a concat-merged list, or None when unavailable.
+
+    Such a list's effective value is every layer at once, while a toggle can
+    only add to or remove from the writable one. Reads the cached layer rather
+    than loading, to stay usable from sync projection.
     """
     try:
         layer = orchestrator.get_layer(orchestrator.writable_layer_name)
@@ -268,12 +340,12 @@ def writable_disabled_skills(
     data = layer.cached_data
     if data is None:
         return None
-    names = getattr(data, "disabled_skills", None)
+    names = getattr(data, field, None)
     return list(names) if names else []
 
 
 def project_installed_skill_summaries(
-    skills: Iterable[SkillInfo],
+    skills: Iterable[InstalledSkill],
     config: VibeConfigSchema,
     user_disabled: Sequence[str] | None = None,
 ) -> list[SkillSummary]:
@@ -291,31 +363,32 @@ def project_installed_skill_summaries(
 
     Plugin skills are locked: they come from an installed plugin and are managed
     through ``/plugins``, not by this config.
+
+    ``active`` is whether the agent resolves the skill's name to it. A pin that
+    another skill of the same name shadows is still listed, so it can be managed.
     """
-    allowed = config.enabled_skills
     disabled = config.disabled_skills
-    own = list(disabled if user_disabled is None else user_disabled)
+    toggles = SkillToggles(
+        allowed=config.enabled_skills,
+        disabled=disabled,
+        own=list(disabled if user_disabled is None else user_disabled),
+    )
 
     def _enabled(info: SkillInfo) -> bool:
-        if info.source is SkillSource.PLUGIN:
-            return True
-        if allowed:
-            return name_matches(info.name, allowed)
-        return not (disabled and name_matches(info.name, disabled))
+        return info.source is SkillSource.PLUGIN or toggles.enabled(info.name)
 
     def _locked(info: SkillInfo) -> bool:
-        if info.source is SkillSource.PLUGIN:
-            return True
-        if allowed:
-            return True
-        if not disabled:
-            return False
-        patterns = [pattern for pattern in disabled if pattern != info.name]
-        if name_matches(info.name, patterns):
-            return True
-        return name_matches(info.name, disabled) and info.name not in own
+        return info.source is SkillSource.PLUGIN or toggles.locked(info.name)
 
-    return [_skill_summary(info, _enabled(info), _locked(info)) for info in skills]
+    return [
+        _skill_summary(
+            skill.info,
+            enabled=_enabled(skill.info),
+            locked=_locked(skill.info),
+            active=skill.active,
+        )
+        for skill in skills
+    ]
 
 
 def project_debug_logs(logs: PaginatedLogs) -> DebugLogPage:
