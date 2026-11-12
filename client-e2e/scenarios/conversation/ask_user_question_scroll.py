@@ -9,13 +9,10 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1", "VIBE_TYPING_GRACE_PERIOD_MS": "0"}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0"}
 handshake = {"callback/result": {"accepted": True}}
-capture_startup = False
-capture_steps = {1, 2, 3}
-settle_per_key = True
 
 _WHEEL_OVER_QUESTION = "\x1b[<64;60;34M"
 _SHIFT_UP = "\x1b[1;2A"
@@ -37,4 +34,5 @@ timeline: Timeline = [
     {"release": 6},
     _WHEEL_OVER_QUESTION,
     _SHIFT_UP,
+    take_snapshot(),
 ]

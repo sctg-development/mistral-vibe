@@ -3,38 +3,59 @@
     reason = "private contract types are reflected by Schemars rather than constructed"
 )]
 
+mod bash_timeout;
+mod settings;
+
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::tools::command_environment::CommandEnvironment;
 use crate::core::tools::external::RuntimeBuiltinToolName;
 use crate::core::tools::schema::ToolSchema;
 
+#[cfg(any(test, feature = "python-binding"))]
+pub(crate) use bash_timeout::restored_bash_call;
+pub(crate) use bash_timeout::{BashTimeout, BashTimeoutSettings, bash_runtime_arguments};
+
+pub(crate) use settings::{Mode, ReadFileDocuments, ReadFileImages, ReadFileSupport};
+
 pub(crate) const NAMESPACE: &str = "file_system";
-const DEFAULT_BASH_TIMEOUT_SECONDS: i64 = 120;
-const MAX_BASH_TIMEOUT_SECONDS: i64 = 300;
+const READ_FILE_DESCRIPTION: &str = "Read a text file with optional zero-indexed line offset and limit. When `was_truncated` is true, read on from `next_offset`. An offset past the end of the file is an error. A directory reads as a listing of its entries, one per line with `/` after each subdirectory, at most 500 at a time.";
+const READ_FILE_EXTRACTED_DOCUMENTS: &str =
+    "PDF, Word, PowerPoint, and email files return their extracted text.";
+const READ_FILE_IMAGE_TEXT: &str = "An image file returns only the text found in the image.";
+const READ_FILE_NATIVE_IMAGE: &str = "An image file returns the image itself.";
+const WRITE_FILE_DESCRIPTION: &str = "Create or overwrite a UTF-8 file. Line breaks in `content` can be `\\n`, `\\r\\n` or `\\r`: the file keeps the line endings of the file it replaces, and a new file uses the repository's line endings when they can be found, or the platform default otherwise. To change a file's line endings, run a command such as `unix2dos` or `dos2unix`.";
 const EDIT_DESCRIPTION: &str = r#"Exact string replacement in a file.
 
-Read the current file first. `old_string` must match exactly, including whitespace, indentation, and line endings. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.
+Read the current file first. `old_string` must match exactly, including whitespace and indentation. Line endings don't need to match: the file keeps its own. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.
 
 Example:
 {"file_path":"src/config.ts","old_string":"const mode = \"old\";","new_string":"const mode = \"new\";","replace_all":false}"#;
 
-/// Whether the Session exposes the file system tools. Omission keeps them
-/// enabled, so settings recorded before this field existed keep their tools.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Mode {
-    #[default]
-    Enabled,
-    Disabled,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Exposure {
+    Direct,
+    Programmatic,
 }
 
-impl Mode {
-    pub(crate) fn is_enabled(&self) -> bool {
-        matches!(self, Self::Enabled)
-    }
+fn read_file_description(support: ReadFileSupport, exposure: Exposure) -> String {
+    let documents = match support.documents {
+        ReadFileDocuments::Unsupported => None,
+        ReadFileDocuments::ExtractedText => Some(READ_FILE_EXTRACTED_DOCUMENTS),
+    };
+    let images = match (support.images, exposure) {
+        (ReadFileImages::Unsupported, _) => None,
+        (ReadFileImages::ExtractedText, _) => Some(READ_FILE_IMAGE_TEXT),
+        (ReadFileImages::Native, Exposure::Direct) => Some(READ_FILE_NATIVE_IMAGE),
+        // A program cannot look at an image, and the model may never see it.
+        (ReadFileImages::Native, Exposure::Programmatic) => None,
+    };
+    [Some(READ_FILE_DESCRIPTION), documents, images]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(crate) fn search_description(environment: CommandEnvironment) -> String {
@@ -45,10 +66,6 @@ pub(crate) fn search_description(environment: CommandEnvironment) -> String {
         ),
         None => "Tools to interact with the file system: read, write, and edit.".to_string(),
     }
-}
-
-fn default_bash_timeout_seconds() -> i64 {
-    DEFAULT_BASH_TIMEOUT_SECONDS
 }
 
 #[derive(JsonSchema)]
@@ -92,38 +109,18 @@ struct WriteFileOutput {
     file_existed: bool,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(JsonSchema)]
 #[schemars(deny_unknown_fields)]
-#[serde(deny_unknown_fields)]
 struct EditInput {
     /// Path to the existing text file to edit. Use `file_path`; `path` is not accepted.
     file_path: String,
     #[schemars(length(min = 1))]
-    /// Exact text to find, including whitespace, indentation, and line endings. It must occur exactly once unless `replace_all` is true.
+    /// Exact text to find, including whitespace and indentation. It must occur exactly once unless `replace_all` is true.
     old_string: String,
     /// Exact replacement text for `old_string`. It may be empty to delete the matched text, but it must differ from `old_string`.
     new_string: String,
-    #[serde(default)]
     #[schemars(default)]
     /// When false (the default), replace the single `old_string` match. When true, replace every occurrence of `old_string`.
-    replace_all: bool,
-}
-
-#[derive(JsonSchema, Serialize)]
-#[schemars(deny_unknown_fields)]
-struct RuntimeSearchReplaceInput {
-    file_path: String,
-    #[schemars(length(min = 1))]
-    content: Vec<RuntimeSearchReplaceBlock>,
-}
-
-#[derive(JsonSchema, Serialize)]
-#[schemars(deny_unknown_fields)]
-struct RuntimeSearchReplaceBlock {
-    #[schemars(length(min = 1))]
-    old_str: String,
-    new_str: String,
-    #[schemars(default)]
     replace_all: bool,
 }
 
@@ -138,11 +135,8 @@ struct EditOutput {
 #[schemars(deny_unknown_fields)]
 struct BashInput {
     command: String,
-    /// Seconds the command may run: 120 by default, at most 300. A command that runs longer is stopped, and the result keeps the output it wrote so far with `timed_out` set.
-    #[schemars(
-        default = "default_bash_timeout_seconds",
-        range(min = 1, max = MAX_BASH_TIMEOUT_SECONDS)
-    )]
+    /// Seconds the command may run; `BashTimeout` fills in the Host's default and maximum.
+    #[schemars(default, range(min = 1))]
     timeout_seconds: i64,
 }
 
@@ -182,12 +176,12 @@ impl ToolName {
         match self {
             Self::ReadFile => RuntimeBuiltinToolName::FileSystemReadFile,
             Self::WriteFile => RuntimeBuiltinToolName::FileSystemWriteFile,
-            Self::Edit => RuntimeBuiltinToolName::FileSystemSearchReplace,
+            Self::Edit => RuntimeBuiltinToolName::FileSystemEdit,
             Self::Bash => RuntimeBuiltinToolName::FileSystemBash,
         }
     }
 
-    fn schemas(self) -> (Value, Value) {
+    fn schemas(self, timeout: BashTimeout) -> (Value, Value) {
         match self {
             Self::ReadFile => (ReadFileInput::tool_schema(), ReadFileOutput::tool_schema()),
             Self::WriteFile => (
@@ -195,32 +189,39 @@ impl ToolName {
                 WriteFileOutput::tool_schema(),
             ),
             Self::Edit => (EditInput::tool_schema(), EditOutput::tool_schema()),
-            Self::Bash => (BashInput::tool_schema(), BashOutput::tool_schema()),
+            Self::Bash => {
+                let mut input_schema = BashInput::tool_schema();
+                timeout.apply_to_input_schema(&mut input_schema);
+                (input_schema, BashOutput::tool_schema())
+            }
         }
     }
 
-    fn runtime_input_schema(self) -> Value {
-        match self {
-            Self::Edit => RuntimeSearchReplaceInput::tool_schema(),
-            _ => self.schemas().0,
-        }
-    }
-
-    fn spec(self, environment: CommandEnvironment) -> Option<ToolSpec> {
+    fn spec(
+        self,
+        environment: CommandEnvironment,
+        timeout: BashTimeout,
+        background: bool,
+    ) -> Option<ToolSpec> {
         let direct_name = self.direct_name(environment)?;
         let description = match self {
-            Self::ReadFile => {
-                "Read a text file with optional zero-indexed line offset and limit. When `was_truncated` is true, read on from `next_offset`. An offset past the end of the file is an error. A directory reads as a listing of its entries, one per line with `/` after each subdirectory, at most 500 at a time."
-            }
-            Self::WriteFile => "Create or overwrite a UTF-8 file.",
+            Self::ReadFile => READ_FILE_DESCRIPTION,
+            Self::WriteFile => WRITE_FILE_DESCRIPTION,
             Self::Edit => EDIT_DESCRIPTION,
-            Self::Bash => environment.profile()?.tool_description,
+            Self::Bash => environment.profile()?.bash_description(background),
         };
-        let (input_schema, output_schema) = self.schemas();
+        let (mut input_schema, output_schema) = self.schemas(timeout);
+        if self == Self::Bash
+            && let Some(hint) = environment.profile()?.timeout_hint(background)
+        {
+            let description = &mut input_schema["properties"]["timeout_seconds"]["description"];
+            let base = description.as_str().unwrap_or_default();
+            *description = Value::from(format!("{base} {hint}"));
+        }
         Some(ToolSpec {
             name: self,
             direct_name,
-            description,
+            description: description.to_string(),
             input_schema,
             output_schema,
         })
@@ -230,7 +231,7 @@ impl ToolName {
 pub(crate) struct ToolSpec {
     pub(crate) name: ToolName,
     pub(crate) direct_name: &'static str,
-    pub(crate) description: &'static str,
+    pub(crate) description: String,
     pub(crate) input_schema: Value,
     pub(crate) output_schema: Value,
 }
@@ -241,19 +242,46 @@ pub(crate) struct RuntimeToolContract {
     pub(crate) output_schema: Value,
 }
 
-pub(crate) fn tools(environment: CommandEnvironment) -> Vec<ToolSpec> {
+/// The file system tools. `background` says whether background processes are
+/// enabled; only then does the bash tool advise starting long work in the
+/// background.
+pub(crate) fn tools(
+    environment: CommandEnvironment,
+    timeout: BashTimeout,
+    background: bool,
+) -> Vec<ToolSpec> {
     ToolName::ALL
         .into_iter()
-        .filter_map(|name| name.spec(environment))
+        .filter_map(|name| name.spec(environment, timeout, background))
         .collect()
 }
 
-pub(crate) fn runtime_contracts() -> Vec<RuntimeToolContract> {
+/// The file system tools as `exposure` shows them: `read_file` also says what
+/// the Runtime declared it returns.
+pub(crate) fn exposed_tools(
+    environment: CommandEnvironment,
+    timeout: BashTimeout,
+    background: bool,
+    read_file: ReadFileSupport,
+    exposure: Exposure,
+) -> Vec<ToolSpec> {
+    tools(environment, timeout, background)
+        .into_iter()
+        .map(|spec| match spec.name {
+            ToolName::ReadFile => ToolSpec {
+                description: read_file_description(read_file, exposure),
+                ..spec
+            },
+            _ => spec,
+        })
+        .collect()
+}
+
+pub(crate) fn runtime_contracts(timeout: BashTimeout) -> Vec<RuntimeToolContract> {
     ToolName::ALL
         .into_iter()
         .map(|name| {
-            let input_schema = name.runtime_input_schema();
-            let (_, output_schema) = name.schemas();
+            let (input_schema, output_schema) = name.schemas(timeout);
             RuntimeToolContract {
                 name: name.runtime_tool(),
                 input_schema,
@@ -261,21 +289,6 @@ pub(crate) fn runtime_contracts() -> Vec<RuntimeToolContract> {
             }
         })
         .collect()
-}
-
-/// Translates arguments that already passed the model-visible `EditInput` schema.
-pub(crate) fn edit_runtime_arguments(arguments: Value) -> Value {
-    let arguments: EditInput = serde_json::from_value(arguments)
-        .expect("edit arguments satisfy the model-visible schema before translation");
-    serde_json::to_value(RuntimeSearchReplaceInput {
-        file_path: arguments.file_path,
-        content: vec![RuntimeSearchReplaceBlock {
-            old_str: arguments.old_string,
-            new_str: arguments.new_string,
-            replace_all: arguments.replace_all,
-        }],
-    })
-    .expect("Runtime edit arguments serialize")
 }
 
 pub(crate) fn direct_tool_name(environment: CommandEnvironment, name: &str) -> Option<ToolName> {
@@ -293,62 +306,28 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    ///
-    /// *Prepare*: The Core-owned schema for the built-in bash tool.
-    /// *Do*: Read the model-visible timeout property.
-    /// *Assert*: Omitted timeout defaults to 120 seconds and explicit values cannot exceed 300.
-    ///
+    /// *Prepare*: The Core-owned edit tool.
+    /// *Do*: Compare the schema the model sees with the Runtime contract.
+    /// *Assert*: They are the same schema, so the Runtime receives the model's arguments as they are.
     #[test]
-    fn bash_timeout_schema_has_the_portable_default_and_maximum() {
+    fn runtime_edit_contract_is_the_model_edit_schema() {
         // Prepare
-        let bash = ToolName::Bash
-            .spec(CommandEnvironment::Unix)
-            .expect("Unix exposes Bash");
+        let edit = ToolName::Edit
+            .spec(CommandEnvironment::Unix, BashTimeout::default(), false)
+            .expect("Unix exposes edit");
 
         // Do
-        let timeout = &bash.input_schema["properties"]["timeout_seconds"];
-
-        // Assert
-        assert_eq!(timeout["default"], 120);
-        assert_eq!(timeout["maximum"], 300);
-    }
-
-    #[test]
-    fn model_edit_arguments_translate_to_the_existing_runtime_contract() {
-        assert_eq!(
-            edit_runtime_arguments(json!({
-                "file_path": "src/lib.rs",
-                "old_string": "before",
-                "new_string": "after",
-            })),
-            json!({
-                "file_path": "src/lib.rs",
-                "content": [{
-                    "old_str": "before",
-                    "new_str": "after",
-                    "replace_all": false,
-                }],
-            }),
-        );
-    }
-
-    #[test]
-    fn runtime_edit_schema_keeps_the_existing_wire_shape() {
-        let contracts = runtime_contracts();
-        let edit = contracts
+        let contracts = runtime_contracts(BashTimeout::default());
+        let contract = contracts
             .iter()
-            .find(|contract| contract.name == RuntimeBuiltinToolName::FileSystemSearchReplace)
+            .find(|contract| contract.name == RuntimeBuiltinToolName::FileSystemEdit)
             .unwrap();
 
+        // Assert
+        assert_eq!(contract.input_schema, edit.input_schema);
         assert_eq!(
-            edit.input_schema["required"],
-            json!(["file_path", "content"])
-        );
-        assert!(edit.input_schema["properties"].get("old_string").is_none());
-        assert!(
-            edit.input_schema["properties"]["content"]["items"]["properties"]
-                .get("old_str")
-                .is_some()
+            contract.input_schema["required"],
+            json!(["file_path", "old_string", "new_string"])
         );
     }
 }

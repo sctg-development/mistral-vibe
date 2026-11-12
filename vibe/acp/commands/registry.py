@@ -10,7 +10,6 @@ class AcpCommandKind(StrEnum):
     RELOAD = auto()
     LOG = auto()
     MCP = auto()
-    TELEPORT = auto()
     PROXY_SETUP = auto()
     RETRY = auto()
     LEANSTALL = auto()
@@ -77,11 +76,6 @@ def _build_commands() -> dict[str, AcpCommand]:
             kind=AcpCommandKind.MCP,
             input_hint="status | login <alias> | logout <alias>",
         ),
-        "teleport": AcpCommand(
-            name="teleport",
-            description="Teleport session to Vibe Code Web",
-            kind=AcpCommandKind.TELEPORT,
-        ),
         "proxy-setup": AcpCommand(
             name="proxy-setup",
             description="Configure proxy and SSL certificate settings",
@@ -91,11 +85,11 @@ def _build_commands() -> dict[str, AcpCommand]:
         "retry": AcpCommand(
             name="retry",
             description=(
-                "Continue an interrupted model response; optionally pass "
+                "Retry a failed or interrupted response; optionally pass "
                 "additional instructions"
             ),
             kind=AcpCommandKind.RETRY,
-            input_hint="Optional additional instructions for the continuation",
+            input_hint="Optional additional instructions for the retry",
         ),
         "leanstall": AcpCommand(
             name="leanstall",

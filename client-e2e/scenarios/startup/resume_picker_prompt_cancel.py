@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from e2e.app_server.events import assistant_msg, turn_completed, turn_started, user_msg
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _ESCAPE = "\x1b[27u"
 
@@ -11,12 +11,14 @@ _ESCAPE = "\x1b[27u"
 client_args = ("continue the work", "--resume")
 timeline: Timeline = [
     _ESCAPE,
+    take_snapshot(),
     "hi\r",
     turn_started(),
     user_msg("hi"),
     assistant_msg("Reply to the typed prompt."),
     turn_completed(),
+    take_snapshot(),
 ]
 
-screen_contains = ("Resume cancelled.", "Reply to the typed prompt.")
-screen_excludes = ("continue the work",)
+screen_contains = ("Reply to the typed prompt.",)
+screen_excludes = ("continue the work", "Resume cancelled.")

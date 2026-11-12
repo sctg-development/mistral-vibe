@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from vibe.config_values import THINKING_LEVELS, ThinkingLevel
+from vibe.config_values import ThinkingLevel
 from vibe.core.config.fingerprint import create_dict_fingerprint
 from vibe.core.config.layer import ConfigLayer, RawConfig
 from vibe.core.config.models import ModelConfig
@@ -131,43 +131,18 @@ def _catalog_model_payload(entry: ModelCatalogEntry) -> dict[str, Any] | None:
 
 
 def _thinking_levels(model_id: str, reasoning: list[str]) -> list[ThinkingLevel]:
+    """The catalog's levels, every one kept: a level of the model's own goes to
+    the provider as the catalog wrote it.
+    """
     levels: list[ThinkingLevel] = []
     for value in reasoning:
-        level = "off" if value == _WIRE_NONE else value
-        if level not in THINKING_LEVELS:
+        if not value.strip():
             logger.warning(
-                "Model catalog entry '%s': unknown reasoning value '%s' ignored",
-                model_id,
-                value,
+                "Model catalog entry '%s': blank reasoning value ignored", model_id
             )
             continue
-        levels.append(cast(ThinkingLevel, level))
+        levels.append("off" if value == _WIRE_NONE else value)
     return levels
-
-
-async def apply_cached_model_catalog(
-    orchestrator: ConfigOrchestrator[VibeConfigSchema],
-) -> None:
-    """Apply the last cached catalog to config before first render.
-
-    Fail-open: a cached catalog the config cannot be built from is ignored.
-    """
-    config = orchestrator.config
-    if not config.experimental_enable_model_catalog:
-        return
-    # Imported here for the same reason as the type-only imports above.
-    from vibe.core.model_catalog import load_cached_model_catalog
-
-    cached = load_cached_model_catalog(config)
-    if cached is None:
-        return
-    try:
-        changed = await apply_model_catalog(orchestrator, cached)
-    except Exception:
-        logger.exception("Failed to apply the cached model catalog to config")
-        return
-    if changed:
-        logger.info("Model catalog applied from cache: %d models", len(cached.models))
 
 
 async def apply_model_catalog(
@@ -181,19 +156,36 @@ async def apply_model_catalog(
     could not be built from.
     """
     layer = _catalog_layer(orchestrator)
-    previous = layer.catalog
-    if catalog == previous:
+    if catalog == layer.catalog:
         return False
+    await set_catalog_and_reload(orchestrator, layer, catalog, full=True)
+    return True
+
+
+async def set_catalog_and_reload(
+    orchestrator: ConfigOrchestrator[VibeConfigSchema],
+    layer: ModelCatalogLayer,
+    catalog: ModelCatalogResponse,
+    *,
+    full: bool = False,
+) -> None:
+    """Rebuild the config on *catalog*: every layer with ``full``, else the
+    catalog layer alone. A failed rebuild restores the previous catalog, so
+    the layer never holds one the config could not be built from.
+    """
+    previous = layer.catalog
     layer.set_catalog(catalog)
     try:
-        await orchestrator.reload()
+        if full:
+            await orchestrator.reload()
+        else:
+            await orchestrator.reload_layer(layer.name)
     except BaseException:
         layer.set_catalog(previous)
         # The reload may have cached the rejected catalog before failing; a
         # later non-forcing rebuild would bring it back.
         await layer.invalidate_cache()
         raise
-    return True
 
 
 def _catalog_layer(

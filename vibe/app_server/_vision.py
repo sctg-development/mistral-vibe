@@ -1,16 +1,16 @@
-"""Core can already show a blind model something other than the pixels: that
-is what ``image_delivery`` set to ``resource_link`` does for a file-backed
-attachment. But that projection is synchronous and infallible, and describing
-an image is neither -- it is a provider call that takes seconds and can fail.
-So the Host substitutes at the turn-input seam instead, where mentioned files
-are already inlined and an await with a failure path is available. What is
-substituted once is what Core stores, compacts and resumes.
+"""Core already shows a model without image input something in place of the
+pixels: ``[Image]``, plus the file's link for a file-backed image. Describing
+an image is Vibe's own feature on top of that, and unlike Core's projection it
+is a provider call that takes seconds and can fail. So the Host substitutes at
+the turn-input seam, where mentioned files are already inlined and an await
+with a failure path is available. What is substituted once is what Core
+stores, compacts and resumes.
 
-An image no describer can reach is left untouched, and Core's resource-link
-projection hands the model the local file in its place -- but only for a
-file-backed one, so ``images_supported`` promises nothing on the strength of
-that alone (see ``project_config_view``). Only the Unified backend does either;
-the legacy ``AgentLoop`` keeps rejecting attachments its model cannot read.
+An image no describer can reach is left as is, and Core hands the model
+``[Image]`` in its place, with the file's link for a file-backed one. That
+says nothing about the image, so ``images_supported`` promises nothing on its
+strength (see ``project_config_view``). Only the Unified backend describes images; the
+legacy ``AgentLoop`` keeps rejecting attachments its model cannot read.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from vibe.app_server.models import (
     SessionTextContentBlock,
     TextContentBlock,
 )
-from vibe.core.tracing import build_otel_span_exporter_config
+from vibe.core.llm.completion import CompletionTransport
 from vibe.core.types import ImageAttachment as CoreImageAttachment
 from vibe.core.vision import ImageDescriber, complete_vision
 from vibe.utils.images import MAX_IMAGES_PER_MESSAGE
@@ -34,13 +34,17 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from typing import Any
 
+    from mistralai_vibe_local_harness.vibe import (
+        ProviderCredentialProvider,
+        UtilityReply,
+    )
     from vibe.app_server.models import (
         ContentBlock,
         ImageAttachment,
         SessionContentBlock,
     )
     from vibe.core.config import ModelConfig, VibeConfigSchema
-    from vibe.core.types import LLMChunk, LLMMessage
+    from vibe.core.types import LLMMessage
     from vibe.core.vision import DescribeReport
 
 __all__ = ["SessionImageDescriber"]
@@ -63,11 +67,14 @@ class SessionImageDescriber:
         notice: Callable[[str], None],
         session_id: Callable[[], str | None],
         record_event: Callable[[str, dict[str, Any]], None],
+        credentials: Callable[[str], ProviderCredentialProvider] | None = None,
     ) -> None:
         self._config = config
         self._notice = notice
         self._session_id = session_id
         self._record_event = record_event
+        # The session's credential for a provider by name; None reads the key.
+        self._credentials = credentials
         self._describer = ImageDescriber(self._complete)
 
     async def described_blocks(self, blocks: list[ContentBlock]) -> list[ContentBlock]:
@@ -164,35 +171,24 @@ class SessionImageDescriber:
         )
 
     def _image_text(self, attachment: CoreImageAttachment) -> str:
+        # pre_agent hooks recognize a described image by this shape, so they never
+        # take it for the text the user typed (see the local harness _foreign_hooks).
         body = self._describer.cached(attachment) or UNREADABLE_IMAGE
         return f'<image alias="{attachment.alias}">\n{body}\n</image>'
 
     async def _complete(
         self, *, model: ModelConfig, messages: Sequence[LLMMessage]
-    ) -> LLMChunk:
+    ) -> UtilityReply:
         config = self._config()
+        provider = config.get_provider_for_model(model)
         return await complete_vision(
             model=model,
-            provider=config.get_provider_for_model(model),
+            provider=provider,
             messages=messages,
-            timeout=config.api_timeout,
-            retry_max_elapsed_time=config.api_retry_max_elapsed_time,
+            transport=CompletionTransport.from_config(config),
             session_id=self._session_id(),
-            enable_otel=_otel_enabled(config),
+            credentials=self._credentials(provider.name) if self._credentials else None,
         )
-
-
-def _otel_enabled(config: VibeConfigSchema) -> bool:
-    # The same gate the legacy loop applies to its own completions: without a
-    # resolvable exporter the tracer instruments the call and drops the spans.
-    if not (config.enable_telemetry and config.enable_otel):
-        return False
-    return (
-        build_otel_span_exporter_config(
-            config.otel_endpoint, config.get_mistral_provider()
-        )
-        is not None
-    )
 
 
 def _reject_beyond_limit(count: int) -> None:

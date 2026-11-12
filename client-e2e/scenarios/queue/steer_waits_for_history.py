@@ -11,11 +11,10 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 _SECOND_QUEUE_ITEM_ID = f"{QUEUE_ITEM_ID}-2"
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
 handshake = {
     "session/start": {"state": {"session": {"harness": "unified"}}},
     "session/turn/queue/steer": {
@@ -25,9 +24,6 @@ handshake = {
     },
 }
 
-settle_per_key = True
-capture_steps = {1, 2}
-
 timeline: Timeline = [
     "first\r",
     turn_started(),
@@ -36,4 +32,5 @@ timeline: Timeline = [
     turn_queue_updated([queued_turn(2, "second")]),
     {"release": 5},
     "\r",
+    take_snapshot(),
 ]

@@ -29,9 +29,8 @@ pub use steering::{
     reconcile_snapshot, steer_pending,
 };
 
-use tokio::sync::mpsc::Sender;
-
 use crate::app::App;
+use crate::clock::UiInstant;
 use crate::server::ImageAttachment;
 
 /// A prompt the server accepted and has not promoted to a turn yet.
@@ -85,7 +84,7 @@ pub struct QueueController {
     /// Whether the server holds the queue until the user resumes it.
     pub paused: bool,
     /// When the user interrupted a turn the server had not started yet.
-    pub interrupt_on_start: Option<std::time::Instant>,
+    pub interrupt_on_start: Option<UiInstant>,
     /// Highlighted prompt in queue mode, by message id, or `None` when closed.
     pub selected: Option<String>,
     /// Whether Enter loaded the highlighted prompt into the input for editing.
@@ -102,8 +101,6 @@ pub struct QueueController {
     consumed: Vec<String>,
     /// Monotonic desired-state revision for merged queue items.
     next_revision: u64,
-    /// Enqueue answers, applied on the main thread.
-    pub tx: Option<Sender<QueueEvent>>,
 }
 
 /// Cap for late enqueue-answer ids and consumed server queue ids.

@@ -11,13 +11,8 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-env = {
-    "VIBE_INPUT_GRACE_PERIOD_MS": "0",
-    "VIBE_REPLAY_SETTLE_BUSY": "1",
-    "VIBE_TYPING_GRACE_PERIOD_MS": "0",
-}
+env = {"VIBE_INPUT_GRACE_PERIOD_MS": "0", "VIBE_TYPING_GRACE_PERIOD_MS": "0"}
 handshake = {"callback/result": {"accepted": True}}
-capture_startup = False
 
 _CHILD_SESSION_ID = "00000000-0000-4000-8000-000000000002"
 _PERMISSIONS = [

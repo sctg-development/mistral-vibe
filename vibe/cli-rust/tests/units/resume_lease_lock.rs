@@ -4,11 +4,12 @@
 
 use crossterm::event::KeyCode;
 use serde_json::json;
-use std::sync::Arc;
 
-use vibe_rs::app::App;
-use vibe_rs::resume_picker::{self, held, lease_locked, Event, Session};
-use vibe_rs::server::Client;
+use vibe_rs::app::Severity;
+use vibe_rs::resume_picker::{self, held, lease_locked, Event};
+
+use crate::feedback_support::{notice, warnings};
+use crate::support::{stub, with_picker};
 
 const BUSY: &str = "This session is open in another Vibe process. Close it there to continue here.";
 
@@ -58,7 +59,7 @@ fn a_missing_snapshot_locks_nothing() {
 
 #[test]
 fn lease_updates_keep_the_lock_set_warm() {
-    let mut app = picker();
+    let mut app = with_picker();
     resume_picker::on_lease_updated(
         &mut app,
         &stub(),
@@ -82,7 +83,7 @@ fn lease_updates_keep_the_lock_set_warm() {
 
 #[test]
 fn a_late_lease_snapshot_keeps_newer_notifications() {
-    let mut app = picker();
+    let mut app = with_picker();
     resume_picker::on_lease_updated(
         &mut app,
         &stub(),
@@ -105,7 +106,7 @@ fn a_late_lease_snapshot_keeps_newer_notifications() {
 
 #[test]
 fn a_late_lease_snapshot_does_not_restore_locks_after_the_watch_ends() {
-    let mut app = picker();
+    let mut app = with_picker();
     resume_picker::on_lease_updated(
         &mut app,
         &stub(),
@@ -122,7 +123,7 @@ fn a_late_lease_snapshot_does_not_restore_locks_after_the_watch_ends() {
 
 #[test]
 fn a_failed_lease_subscribe_does_not_clear_locks_already_collected() {
-    let mut app = picker();
+    let mut app = with_picker();
     resume_picker::on_lease_updated(
         &mut app,
         &stub(),
@@ -134,7 +135,7 @@ fn a_failed_lease_subscribe_does_not_clear_locks_already_collected() {
 
 #[test]
 fn a_lease_snapshot_still_seeds_locks_before_any_notification() {
-    let mut app = picker();
+    let mut app = with_picker();
     resume_picker::apply_event(
         &mut app,
         &stub(),
@@ -152,8 +153,8 @@ fn a_lease_snapshot_still_seeds_locks_before_any_notification() {
 }
 
 #[tokio::test]
-async fn enter_on_a_locked_row_toasts_the_busy_refusal_instead_of_resuming() {
-    let mut app = picker();
+async fn enter_on_a_locked_row_warns_with_the_busy_refusal_instead_of_resuming() {
+    let mut app = with_picker();
     let _channels = vibe_rs::channels::connect(&mut app);
     resume_picker::on_lease_updated(
         &mut app,
@@ -163,35 +164,14 @@ async fn enter_on_a_locked_row_toasts_the_busy_refusal_instead_of_resuming() {
     resume_picker::handle_key(&mut app, &stub(), KeyCode::Enter.into());
     assert!(!app.resume_picker.resuming);
     assert!(app.resume_picker.open);
-    let toasts = app
-        .overlays
-        .toasts
-        .iter()
-        .map(|toast| toast.text.clone())
-        .collect::<Vec<_>>();
-    assert!(toasts.contains(&BUSY.to_owned()));
+    assert_eq!(notice(&app), Some((Severity::Warning, BUSY)));
+    assert!(warnings(&app).is_empty());
 }
 
 #[tokio::test]
 async fn enter_on_an_unlocked_row_still_resumes() {
-    let mut app = picker();
+    let mut app = with_picker();
     let _channels = vibe_rs::channels::connect(&mut app);
     resume_picker::handle_key(&mut app, &stub(), KeyCode::Enter.into());
     assert!(app.resume_picker.resuming);
-}
-
-fn picker() -> App {
-    let mut app = App::default();
-    app.resume_picker.open = true;
-    app.resume_picker.sessions = vec![Session {
-        id: "busy".into(),
-        title: "Saved implementation".into(),
-        ..Default::default()
-    }];
-    app.resume_picker.list.highlight(0);
-    app
-}
-
-fn stub() -> Arc<Client> {
-    Arc::new(Client::stub())
 }

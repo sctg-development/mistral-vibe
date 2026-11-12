@@ -4,6 +4,7 @@
 //! reads its stdin to see the client gone. Both spawns are covered: `vibe -p`
 //! and the TUI's, and the run server's multiplexed one.
 #![cfg(target_os = "linux")]
+#![allow(clippy::disallowed_methods)] // Tests drive real time directly; replay acks never run here.
 
 use std::any::Any;
 use std::fs::File;
@@ -41,10 +42,11 @@ fn ends_within(mut pipe: File, budget: Duration) -> bool {
 
 /// A stand-in app-server that ignores its arguments and never reads its
 /// stdin, so the end of the client's pipe cannot end it. It ends on SIGTERM,
-/// which it records in `signals`, after `ready` once it handles it.
+/// which it records in `signals` after `ready`, once its foreground `sleep 1`
+/// ends: it signals no child, as a signal sent before a child's exec is lost.
 fn deaf_app_server(signals: &str) -> Launch {
     let script =
-        r#"trap 'echo TERM >> "$0"; kill $!; exit 0' TERM; echo ready > "$0"; sleep 3600 & wait"#;
+        r#"trap 'echo TERM >> "$0"; exit 0' TERM; echo ready > "$0"; while :; do sleep 1; done"#;
     Launch {
         program: "sh".into(),
         args: vec!["-c".into(), script.into(), signals.into()],
@@ -88,7 +90,7 @@ fn helper_client_spawns_app_server_and_hangs() {
 
 /// SIGKILLs a client that spawned the stand-in by `spawn`: whether the
 /// stand-in died within `DEATH_BUDGET`, and the signals it recorded.
-fn app_server_dies_with_its_client(spawn: &str) -> (bool, String) {
+fn app_server_dies_with_its_client(spawn: &str) -> (bool, Vec<String>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let signals = dir.path().join("signals");
     let (mut pid, pid_w) = pipe();
@@ -126,7 +128,11 @@ fn app_server_dies_with_its_client(spawn: &str) -> (bool, String) {
     let died = ends_within(alive, DEATH_BUDGET);
     // Its own process group; a no-op once it has died.
     unsafe { libc::kill(-app_server, libc::SIGKILL) };
-    (died, std::fs::read_to_string(&signals).unwrap_or_default())
+    let recorded = std::fs::read_to_string(&signals).unwrap_or_default();
+    let mut recorded: Vec<String> = recorded.split_whitespace().map(String::from).collect();
+    // The kernel resends the death signal as each dying client thread hands the stand-in on.
+    recorded.dedup();
+    (died, recorded)
 }
 
 // One sequential test: a concurrent spawn would inherit the pipe write ends
@@ -136,7 +142,7 @@ fn a_killed_client_sigterms_its_app_server() {
     let (died, signals) = app_server_dies_with_its_client("client");
     assert!(died, "the app-server outlived its killed client");
     assert_eq!(
-        signals.split_whitespace().collect::<Vec<_>>(),
+        signals,
         ["ready", "TERM"],
         "the app-server was not sent SIGTERM"
     );
@@ -146,7 +152,7 @@ fn a_killed_client_sigterms_its_app_server() {
         "the multiplexed app-server outlived its killed run server"
     );
     assert_eq!(
-        signals.split_whitespace().collect::<Vec<_>>(),
+        signals,
         ["ready", "TERM"],
         "the multiplexed app-server was not sent SIGTERM"
     );

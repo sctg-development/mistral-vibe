@@ -1,11 +1,12 @@
-"""A narrow terminal ellipsizes the bottom bar cwd and keeps the full token counter."""
+"""A narrow terminal turns the context gauge into a one-cell level and keeps the cwd whole."""
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline, resize
+from e2e.app_server.scenario import Timeline, resize, take_snapshot
 
 handshake = {"runtime/read": {"runtime": {"stats": {"contextTokens": 23_000}}}}
 
-timeline: Timeline = [resize(20, 36)]
+timeline: Timeline = [resize(20, 28), take_snapshot()]
 
-screen_contains = ("/test/… [PID 0] 23k/600k tokens (4%)",)
+screen_contains = ("/test/workdir", "ctx ▁")
+screen_excludes = ("23k/600k",)

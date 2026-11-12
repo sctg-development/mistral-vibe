@@ -2,15 +2,26 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, RwLock};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 use ignore::{IncrementalIgnore, WalkBuilder};
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{event::ModifyKind, Event, EventKind};
 use tokio::sync::watch;
 
 use crate::utils::file_match;
+
+mod directory_scans;
+mod git;
+mod ignore_changes;
+mod incremental;
+mod lifecycle;
+mod metrics;
+
+pub use git::{git_ls_files, rebuild_index};
+pub use lifecycle::{apply, env_opt_out, reconcile, FileIndexAction, FileIndexHandle};
+pub use metrics::BatchStats;
 
 #[derive(Clone, Default)]
 pub struct FileIndex {
@@ -18,17 +29,8 @@ pub struct FileIndex {
 }
 
 impl FileIndex {
-    pub fn start(root: Option<PathBuf>) -> (Self, watch::Receiver<u64>) {
-        let index = Self::default();
-        let (version_tx, version_rx) = watch::channel(0);
-        let Some(root) = root else {
-            return (index, version_rx);
-        };
-        let paths = index.paths.clone();
-        let _ = std::thread::Builder::new()
-            .name("file-index-watch".into())
-            .spawn(move || watch_files(root, paths, version_tx));
-        (index, version_rx)
+    pub(crate) fn from_paths(paths: Arc<RwLock<BTreeMap<String, bool>>>) -> Self {
+        Self { paths }
     }
 
     pub fn matching(&self, query: &str, limit: usize) -> Vec<String> {
@@ -39,44 +41,7 @@ impl FileIndex {
     }
 }
 
-fn watch_files(
-    root: PathBuf,
-    paths: Arc<RwLock<BTreeMap<String, bool>>>,
-    version: watch::Sender<u64>,
-) {
-    let (event_tx, event_rx) = mpsc::channel();
-    let Ok(mut watcher) = RecommendedWatcher::new(
-        move |event| {
-            let _ = event_tx.send(event);
-        },
-        Config::default(),
-    ) else {
-        return;
-    };
-    if watcher.watch(&root, RecursiveMode::Recursive).is_err() {
-        return;
-    }
-
-    let mut ignore = ignore_matcher(&root);
-    let (initial, mut git_backed) = rebuild_index(&root);
-    if let Ok(mut current) = paths.write() {
-        *current = initial;
-    }
-    bump(&version);
-
-    while let Ok(first) = event_rx.recv() {
-        let Ok(first) = first else { continue };
-        let mut events = vec![first];
-        while let Ok(event) = event_rx.try_recv() {
-            if let Ok(event) = event {
-                events.push(event);
-            }
-        }
-        git_backed = apply_events(&root, &paths, events, &version, &mut ignore, git_backed);
-    }
-}
-
-// One git rebuild per drained burst, not one per event.
+// One full rebuild per drained burst, not one per event.
 pub fn apply_events(
     root: &Path,
     paths: &RwLock<BTreeMap<String, bool>>,
@@ -85,75 +50,84 @@ pub fn apply_events(
     ignore: &mut IncrementalIgnore,
     git_backed: bool,
 ) -> bool {
-    if git_backed {
-        if !events.iter().any(tracks_files) {
-            return git_backed;
-        }
-        let (replacement, still_git) = rebuild_index(root);
-        replace_index(paths, replacement, version);
-        return still_git;
-    }
-    for event in events {
-        apply_event(root, paths, event, version, ignore);
-    }
-    git_backed
+    apply_events_tracked(root, paths, events, version, ignore, git_backed, None).0
 }
 
-fn apply_event(
+// `apply_events` plus what the burst cost, for the watch thread's telemetry.
+// `stop` lets a rebuild planned mid-burst bail instead of finishing into a
+// handle nobody reads.
+pub fn apply_events_tracked(
     root: &Path,
     paths: &RwLock<BTreeMap<String, bool>>,
-    event: Event,
+    events: Vec<Event>,
     version: &watch::Sender<u64>,
     ignore: &mut IncrementalIgnore,
-) {
-    if !tracks_files(&event) {
-        return;
+    git_backed: bool,
+    stop: Option<&AtomicBool>,
+) -> (bool, BatchStats) {
+    let mut stats = BatchStats::new(events.len() as u64);
+    if stopped(stop) {
+        return (git_backed, stats);
     }
-    if event.paths.iter().any(|path| is_ignore_file(root, path)) {
-        *ignore = ignore_matcher(root);
-        replace_index(paths, collect_files(root, root), version);
-        return;
-    }
-
-    let mut additions = BTreeMap::new();
-    let mut removals = Vec::new();
-    for path in event.paths {
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        if path.exists() {
-            let is_dir = path.is_dir();
-            if is_dir {
-                *ignore = ignore_matcher(root);
-            }
-            if is_git_path(relative) || ignore.matched(relative, is_dir).is_ignore() {
-                continue;
-            }
-            additions.extend(collect_files(&path, root));
-        } else if let Some(relative) = display_path(relative) {
-            removals.push(relative);
+    let rescan = events.iter().any(Event::need_rescan);
+    if git_backed || rescan {
+        if !rescan && !events.iter().any(tracks_files) {
+            return (git_backed, stats);
         }
+        // A rescan means events were dropped; an ignore-file edit may have
+        // been lost with them, so the matcher needs a rebuild too.
+        if rescan {
+            *ignore = ignore_matcher(root);
+        }
+        let (replacement, still_git) = rebuild_index(root, stop);
+        if stopped(stop) {
+            return (still_git, stats);
+        }
+        stats.rebuild(&replacement);
+        replace_index(paths, replacement, version);
+        return (still_git, stats);
     }
-    if additions.is_empty() && removals.is_empty() {
-        return;
+    // Removed or renamed directories leave stale rules in the cached matcher.
+    if events.iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+        )
+    }) {
+        *ignore = ignore_matcher(root);
     }
-    let Ok(mut current) = paths.write() else {
-        return;
+    if events
+        .iter()
+        .filter(|event| tracks_files(event))
+        .any(|event| {
+            event
+                .paths
+                .iter()
+                .any(|path| ignore_changes::relevant(root, path, ignore))
+        })
+    {
+        *ignore = ignore_matcher(root);
+        let replacement = collect_files(root, root, stop);
+        if !stopped(stop) {
+            stats.rebuild(&replacement);
+            replace_index(paths, replacement, version);
+        }
+        return (git_backed, stats);
+    }
+    let mut scans = directory_scans::DirectoryScans::plan(root, &events, ignore, stop);
+    let updates = incremental::Updates {
+        root,
+        paths,
+        version,
     };
-    let mut changed = false;
-    for relative in removals {
-        let prefix = format!("{relative}/");
-        let previous_len = current.len();
-        current.retain(|entry, _| entry != &relative && !entry.starts_with(&prefix));
-        changed |= previous_len != current.len();
+    for event in events {
+        updates.apply(event, ignore, &mut stats, stop, &mut scans);
     }
-    for (path, is_dir) in additions {
-        changed |= current.insert(path, is_dir) != Some(is_dir);
-    }
-    drop(current);
-    if changed {
-        bump(version);
-    }
+    (git_backed, stats)
+}
+
+fn stopped(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
 }
 
 fn tracks_files(event: &Event) -> bool {
@@ -175,66 +149,28 @@ fn replace_index(
     }
 }
 
-pub fn rebuild_index(root: &Path) -> (BTreeMap<String, bool>, bool) {
-    match git_ls_files(root) {
-        Some(entries) => (entries, true),
-        None => (collect_files(root, root), false),
-    }
-}
-
-pub fn git_ls_files(root: &Path) -> Option<BTreeMap<String, bool>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+/// `stop` aborts the walk and returns what it has; `None` enumerates it all.
+fn collect_files(
+    scan_root: &Path,
+    workspace_root: &Path,
+    stop: Option<&AtomicBool>,
+) -> BTreeMap<String, bool> {
     let mut entries = BTreeMap::new();
-    for raw in output.stdout.split(|byte| *byte == 0) {
-        if raw.is_empty() {
+    for entry in walk_builder(scan_root).build().flatten() {
+        if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+            return entries;
+        }
+        let Some(kind) = entry.file_type() else {
             continue;
-        }
-        let rel = String::from_utf8_lossy(raw).into_owned();
-        let path = root.join(&rel);
-        if !path.exists() {
+        };
+        let Some(relative) = relative_path(workspace_root, entry.path()) else {
             continue;
+        };
+        if kind.is_file() || kind.is_dir() || kind.is_symlink() {
+            entries.insert(relative, kind.is_dir());
         }
-        // Parent dirs exist only as ancestors of a listed file.
-        let parts: Vec<&str> = rel.split('/').collect();
-        let mut parent = String::new();
-        for part in &parts[..parts.len() - 1] {
-            if !parent.is_empty() {
-                parent.push('/');
-            }
-            parent.push_str(part);
-            entries.entry(parent.clone()).or_insert(true);
-        }
-        entries.insert(rel, path.is_dir());
     }
-    Some(entries)
-}
-
-fn collect_files(scan_root: &Path, workspace_root: &Path) -> BTreeMap<String, bool> {
-    walk_builder(scan_root)
-        .build()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let kind = entry.file_type()?;
-            let relative = relative_path(workspace_root, entry.path())?;
-            (kind.is_file() || kind.is_dir() || kind.is_symlink())
-                .then_some((relative, kind.is_dir()))
-        })
-        .collect()
+    entries
 }
 
 fn walk_builder(root: &Path) -> WalkBuilder {
@@ -271,14 +207,6 @@ fn display_path(path: &Path) -> Option<String> {
 fn is_git_path(path: &Path) -> bool {
     path.components()
         .any(|component| component.as_os_str() == OsStr::new(".git"))
-}
-
-fn is_ignore_file(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    matches!(relative.file_name(), Some(name) if name == OsStr::new(".gitignore") || name == OsStr::new(".ignore"))
-        || relative.ends_with(Path::new(".git").join("info").join("exclude"))
 }
 
 fn bump(version: &watch::Sender<u64>) {

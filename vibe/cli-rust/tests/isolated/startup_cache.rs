@@ -92,6 +92,23 @@ fn round_trips_through_the_cache_file_format() {
 }
 
 #[test]
+fn projects_mouse_capture_from_the_runtime_config() {
+    assert!(config_with(CLIENT_VERSION, 1000).enable_mouse_capture);
+    let mut disabled = runtime("safe");
+    disabled["runtime"]["config"]["enableMouseCapture"] = false.into();
+    let config = StartupConfig::from_runtime("1.0.0", &disabled).unwrap();
+    assert!(!config.enable_mouse_capture);
+}
+
+#[test]
+fn an_older_cache_without_mouse_capture_keeps_capturing() {
+    let mut cache = serde_json::to_value(config_with(CLIENT_VERSION, 1000)).unwrap();
+    cache.as_object_mut().unwrap().remove("enableMouseCapture");
+    let config: StartupConfig = serde_json::from_value(cache).unwrap();
+    assert!(config.enable_mouse_capture);
+}
+
+#[test]
 fn an_older_cache_without_cursor_blink_keeps_blinking_enabled() {
     let mut cache = serde_json::to_value(config_with(CLIENT_VERSION, 1000)).unwrap();
     cache.as_object_mut().unwrap().remove("cursorBlink");
@@ -177,4 +194,22 @@ fn from_runtime_stamps_the_write_time() {
         .as_secs() as i64;
     assert!(config.cached_at >= before && config.cached_at <= after);
     assert!(config.is_fresh(CLIENT_VERSION, after));
+}
+
+#[test]
+fn file_autocomplete_defaults_to_enabled_when_the_runtime_omits_it() {
+    let config = StartupConfig::from_runtime("1.0.0", &runtime("safe")).unwrap();
+    assert!(config.enable_file_autocomplete);
+    assert!(config.file_watcher_for_autocomplete);
+}
+
+#[test]
+fn runtime_flags_project_into_the_startup_config() {
+    let mut runtime = runtime("safe");
+    let config = &mut runtime["runtime"]["config"];
+    config["enableFileAutocomplete"] = false.into();
+    config["fileWatcherForAutocomplete"] = false.into();
+    let config = StartupConfig::from_runtime("1.0.0", &runtime).unwrap();
+    assert!(!config.enable_file_autocomplete);
+    assert!(!config.file_watcher_for_autocomplete);
 }

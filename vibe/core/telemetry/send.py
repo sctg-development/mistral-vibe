@@ -1,26 +1,37 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal
+from collections.abc import Callable, Mapping
+from enum import Enum
+import math
+from types import NoneType, UnionType
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
 from urllib.parse import urljoin
 
-import httpx
+import httpx2
 
 from vibe import __version__
 from vibe.core.config import ProviderConfig, VibeConfigSchema
 from vibe.core.config.admin_config import AdminConfigOutcome
+from vibe.core.platform_auth import (
+    PlatformCredentialFactory,
+    PlatformCredentialRequired,
+    PlatformCredentialTarget,
+)
+from vibe.core.platform_auth._mistral import (
+    MistralCredentials,
+    fetched_for_current_account,
+    is_user_principal,
+    mistral_credentials,
+    resolve_principal,
+    resolve_snapshot,
+)
 from vibe.core.telemetry.build_metadata import build_base_metadata
 from vibe.core.telemetry.types import (
     AttachmentKind,
     ExperimentAssignment,
     LaunchContext,
-    ProjectPickerTelemetryPayload,
-    RemoteProjectOutcome,
     TelemetryCallType,
-    TeleportContextSummaryStatus,
-    TeleportFailureDetails,
-    TeleportFailureStage,
 )
 from vibe.observability.logging import logger
 from vibe.utils.api_keys import resolve_api_key
@@ -43,6 +54,35 @@ type SubagentOperation = Literal[
 ]
 type SubagentOutcome = Literal["success", "failure", "timeout"]
 type SubagentProfileSource = Literal["generic", "vibe_profile"]
+
+
+type ConfigValue = bool | int | float | str | None
+
+
+def config_snapshot(config: VibeConfigSchema) -> dict[str, ConfigValue]:
+    """The live bool, number and enum settings; strings and lists can hold PII."""
+    snapshot: dict[str, ConfigValue] = {}
+    for name, field in type(config).model_fields.items():
+        if field.deprecated or not _is_safe_config_type(field.annotation):
+            continue
+        value = getattr(config, name)
+        if isinstance(value, Enum):
+            value = value.value
+        # JSON has no inf or nan: one would drop the whole event.
+        if isinstance(value, float) and not math.isfinite(value):
+            value = None
+        snapshot[name] = value
+    return snapshot
+
+
+def _is_safe_config_type(annotation: Any) -> bool:
+    if get_origin(annotation) in {Union, UnionType}:
+        return all(_is_safe_config_type(arg) for arg in get_args(annotation))
+    if annotation is NoneType:
+        return True
+    return isinstance(annotation, type) and issubclass(
+        annotation, (bool, int, float, Enum)
+    )
 
 
 def get_mistral_provider_and_api_key(
@@ -69,20 +109,49 @@ def get_mistral_provider_and_api_key(
     return provider, api_key
 
 
-def mistral_credential_cache_key(config: VibeConfigSchema) -> str | None:
-    """Stable, anonymous per-user cache key derived from the Mistral API key.
+def mistral_credential_cache_key(
+    config: VibeConfigSchema, credentials: PlatformCredentialFactory | None = None
+) -> str | None:
+    """Stable, anonymous cache key for the Mistral credential and tenant.
 
-    The single resolution for on-disk caches keyed by user (experiment eval,
-    model catalog): None means no Mistral credential, so the caller has no
-    entry to read or write.
+    The shared key for managed config, experiment eval, and model catalog:
+    the credential's principal (the hashed API key, or the user and tenant).
+    None means no credential or no known principal, so the caller has no
+    entry to read or write. Never refreshes nor reaches the network.
     """
-    from vibe.core.experiments.manager import hash_api_key
-
-    provider_and_key = get_mistral_provider_and_api_key(config)
-    if provider_and_key is None:
+    mistral = mistral_credentials(config, credentials)
+    if mistral is None:
         return None
-    _provider, api_key = provider_and_key
-    return hash_api_key(api_key)
+    return mistral.cached_principal()
+
+
+async def resolve_credential_cache_key(
+    config: VibeConfigSchema, credentials: PlatformCredentialFactory | None = None
+) -> str | None:
+    """The principal a fetch starts under, resolving the credential when it is
+    not known yet (a token refresh, a tenant discovery).
+
+    Pass it to the store as ``fetched_for``: a user token's principal, unlike
+    an API key's, does not name the material a request carried, so the store
+    keeps only a response fetched for the account still signed in. ``None``
+    when it cannot be resolved in time (fetch, but cache nothing).
+    """
+    mistral = mistral_credentials(config, credentials)
+    if mistral is None:
+        return None
+    return await resolve_principal(mistral)
+
+
+def credential_cache_key_is_current(
+    fetched_for: str,
+    config: VibeConfigSchema | None = None,
+    credentials: PlatformCredentialFactory | None = None,
+) -> bool:
+    """``fetched_for_current_account`` for a fetch that holds the config."""
+    mistral = mistral_credentials(config, credentials) if config is not None else None
+    if mistral is None:
+        return not is_user_principal(fetched_for)
+    return fetched_for_current_account(mistral.credentials, fetched_for)
 
 
 def _subagent_depth(caller_agent_path: str) -> int:
@@ -193,8 +262,10 @@ class TelemetryClient:
             Callable[[], ExperimentAttributes | None] | None
         ) = None,
         harness_backend: ExperimentSurface | None = None,
+        credentials: PlatformCredentialFactory | None = None,
     ) -> None:
         self._config_getter = config_getter
+        self._credentials = credentials
         self._session_id_getter = session_id_getter
         self._parent_session_id_getter = parent_session_id_getter
         self._launch_context = launch_context
@@ -210,12 +281,8 @@ class TelemetryClient:
         base = get_server_url_from_api_base(api_base) or _DEFAULT_TELEMETRY_BASE_URL
         return urljoin(base.rstrip("/"), _DATALAKE_EVENTS_PATH)
 
-    def _get_mistral_api_key(self) -> str | None:
-        provider_and_api_key = get_mistral_provider_and_api_key(self._config_getter())
-        if provider_and_api_key is None:
-            return None
-        _, api_key = provider_and_api_key
-        return api_key
+    def _mistral(self) -> MistralCredentials | None:
+        return mistral_credentials(self._config_getter(), self._credentials)
 
     def _is_enabled(self) -> bool:
         try:
@@ -224,14 +291,14 @@ class TelemetryClient:
             return False
 
     def is_active(self) -> bool:
-        return self._is_enabled() and self._get_mistral_api_key() is not None
+        return self._is_enabled() and self._mistral() is not None
 
     @property
     def client(self) -> VibeAsyncHTTPClient:
         if self._client is None:
             self._client = VibeAsyncHTTPClient(
-                timeout=httpx.Timeout(5.0),
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                timeout=httpx2.Timeout(5.0),
+                limits=httpx2.Limits(max_keepalive_connections=5, max_connections=10),
                 verify=build_ssl_context(),
             )
         return self._client
@@ -289,12 +356,12 @@ class TelemetryClient:
     ) -> None:
         if not self._is_enabled():
             return
-        provider_and_api_key = get_mistral_provider_and_api_key(self._config_getter())
-        if provider_and_api_key is None:
+        mistral = self._mistral()
+        if mistral is None:
             return
-        provider, mistral_api_key = provider_and_api_key
-        telemetry_url = self._get_telemetry_url(provider.api_base)
-        user_agent = get_user_agent(provider.backend)
+        credentials = mistral.credentials
+        telemetry_url = self._get_telemetry_url(mistral.provider.api_base)
+        user_agent = get_user_agent(mistral.provider.backend)
         properties = self.build_client_event_metadata() | properties
         logger.debug(
             "telemetry event=%s properties=%s correlation_id=%s",
@@ -309,15 +376,32 @@ class TelemetryClient:
 
         async def _send() -> None:
             try:
-                await self.client.post(
-                    telemetry_url,
-                    json=payload,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {mistral_api_key}",
-                        "User-Agent": user_agent,
-                    },
-                )
+                # Bound credential resolution (a token refresh) too.
+                async with asyncio.timeout(5):
+                    snapshot = await resolve_snapshot(credentials, telemetry_url)
+                    if isinstance(snapshot, PlatformCredentialRequired):
+                        return
+                    extra: dict[str, Any] = (
+                        {}
+                        if snapshot.follows_redirects
+                        else {"follow_redirects": False}
+                    )
+                    response = await self.client.post(
+                        telemetry_url,
+                        json=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            **snapshot.headers,
+                            "User-Agent": user_agent,
+                        },
+                        **extra,
+                    )
+                    if response.status_code == httpx2.codes.UNAUTHORIZED:
+                        await credentials.reject(
+                            PlatformCredentialTarget(telemetry_url),
+                            observed=snapshot.identity,
+                            reason="http_unauthorized",
+                        )
             except Exception:
                 pass  # Silently swallow all exceptions for fire-and-forget telemetry
 
@@ -365,7 +449,16 @@ class TelemetryClient:
         self.send_telemetry_event("vibe.compaction_failed", payload)
 
     def send_new_session(
-        self, has_agents_md: bool, nb_skills: int, nb_mcp_servers: int, nb_models: int
+        self,
+        has_agents_md: bool,
+        nb_skills: int,
+        nb_mcp_servers: int,
+        nb_models: int,
+        *,
+        has_outside_workdir_deny: bool,
+        nb_post_agent_scoped_hooks: int,
+        nb_post_agent_main_hooks: int,
+        nb_hooks_by_type: Mapping[str, int] | None = None,
     ) -> None:
         lc = self._launch_context
         payload = {
@@ -373,6 +466,14 @@ class TelemetryClient:
             "nb_skills": nb_skills,
             "nb_mcp_servers": nb_mcp_servers,
             "nb_models": nb_models,
+            "has_outside_workdir_deny": has_outside_workdir_deny,
+            "nb_post_agent_scoped_hooks": nb_post_agent_scoped_hooks,
+            "nb_post_agent_main_hooks": nb_post_agent_main_hooks,
+            # One count per hook type (``nb_hooks_pre_tool``...), plugins included.
+            **{
+                f"nb_hooks_{hook_type}": count
+                for hook_type, count in (nb_hooks_by_type or {}).items()
+            },
             "entrypoint": lc.agent_entrypoint if lc else "unknown",
             "host_kind": "local",
             "version": __version__,
@@ -383,11 +484,34 @@ class TelemetryClient:
                 if lc and lc.terminal_emulator is not None
                 else None
             ),
+            "config": config_snapshot(self._config_getter()),
         }
         self.send_telemetry_event("vibe.new_session", payload)
 
-    def send_session_closed(self) -> None:
-        self.send_telemetry_event("vibe.session_closed", {})
+    def send_session_closed(self, *, reason: str) -> None:
+        # ``exit``, ``clear``, ``other`` or ``client_disconnected``.
+        self.send_telemetry_event("vibe.session_closed", {"reason": reason})
+
+    def send_config_updated(
+        self, *, fields: list[str], target_layers: list[str]
+    ) -> None:
+        # Field names only: values and the client's free-text reason can hold PII.
+        payload = {"fields": fields, "target_layers": target_layers}
+        self.send_telemetry_event("vibe.config.updated", payload)
+
+    def send_turn_failed(
+        self, *, error_code: str | None, http_status: int | None, message_id: str | None
+    ) -> None:
+        payload = {
+            "error_code": error_code,
+            "http_status": http_status,
+            "message_id": message_id,
+        }
+        self.send_telemetry_event("vibe.turn.failed", payload)
+
+    def send_hook_triggered(self, *, hook_type: str, from_plugin: bool) -> None:
+        payload = {"hook_type": hook_type, "from_plugin": from_plugin}
+        self.send_telemetry_event("vibe.hook.triggered", payload)
 
     def send_admin_config_applied(
         self,
@@ -417,11 +541,13 @@ class TelemetryClient:
         nb_context_messages: int,
         nb_prompt_chars: int,
         call_type: TelemetryCallType,
+        reasoning_effort: str,
         message_id: str | None = None,
         attachment_counts: dict[AttachmentKind, int] | None = None,
     ) -> None:
         payload = {
             "model": model,
+            "reasoning_effort": reasoning_effort,
             "nb_context_chars": nb_context_chars,
             "nb_context_messages": nb_context_messages,
             "nb_prompt_chars": nb_prompt_chars,
@@ -479,56 +605,3 @@ class TelemetryClient:
             {"rating": rating, "version": __version__, "model": model},
             correlation_id=self.last_correlation_id,
         )
-
-    def send_teleport_completed(
-        self,
-        *,
-        push_required: bool,
-        nb_session_messages: int,
-        context_summary: TeleportContextSummaryStatus = "skipped",
-        context_summary_chars: int | None = None,
-        project_picker: ProjectPickerTelemetryPayload | None = None,
-    ) -> None:
-        payload: dict[str, object] = {
-            "push_required": push_required,
-            "nb_session_messages": nb_session_messages,
-            "context_summary": context_summary,
-            "context_summary_chars": context_summary_chars,
-        }
-        if project_picker is not None:
-            payload.update(project_picker)
-        self.send_telemetry_event("vibe.teleport_completed", dict(payload))
-
-    def send_teleport_failed(
-        self,
-        *,
-        stage: TeleportFailureStage,
-        error_class: str,
-        push_required: bool,
-        nb_session_messages: int,
-        context_summary: TeleportContextSummaryStatus = "skipped",
-        context_summary_chars: int | None = None,
-        error_details: TeleportFailureDetails | None = None,
-        project_picker: ProjectPickerTelemetryPayload | None = None,
-    ) -> None:
-        payload: dict[str, object] = {
-            "stage": stage,
-            "error_class": error_class,
-            "push_required": push_required,
-            "nb_session_messages": nb_session_messages,
-            "context_summary": context_summary,
-            "context_summary_chars": context_summary_chars,
-            **(error_details or {}),
-        }
-        if project_picker is not None:
-            payload.update(project_picker)
-        self.send_telemetry_event("vibe.teleport_failed", dict(payload))
-
-    def send_remote_project_configured(
-        self,
-        *,
-        outcome: RemoteProjectOutcome,
-        project_picker: ProjectPickerTelemetryPayload,
-    ) -> None:
-        payload: dict[str, object] = {"outcome": outcome, **project_picker}
-        self.send_telemetry_event("vibe.remote_project_configured", dict(payload))

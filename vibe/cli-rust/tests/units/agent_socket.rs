@@ -65,13 +65,12 @@ fn options_that_pick_a_host_directory_or_session_are_named() {
         "--add-dir",
         ".",
         "-c",
-        "--teleport",
     ]);
     assert_eq!(
         usage_error(&run, false).as_deref(),
         Some(
             "--agent-socket cannot be combined with --workdir, --worktree, --add-dir, \
-             --continue, --teleport"
+             --continue"
         )
     );
 }
@@ -208,26 +207,17 @@ fn a_session_elsewhere_than_this_directory_is_sandboxed() {
 #[test]
 fn a_resumed_run_counts_its_usage_from_its_start() {
     use vibe_rs::headless::UsageBaseline;
-    let baseline = UsageBaseline::from_stats(&json!({
-        "sessionPromptTokens": 6,
-        "sessionCompletionTokens": 8,
-        "sessionCachedTokens": 0,
-        "modelCalls": 0,
-    }));
-    let stats = json!({
-        "sessionPromptTokens": 9,
-        "sessionCompletionTokens": 12,
-        "sessionCachedTokens": 0,
-        "modelCalls": 1,
-    });
+    use vibe_rs::server::SessionStats;
+    let stats = |prompt, completion, model_calls| SessionStats {
+        session_prompt_tokens: prompt,
+        session_completion_tokens: completion,
+        model_calls: Some(model_calls),
+        ..Default::default()
+    };
+    let baseline = UsageBaseline(stats(6, 8, 0));
+    assert_eq!(baseline.run_stats(&stats(9, 12, 1)), stats(3, 4, 1));
     assert_eq!(
-        baseline.run_stats(&stats),
-        json!({
-            "sessionPromptTokens": 3,
-            "sessionCompletionTokens": 4,
-            "sessionCachedTokens": 0,
-            "modelCalls": 1,
-        })
+        UsageBaseline::default().run_stats(&stats(9, 12, 1)),
+        stats(9, 12, 1)
     );
-    assert_eq!(UsageBaseline::default().run_stats(&stats), stats);
 }

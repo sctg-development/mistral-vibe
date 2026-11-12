@@ -10,16 +10,16 @@ chunks, and translate the final assistant message back into a
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Callable, Mapping
+from contextlib import aclosing
 from html import escape
 import json
 import logging
 from typing import Any, cast
 
-import httpx
+import httpx2
 
 from mistralai_vibe_local_harness.protocol import (
     RustAssistantMessage,
-    RustCompletionFinishReason,
     RustCompletionResult,
     RustCompletionResultPart,
     RustCompletionResultToolCallPart,
@@ -46,6 +46,7 @@ from mistralai_vibe_local_harness.vibe._http_transport import (
     env_proxy_transport,
     keepalive_socket_options,
 )
+from mistralai_vibe_local_harness.vibe._route_profile import generic_wire
 from mistralai_vibe_local_harness.vibe._runtime_config import (
     LocalModelRoute,
     LocalRuntimeAdapterConfig,
@@ -58,13 +59,22 @@ from mistralai_vibe_local_harness.vibe.adapters._correlation import correlation_
 from mistralai_vibe_local_harness.vibe.adapters._provider_failure import (
     IncompleteProviderStream,
     ProviderRefusal,
+    is_read_timeout,
     until_connection_lost,
 )
+from mistralai_vibe_local_harness.vibe.adapters._reply_usage import (
+    has_reply_usage,
+    merge_reported_usage,
+    reply_token_usage,
+)
+from mistralai_vibe_local_harness.vibe.adapters._request_log import (
+    log_completion_request,
+)
 from mistralai_vibe_local_harness.vibe.adapters._retry import (
+    ProviderAttempt,
     RetryNotices,
     call_with_retries,
 )
-from mistralai_vibe_local_harness.vibe.adapters._stream_idle import StreamIdleGuard
 from mistralai_vibe_local_harness.vibe.adapters._tool_call_finish import (
     CompletionSource,
     MalformedToolCalls,
@@ -82,7 +92,6 @@ from mistralai_vibe_local_harness.vibe.adapters.generic._model import (
     InlineImageSource,
     LLMChunk,
     LLMMessage,
-    LLMUsage,
     Role,
     ToolCall,
 )
@@ -92,6 +101,11 @@ from mistralai_vibe_local_harness.vibe.adapters.generic._openai_chat import (
 )
 from mistralai_vibe_local_harness.vibe.adapters.generic._provider import ProviderView
 from mistralai_vibe_local_harness.vibe.adapters.generic._sse import iter_sse_lines
+from mistralai_vibe_local_harness.vibe.completion_profile import (
+    StreamGuard,
+    WireFormat,
+    finish_reason as map_finish_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,14 +198,42 @@ async def execute_generic_completion(
     route = route or config.active_model
     provider = _provider_view(config)
     adapter = _get_adapter(provider.api_style)
+    wire = generic_wire(provider.api_style)
     notices = RetryNotices(on_retry)
+    current_attempt: ProviderAttempt | None = None
+
+    async def observe_response(response: httpx2.Response) -> None:
+        if response.is_success and current_attempt is not None:
+            current_attempt.accept()
+        await notices.clear_on_success(response)
+
+    async def complete_attempt(
+        provider_attempt: ProviderAttempt,
+    ) -> RustCompletionResult:
+        nonlocal current_attempt
+        current_attempt = provider_attempt
+        return await _complete_once(
+            client=client,
+            url=url,
+            body=request.body,
+            headers=headers,
+            provider=provider,
+            model=route.model,
+            guard=config.stream_guard(),
+            on_delta=on_delta,
+            malformed=malformed,
+            provider_attempt=provider_attempt,
+        )
+
     request = adapter.prepare_request(
         model_name=route.model,
         messages=[_to_llm_message(message) for message in messages],
         temperature=route.temperature,
         top_p=route.top_p,
         tools=[_to_available_tool(tool) for tool in tools],
-        max_tokens=config.output_token_cap(route),
+        max_tokens=config.output_token_cap(
+            route, required=wire is WireFormat.ANTHROPIC
+        ),
         tool_choice=None,
         enable_streaming=True,
         provider=provider,
@@ -201,49 +243,51 @@ async def execute_generic_completion(
         # ``vertex-anthropic`` adapter ignores it and obtains its own Google ADC
         # token.
         api_key=credential.token,
-        thinking=route.thinking,
+        thinking=route.reasoning_setting(wire),
+        reasoning_support=route.reasoning,
     )
 
     headers = dict(request.headers)
     headers.update(config.request_headers())
+    headers.update({
+        name: value
+        for name, value in credential.headers.items()
+        if name.lower() not in {"authorization", "x-api-key", "anthropic-version"}
+    })
 
     base = request.base_url or provider.api_base.rstrip("/")
     url = f"{base}{request.endpoint}"
+    log_completion_request(
+        provider.name, route.model, wire, route.reasoning_setting(wire)
+    )
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(config.timeout_s),
+    async with httpx2.AsyncClient(
+        timeout=httpx2.Timeout(
+            config.timeout_s, read=config.stream_guard().read_timeout_seconds
+        ),
         transport=env_proxy_transport(
             verify=build_ssl_context(
                 use_system_trust_store=config.enable_system_trust_store
             ),
-            limits=httpx.Limits(
+            limits=httpx2.Limits(
                 max_keepalive_connections=5,
                 max_connections=10,
                 keepalive_expiry=MODEL_HTTP_KEEPALIVE_EXPIRY_SECONDS,
             ),
             socket_options=keepalive_socket_options(),
         ),
-        follow_redirects=True,
+        follow_redirects=credential.follow_redirects,
         # Mistral-hosted models reached through the generic (OpenAI-compatible)
         # path still return mistral-correlation-id; capture it like the native
         # adapter. Non-Mistral providers omit the header (sink gets None).
-        event_hooks={"response": [correlation_hook(config), notices.clear_on_success]},
+        event_hooks={"response": [correlation_hook(config), observe_response]},
     ) as client:
         result = await call_with_retries(
-            lambda: _complete_once(
-                client=client,
-                url=url,
-                body=request.body,
-                headers=headers,
-                provider=provider,
-                model=route.model,
-                idle_timeout_s=config.stream_idle_timeout_s,
-                read_timeout_s=config.timeout_s,
-                on_delta=on_delta,
-                malformed=malformed,
-            ),
+            complete_attempt,
             max_elapsed_time_s=config.retry_max_elapsed_time_s,
             notices=notices,
+            completion_budget=config.completion_budget,
+            pricing=route.pricing,
         )
 
     _warn_on_workless_completion(
@@ -266,7 +310,8 @@ def _warn_on_workless_completion(
     that outcome from a deliberate final answer. Report only that case, carrying
     the request knobs, because the result alone cannot explain it.
     """
-    if not tools_offered or route.thinking == "off":
+    thinking = route.reasoning_setting(generic_wire(provider.api_style))
+    if not tools_offered or thinking in {None, "off"}:
         return
     kinds = [part.type for part in result.parts]
     if "tool_call" in kinds or "reasoning" in kinds:
@@ -276,7 +321,7 @@ def _warn_on_workless_completion(
         provider.name,
         provider.api_style,
         route.model,
-        route.thinking,
+        thinking,
         tools_offered,
         result.finish_reason,
         "+".join(kinds),
@@ -286,46 +331,50 @@ def _warn_on_workless_completion(
 
 async def _complete_once(
     *,
-    client: httpx.AsyncClient,
+    client: httpx2.AsyncClient,
     url: str,
     body: bytes,
     headers: dict[str, str],
     provider: ProviderView,
     model: str,
-    idle_timeout_s: float | None,
-    read_timeout_s: float,
+    guard: StreamGuard,
     on_delta: ProviderDeltaObserver | None = None,
     malformed: MalformedToolCalls | None = None,
+    provider_attempt: ProviderAttempt,
 ) -> RustCompletionResult:
     # Adapters buffer parse state, so a retried attempt gets a fresh one.
     adapter = _get_adapter(provider.api_style)
     accumulated: LLMChunk | None = None
-    usage = LLMUsage()
-    has_usage = False
-    idle_guard = StreamIdleGuard(idle_timeout_s, read_timeout_s=read_timeout_s)
-    raw_chunks = _stream_json_chunks(client, url, body, headers, idle_guard)
+    raw_usage: dict[str, object] | None = None
+    wire = generic_wire(provider.api_style)
+    raw_chunks = _stream_json_chunks(client, url, body, headers, guard)
     async for parsed in until_connection_lost(
         adapter.parse_stream(raw_chunks, provider),
         # Read when the stream fails, so it must see the latest chunk.
-        complete=lambda: accumulated is not None and accumulated.stop is not None,  # noqa: B023
+        complete=lambda: (
+            accumulated is not None  # noqa: B023
+            and accumulated.stop is not None  # noqa: B023
+            and has_reply_usage(wire, raw_usage)  # noqa: B023
+        ),
     ):
         chunk = parsed.chunk
         if _carries_model_output(chunk):
-            idle_guard.output_started()
-        # Adapters synthesise a zero ``LLMUsage`` for chunks the provider sent no
-        # usage on, so summing ``chunk.usage`` cannot tell "the provider reported
-        # nothing" from "the provider reported zero". Track the payloads that
-        # carried usage of their own, and leave usage unset when none did, rather
-        # than handing the Harness an authoritative-looking zero.
-        if chunk.usage is not None and _reports_usage(parsed.data):
-            usage += chunk.usage
-            has_usage = True
+            guard.mark_output()
+        if (reported := _reported_usage(parsed.data)) is not None:
+            raw_usage = merge_reported_usage(raw_usage, reported)
+            if has_reply_usage(wire, raw_usage):
+                provider_attempt.report_usage(reply_token_usage(wire, raw_usage))
         accumulated = chunk if accumulated is None else accumulated + chunk
         if on_delta is not None:
             text = chunk.message.content or ""
             reasoning = chunk.message.reasoning_content or ""
-            if text or reasoning:
-                await on_delta(ProviderStreamDelta(text=text, reasoning=reasoning))
+            tool_call = bool(chunk.message.tool_calls)
+            if text or reasoning or tool_call:
+                await on_delta(
+                    ProviderStreamDelta(
+                        text=text, reasoning=reasoning, tool_call=tool_call
+                    )
+                )
 
     if accumulated is None:
         raise IncompleteProviderStream(
@@ -347,8 +396,14 @@ async def _complete_once(
         raise ProviderRefusal(
             category=accumulated.stop.category, explanation=accumulated.stop.explanation
         )
+    usage = reply_token_usage(wire, raw_usage)
+    provider_attempt.report_usage(usage)
     return _to_completion_result(
-        accumulated.model_copy(update={"usage": usage if has_usage else None}),
+        accumulated.model_copy(
+            update={"message": adapter.finish_message(accumulated.message)}
+        ),
+        wire=wire,
+        usage=usage,
         source=CompletionSource(provider=provider.name, model=model),
         record=malformed,
     )
@@ -363,37 +418,57 @@ def _carries_model_output(chunk: LLMChunk) -> bool:
     return bool(message.content or message.reasoning_content or message.tool_calls)
 
 
-def _reports_usage(response_data: dict[str, Any]) -> bool:
-    """Whether the raw payload carries usage of its own, under any adapter shape."""
-    if isinstance(response_data.get("usage"), dict):
-        return True
+def _reported_usage(response_data: dict[str, Any]) -> dict[str, Any] | None:
+    """The usage a raw payload reports, under any adapter's shape, or ``None``.
 
-    message = response_data.get("message")
-    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
-        return True
-
-    response = response_data.get("response")
-    return isinstance(response, dict) and isinstance(response.get("usage"), dict)
+    Chat Completions and Anthropic deltas carry ``usage``; Anthropic's start
+    event carries ``message.usage``; Responses' final event ``response.usage``.
+    """
+    if isinstance(usage := response_data.get("usage"), dict):
+        return cast(dict[str, Any], usage)
+    for key in ("message", "response"):
+        holder = response_data.get(key)
+        if isinstance(holder, dict) and isinstance(
+            usage := cast(dict[str, Any], holder).get("usage"), dict
+        ):
+            return cast(dict[str, Any], usage)
+    return None
 
 
 async def _stream_json_chunks(
-    client: httpx.AsyncClient,
+    client: httpx2.AsyncClient,
     url: str,
     body: bytes,
     headers: dict[str, str],
-    idle_guard: StreamIdleGuard,
+    guard: StreamGuard,
 ) -> AsyncGenerator[dict[str, Any]]:
-    async with client.stream(
-        method="POST", url=url, content=body, headers=headers
-    ) as response:
-        if not response.is_success:
-            await response.aread()
-        response.raise_for_status()
-        # Every line resets the idle deadline once armed, so heartbeats keep a
-        # slow but live stream going; only response data resets the read
-        # timeout.
-        async for line in idle_guard.watch(
-            iter_sse_lines(response), is_heartbeat=_is_sse_heartbeat
+    opened = False
+
+    # The guard watches the request from the start, so silence before the
+    # response headers ends at the first-output wait, like silence after them. A
+    # read timeout before the headers stays an ordinary failure: only one after
+    # them is a stall.
+    async def open_lines() -> AsyncGenerator[str]:
+        nonlocal opened
+        async with client.stream(
+            method="POST", url=url, content=body, headers=headers
+        ) as response:
+            if not response.is_success:
+                await response.aread()
+            response.raise_for_status()
+            opened = True
+            async for line in iter_sse_lines(response):
+                yield line
+
+    async with aclosing(open_lines()) as lines:
+        # Lines are not model output: the parsed chunks above mark it. Once it
+        # starts, every line resets the idle limit, so heartbeats keep a slow but
+        # live stream going; only response data resets the read timeout.
+        async for line in guard.watch(
+            lines,
+            starts_output=lambda _line: False,
+            is_heartbeat=_is_sse_heartbeat,
+            is_read_timeout=lambda error: opened and is_read_timeout(error),
         ):
             if _is_sse_heartbeat(line):
                 continue
@@ -483,6 +558,7 @@ def _to_llm_message(message: RustMessage) -> LLMMessage:
         return LLMMessage(
             role=Role.tool,
             content=_blocks_text(message.content),
+            images=_blocks_images(message.content) or None,
             name=message.name,
             tool_call_id=message.tool_call_id,
         )
@@ -541,6 +617,9 @@ def _blocks_text(content: Any) -> str:
             block.resource, RustTextResourceContents
         ):
             parts.append(_resource_text(block.resource))
+        elif isinstance(block, RustEmbeddedResourceContentBlock):
+            # Embedded file data has no text form; the model gets its link.
+            parts.append(f"[resource: {block.resource.uri}]")
         elif isinstance(block, RustResourceLinkContentBlock):
             parts.append(f"[resource: {block.uri}]")
     return "\n\n".join(parts)
@@ -569,6 +648,8 @@ def _resource_text(resource: RustTextResourceContents) -> str:
 def _to_completion_result(
     chunk: LLMChunk,
     *,
+    wire: WireFormat,
+    usage: RustTokenUsage,
     source: CompletionSource,
     record: MalformedToolCalls | None = None,
 ) -> RustCompletionResult:
@@ -585,12 +666,13 @@ def _to_completion_result(
     if not parts:
         parts.append(RustTextContentBlock(text=" "))
 
-    finish_reason = _finish_reason(chunk)
-    if finish_reason == "other" and chunk.stop is not None:
+    raw_reason = chunk.stop.reason if chunk.stop else None
+    finish_reason = None if raw_reason is None else map_finish_reason(wire, raw_reason)
+    if finish_reason == "other":
         # `other` alone cannot say what ended the generation; the provider's value can.
         logger.warning(
             "Provider stop reason %r has no completion finish reason; reporting 'other'",
-            chunk.stop.reason,
+            raw_reason,
         )
     finish_reason = align_finish_reason(
         finish_reason,
@@ -599,9 +681,7 @@ def _to_completion_result(
         source=source,
         record=record,
     )
-    return RustCompletionResult(
-        parts=parts, finish_reason=finish_reason, usage=_token_usage(chunk)
-    )
+    return RustCompletionResult(parts=parts, finish_reason=finish_reason, usage=usage)
 
 
 def _reasoning_part(message: LLMMessage) -> RustReasoningPart | None:
@@ -638,33 +718,6 @@ def _tool_call_parts(
             )
         )
     return parts
-
-
-def _finish_reason(chunk: LLMChunk) -> RustCompletionFinishReason | None:
-    """The provider's stop reason in Core's terms, or ``None`` when it sent none."""
-    raw = chunk.stop.reason if chunk.stop else None
-    if raw in {"tool_calls", "tool_use", "tool_call"}:
-        return "tool_call"
-    if raw in {"stop", "end_turn", "completed", "stop_sequence"}:
-        return "stop"
-    if raw in {"length", "max_tokens", "incomplete"}:
-        return "length"
-    if raw == "content_filter":
-        return "content_filter"
-    return None if raw is None else "other"
-
-
-def _token_usage(chunk: LLMChunk) -> RustTokenUsage | None:
-    if chunk.usage is None:
-        return None
-    input_tokens = chunk.usage.prompt_tokens
-    output_tokens = chunk.usage.completion_tokens
-    return RustTokenUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        total_tokens=input_tokens + output_tokens,
-        cached_input_tokens=chunk.usage.cached_tokens,
-    )
 
 
 __all__ = ["execute_generic_completion"]

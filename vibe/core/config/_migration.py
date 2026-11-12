@@ -4,6 +4,8 @@ from collections.abc import Iterable, Set as AbstractSet
 from typing import Any
 
 from vibe.core.agents.models import BuiltinAgentName
+from vibe.core.config._defaults import SHELL_TOOLS
+from vibe.core.config._retry import retry_on_conflict
 from vibe.core.config.layer import (
     ConfigLayer,
     EmptyLayerError,
@@ -12,8 +14,9 @@ from vibe.core.config.layer import (
     UntrustedLayerError,
 )
 from vibe.core.config.layers._base import BaseTomlConfigLayer
-from vibe.core.config.layers.user import SuppliedUserConfigLayer
+from vibe.core.config.layers.user import SuppliedUserConfigLayer, UserConfigLayer
 from vibe.core.config.patch import ConfigPatch, ReplaceOperationPatch
+from vibe.core.config.types import ConcurrencyConflictError
 from vibe.core.utils import name_matches
 
 # One-shot id: syncs an existing bash allowlist up to the current default
@@ -26,10 +29,20 @@ RENAMED_TOOLS: dict[str, str] = {"read": "read_file", "search_replace": "edit"}
 
 RENAMED_AGENTS: dict[str, str] = {"default": "ask"}
 
+# The value older versions wrote for an unset ``auto_compact_threshold``.
+UNSET_AUTO_COMPACT_THRESHOLD = -1
+
 # Options on the old tool that have no equivalent on the new one; dropped on migrate.
 DROPPED_TOOL_OPTIONS: dict[str, tuple[str, ...]] = {
     "edit": ("max_content_size", "create_backup")
 }
+
+# Until July 2026 Vibe's first run wrote every tool default into config.toml,
+# which left `[tools.bash] default_timeout = 300` without a maximum. A shell
+# timeout set without its maximum is now a config error, so that seeded value
+# is dropped and the shell keeps Vibe's own default and maximum. Only the user
+# config was seeded, and a 300 that another file pairs with a maximum is kept.
+SEEDED_SHELL_DEFAULT_TIMEOUT = 300
 
 
 async def migrate_config_layers(layers: Iterable[ConfigLayer[RawConfig]]) -> None:
@@ -54,33 +67,75 @@ async def migrate_config_layers(layers: Iterable[ConfigLayer[RawConfig]]) -> Non
         for key, model in _model_entries(data)
         if key and model.get("name") and model.get("provider")
     }
+    # Only the user file was seeded, and a 300 that any file pairs with a
+    # maximum is a real setting: the merge sets both.
+    shells_with_max = {
+        name
+        for _, data in loaded
+        for name in SHELL_TOOLS
+        if _sets_shell_maximum(data, name)
+    }
 
-    for layer, data in loaded:
-        if not migrate_config(data, complete_aliases=complete_aliases):
-            continue
-
-        fingerprint = layer.fingerprint
-        if fingerprint is None:
-            raise LayerNotLoadedError(layer.name)
-
-        await layer.apply(
-            ConfigPatch(
-                ReplaceOperationPatch(path="", value=data),
-                fingerprint=fingerprint,
-                reason="config migration",
-            )
+    for layer, _ in loaded:
+        seeded_shells = (
+            frozenset[str](SHELL_TOOLS) - shells_with_max
+            if isinstance(layer, (UserConfigLayer, SuppliedUserConfigLayer))
+            else frozenset()
+        )
+        await _migrate_layer(
+            layer, complete_aliases=complete_aliases, seeded_shells=seeded_shells
         )
 
 
+async def _migrate_layer(
+    layer: BaseTomlConfigLayer | SuppliedUserConfigLayer,
+    *,
+    complete_aliases: AbstractSet[str],
+    seeded_shells: AbstractSet[str],
+) -> None:
+    async def write() -> list[BaseException]:
+        try:
+            data = (await layer.load()).model_dump()
+        except (EmptyLayerError, UntrustedLayerError):
+            return []
+        if not migrate_config(
+            data, complete_aliases=complete_aliases, seeded_shells=seeded_shells
+        ):
+            return []
+        fingerprint = layer.fingerprint
+        if fingerprint is None:
+            raise LayerNotLoadedError(layer.name)
+        try:
+            await layer.apply(
+                ConfigPatch(
+                    ReplaceOperationPatch(path="", value=data),
+                    fingerprint=fingerprint,
+                    reason="config migration",
+                )
+            )
+        except ConcurrencyConflictError as exc:
+            # Another session saved since the load: the next attempt migrates what it wrote.
+            await layer.refresh()
+            return [exc]
+        return []
+
+    await retry_on_conflict(write, description=f"migrating {layer.name}")
+
+
 def migrate_config(
-    data: dict[str, Any], *, complete_aliases: AbstractSet[str] = frozenset()
+    data: dict[str, Any],
+    *,
+    complete_aliases: AbstractSet[str] = frozenset(),
+    seeded_shells: AbstractSet[str] = frozenset(),
 ) -> bool:
     """Apply every config migration in order, mutating ``data`` in place.
 
     Returns whether anything changed, so the caller can decide to persist.
     ``complete_aliases`` lists model aliases that some config file defines
     completely; completion migrations must not stamp those (see
-    ``_migrate_removed_local``).
+    ``_migrate_removed_local``). ``seeded_shells`` lists the shell tools
+    whose ``default_timeout = 300`` alone is the first run's seeded value
+    (see ``_migrate_seeded_shell_default_timeout``).
     """
     changed = False
     changed |= _migrate_bash_allowlist(data)
@@ -90,6 +145,10 @@ def migrate_config(
     changed |= _migrate_removed_local(data, complete_aliases=complete_aliases)
     changed |= _migrate_renamed_tools(data)
     changed |= _migrate_renamed_agents(data)
+    changed |= _migrate_seeded_shell_default_timeout(data, seeded_shells)
+    changed |= _migrate_unset_auto_compact_threshold(data)
+    changed |= _migrate_removed_tool_paths(data)
+    changed |= _migrate_renamed_worktree_copy_on_write(data)
     return changed
 
 
@@ -278,6 +337,49 @@ def _rekey_model_entry(
     models[new_alias] = models.pop(old_alias)
 
 
+def _migrate_unset_auto_compact_threshold(data: dict[str, Any]) -> bool:
+    """Drop the old ``auto_compact_threshold = -1`` "unset" marker.
+
+    Older versions wrote ``-1`` to mean "no threshold"; removing the key keeps
+    that meaning: each model's default threshold. ``0`` meant "compaction off",
+    which no longer exists, so it stays in the file and fails validation with
+    an error that names the setting.
+    """
+    changed = _drop_unset_threshold(data)
+    for _, model in _model_entries(data):
+        changed |= _drop_unset_threshold(model)
+    return changed
+
+
+def _drop_unset_threshold(entry: dict[str, Any]) -> bool:
+    value = entry.get("auto_compact_threshold")
+    if isinstance(value, bool) or value != UNSET_AUTO_COMPACT_THRESHOLD:
+        return False
+    del entry["auto_compact_threshold"]
+    return True
+
+
+def _migrate_removed_tool_paths(data: dict[str, Any]) -> bool:
+    """Drop ``tool_paths``, which only listed custom Python tools.
+
+    Vibe no longer loads custom Python tools. The folders it listed stay on
+    disk, so their tools can still be migrated to skills.
+    """
+    return data.pop("tool_paths", None) is not None
+
+
+def _migrate_renamed_worktree_copy_on_write(data: dict[str, Any]) -> bool:
+    """Rename ``experimental_worktree_copy_on_write`` and keep its value.
+
+    The setting is now on by default, so an old ``false`` is kept as an opt-out.
+    """
+    if "experimental_worktree_copy_on_write" not in data:
+        return False
+    value = data.pop("experimental_worktree_copy_on_write")
+    data.setdefault("worktree_copy_on_write", value)
+    return True
+
+
 def _migrate_renamed_tools(data: dict[str, Any]) -> bool:
     """Move config from old tool names to new ones, and rename them in lists."""
     changed = False
@@ -347,3 +449,31 @@ def _agent_filters_exclude(data: dict[str, Any], agent: str) -> bool:
     if isinstance(disabled, list):
         return name_matches(agent, disabled)
     return False
+
+
+def _sets_shell_maximum(data: dict[str, Any], name: str) -> bool:
+    """Whether this file sets the shell tool's ``max_timeout_seconds``."""
+    tools = data.get("tools")
+    shell = tools.get(name) if isinstance(tools, dict) else None
+    return isinstance(shell, dict) and shell.get("max_timeout_seconds") is not None
+
+
+def _migrate_seeded_shell_default_timeout(
+    data: dict[str, Any], seeded_shells: AbstractSet[str]
+) -> bool:
+    """Drop the seeded ``default_timeout = 300`` of each shell in ``seeded_shells``."""
+    tools = data.get("tools")
+    if not isinstance(tools, dict):
+        return False
+
+    changed = False
+    for name in seeded_shells:
+        shell = tools.get(name)
+        if (
+            isinstance(shell, dict)
+            and shell.get("default_timeout") == SEEDED_SHELL_DEFAULT_TIMEOUT
+            and shell.get("max_timeout_seconds") is None
+        ):
+            del shell["default_timeout"]
+            changed = True
+    return changed

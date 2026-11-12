@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from enum import StrEnum
+import functools
 import json
 import os
 from pathlib import Path
 import tomllib
+from types import MappingProxyType
+import typing
 from typing import Annotated, Any, ClassVar, Self
 
 from dotenv import dotenv_values
@@ -15,42 +18,46 @@ from pydantic import (
     Field,
     PrivateAttr,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
-from vibe.config_values import ThinkingLevel
 from vibe.core.agents.models import REMOVED_BUILTIN_AGENTS, BuiltinAgentName
+from vibe.core.config._catalog_filter import with_catalog_filter
 from vibe.core.config._defaults import (
-    AUTO_COMPACT_WINDOW_RATIO,
-    DEFAULT_API_CONNECT_TIMEOUT,
-    DEFAULT_API_POOL_TIMEOUT,
     DEFAULT_API_RETRY_MAX_ELAPSED_TIME,
     DEFAULT_API_STREAM_IDLE_TIMEOUT,
     DEFAULT_API_TIMEOUT,
-    DEFAULT_API_WRITE_TIMEOUT,
-    DEFAULT_AUTO_COMPACT_THRESHOLD,
-    DEFAULT_COMPACTION_MAX_OUTPUT_TOKENS,
     DEFAULT_COMPACTION_REASONING_LIMIT_TOKENS,
     DEFAULT_CONSOLE_BASE_URL,
+    DEFAULT_MISTRAL_API_BASE,
     DEFAULT_MISTRAL_API_ENV_KEY,
     DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
     DEFAULT_MISTRAL_BROWSER_AUTH_BASE_URL,
-    DEFAULT_MISTRAL_SERVER_URL,
     DEFAULT_OUTPUT_LIMIT_RETRIES,
-    DEFAULT_OUTPUT_TOKEN_RESERVE,
     DEFAULT_THEME,
     DEFAULT_VIBE_BASE_URL,
-    UNSET_AUTO_COMPACT_THRESHOLD,
+    SHELL_TOOLS,
 )
 
 # DEFAULT_LOG_LEVEL is not imported here to avoid a circular dependency
 # (vibe_schema.py imports from vibe.observability.logging). The constant
 # lives in vibe.config_values.
-from vibe.core.config._model_aliases import build_alias_index, warn_ignored_alias
+from vibe.core.config._model_aliases import (
+    CATALOG_LAYER,
+    build_alias_index,
+    catalog_alias_index,
+    defines_model,
+    models_on_catalog_ids,
+    settings_keys,
+    warn_ignored_alias,
+)
 from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.config.layers.admin import AdminConfigLayer
+from vibe.core.config.layers.default import DefaultConfigLayer
 from vibe.core.config.models import (
     ACTIVE_MODEL_SELECTOR,
+    THINKING_LEVELS,
     ConnectorConfig,
     ExperimentsConfig,
     MCPServer,
@@ -67,7 +74,14 @@ from vibe.core.config.models import (
     UtilityFeature,
     UtilityModelsConfig,
     normalize_model_configs,
+    refuse_zero_auto_compact_threshold,
     serialize_model_configs,
+)
+from vibe.core.config.patch import (
+    PatchOp,
+    RemoveOperationPatch,
+    escape_json_pointer_token,
+    unescape_json_pointer_token,
 )
 from vibe.core.config.schema import (
     ConfigSchema,
@@ -77,6 +91,7 @@ from vibe.core.config.schema import (
     WithShallowMerge,
     WithUnionMerge,
 )
+from vibe.core.config.shell_timeouts import check_shell_timeout_pair
 from vibe.core.paths import GLOBAL_ENV_FILE
 from vibe.core.prompts import (
     SystemPrompt,
@@ -87,6 +102,7 @@ from vibe.core.prompts import (
 from vibe.core.types import Backend
 from vibe.core.utils.matching import name_matches
 from vibe.observability.logging import logger
+from vibe.permissions import OutsideWorkdirPolicy
 from vibe.utils.api_keys import resolve_api_key
 from vibe.utils.keyring import keyring_read_failure
 
@@ -103,6 +119,15 @@ def _strip_session_pattern_wildcard(pattern: str) -> str:
     if pattern.endswith(" *"):
         return pattern[:-2]
     return pattern
+
+
+def stored_tool_allowlist_patterns(
+    tool_name: str, patterns: Sequence[str]
+) -> list[str]:
+    """The ``patterns``, deduplicated, in the form the tool stores them."""
+    if tool_name in _SESSION_PATTERN_WILDCARD_TOOLS:
+        patterns = [_strip_session_pattern_wildcard(p) for p in patterns]
+    return list(dict.fromkeys(patterns))
 
 
 class EnvValueOrigin(StrEnum):
@@ -175,7 +200,7 @@ def load_dotenv_values(
 DEFAULT_PROVIDERS = [
     ProviderConfig(
         name="mistral",
-        api_base=f"{DEFAULT_MISTRAL_SERVER_URL}/v1",
+        api_base=DEFAULT_MISTRAL_API_BASE,
         api_key_env_var=DEFAULT_MISTRAL_API_ENV_KEY,
         browser_auth_base_url=DEFAULT_MISTRAL_BROWSER_AUTH_BASE_URL,
         browser_auth_api_base_url=DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
@@ -277,22 +302,12 @@ def _non_empty(items: list[Any]) -> list[Any]:
     return items
 
 
-def _defines_model(payload: object) -> bool:
-    """Whether a ``models`` entry is a whole model, not a setting on another one.
-
-    Without ``name`` and ``provider`` the entry cannot validate on its own: it
-    adjusts a model some layer defines, like ``[models.<id>]`` or a field-only
-    write.
-    """
-    return not isinstance(payload, Mapping) or {"name", "provider"} <= payload.keys()
-
-
 def _without_orphan_model_overrides(
     data: dict[str, Any],
 ) -> tuple[dict[str, Any], list[str]]:
     """Drop model overrides that no layer completes, and name them.
 
-    A merged entry that is still not a whole model (``_defines_model``) only
+    A merged entry that is still not a whole model (``defines_model``) only
     adjusts a model nothing defines (a retired catalog model, an ended
     experiment, a typo); it cannot validate, so it is left out for the rest of
     the config to load, and applies again if the model returns.
@@ -300,18 +315,56 @@ def _without_orphan_model_overrides(
     models = data.get("models")
     if not isinstance(models, Mapping):
         return data, []
-    orphans = [
-        alias for alias, payload in models.items() if not _defines_model(payload)
-    ]
+    orphans = [alias for alias, payload in models.items() if not defines_model(payload)]
     if not orphans:
         return data, []
     kept = {alias: payload for alias, payload in models.items() if alias not in orphans}
     return {**data, "models": kept}, orphans
 
 
-def _suppress_unset_default(schema: dict[str, Any]) -> None:
-    """Keep the unset sentinel out of the published config schema."""
-    schema.pop("default", None)
+def _without_blank_thinking_levels(
+    data: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Drop thinking values that are not words, and say which.
+
+    Any word is a level, but a blank or a number is none: one such typo must
+    not stop the config from loading, or the session could not open, and the
+    pickers that would fix it with it. The model then runs at its default level
+    until the user picks one.
+    """
+    models = data.get("models")
+    if not isinstance(models, Mapping):
+        return data, []
+    warnings: list[str] = []
+    kept: dict[str, Any] = {}
+    for alias, payload in models.items():
+        if not isinstance(payload, Mapping):
+            kept[alias] = payload
+            continue
+        payload = dict(payload)
+        if "thinking" in payload and not _is_word(thinking := payload["thinking"]):
+            del payload["thinking"]
+            warnings.append(
+                f"Model '{alias}': thinking {thinking!r} is not a level; using the "
+                "model's default. Pick another thinking level."
+            )
+        levels = payload.get("thinking_levels")
+        if isinstance(levels, list) and not all(map(_is_word, levels)):
+            words = [level for level in levels if _is_word(level)]
+            if words:
+                payload["thinking_levels"] = words
+            else:
+                del payload["thinking_levels"]
+            ignored = ", ".join(repr(level) for level in levels if not _is_word(level))
+            warnings.append(f"Model '{alias}': thinking_levels {ignored} ignored.")
+        kept[alias] = payload
+    if not warnings:
+        return data, []
+    return {**data, "models": kept}, warnings
+
+
+def _is_word(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _expand_paths(v: Any) -> list[Path]:
@@ -326,23 +379,20 @@ def _normalize_tool_configs(v: Any) -> dict[str, dict[str, Any]]:
     return {name: cfg if isinstance(cfg, dict) else {} for name, cfg in v.items()}
 
 
-def _reject_shell_timeouts_above_their_maximum(
+def _reject_invalid_shell_timeouts(
     tools: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """A shell tool's `default_timeout` set above its `max_timeout_seconds` is a
-    configuration error, not a value to lower quietly.
+    """A shell tool's `default_timeout` and `max_timeout_seconds` are finite
+    numbers of seconds above 0, and the default is not above the maximum. A
+    default set alone runs under Vibe's own maximum when within it; any other
+    partial pair is a configuration error, and a default above the maximum is
+    not lowered quietly.
+
+    Checked here so a config fails at load; the unified harness's own rule is
+    `bash_timeout` in the local harness's `vibe/_shell_tools.py`.
     """
-    for name, settings in tools.items():
-        default = settings.get("default_timeout")
-        maximum = settings.get("max_timeout_seconds")
-        if not isinstance(default, int | float) or not isinstance(maximum, int | float):
-            continue
-        if default > maximum:
-            raise ValueError(
-                f"tools.{name}: default_timeout {default:g} is above"
-                f" max_timeout_seconds {maximum:g}. Lower default_timeout or raise"
-                " max_timeout_seconds."
-            )
+    for name in SHELL_TOOLS:
+        check_shell_timeout_pair(name, tools.get(name, {}))
     return tools
 
 
@@ -394,11 +444,32 @@ def _normalize_log_level(value: Any) -> Any:
     return normalized
 
 
-class VibeConfigSchema(ConfigSchema):
+@functools.cache
+def _mistral_efforts() -> frozenset[str]:
+    """The efforts the Mistral SDK puts on the wire; it leaves any other out."""
+    from mistralai.client.models import ReasoningEffort
+
+    return frozenset(
+        value
+        for member in typing.get_args(ReasoningEffort)
+        for value in typing.get_args(member)
+        if isinstance(value, str)
+    )
+
+
+def _mistral_thinking_levels() -> list[str]:
+    """The SDK's efforts as Vibe names them: the standard levels in order, then its own."""
+    efforts = {"off" if effort == "none" else effort for effort in _mistral_efforts()}
+    standard = [level for level in THINKING_LEVELS if level in efforts]
+    return [*standard, *sorted(efforts - set(standard))]
+
+
+class VibeConfigSchema(ConfigSchema):  # noqa: PLR0904 - the effective config read by every caller
     # Fields a runtime layer populates (model catalog, GrowthBook, managed
     # shell), never the user's files. The settings UI hides them; declare a new
     # one here, not in a second list.
     RUNTIME_INJECTED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "catalog_default_model",
         "catalog_model_aliases",
         "catalog_recommended_model",
         "managed_shell_tools_enabled",
@@ -406,13 +477,13 @@ class VibeConfigSchema(ConfigSchema):
         "routed_model_config",
         "routed_extra_models",
         "smart_approve_available",
-        "smart_approve_default",
     })
 
     _validation_warnings: list[str] = PrivateAttr(default_factory=list)
     # The pin the fallback replaced, so validate_merged can skip the orphan
     # notice for the same alias.
     _missing_pin: str = PrivateAttr(default="")
+    _alias_targets: dict[str, str] = PrivateAttr(default_factory=dict)
 
     @property
     def validation_warnings(self) -> tuple[str, ...]:
@@ -420,7 +491,165 @@ class VibeConfigSchema(ConfigSchema):
 
     @classmethod
     def defines_entry(cls, key: str, payload: Any) -> bool:
-        return key != "models" or _defines_model(payload)
+        return key != "models" or defines_model(payload)
+
+    @classmethod
+    def prepare_layers(
+        cls, layers: list[tuple[str, dict[str, Any]]]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        layers = with_catalog_filter(layers)
+        # While the catalog lists models, the built-ins below it are unavailable;
+        # an empty catalog keeps them, and layers above still win their names.
+        catalog_lists_models = False
+        for name, data in layers:
+            if name == CATALOG_LAYER:
+                models = normalize_model_configs(data.get("models"))
+                catalog_lists_models = isinstance(models, Mapping) and bool(models)
+        if catalog_lists_models:
+            layers = [
+                (
+                    name,
+                    {key: value for key, value in data.items() if key != "models"}
+                    if name == DefaultConfigLayer.NAME
+                    else data,
+                )
+                for name, data in layers
+            ]
+        targets = catalog_alias_index(layers).targets
+        if not targets:
+            return layers
+        prepared: list[tuple[str, dict[str, Any]]] = []
+        for name, data in layers:
+            models = normalize_model_configs(data.get("models"))
+            if name != CATALOG_LAYER and isinstance(models, Mapping):
+                data = {**data, "models": models_on_catalog_ids(models, targets)}
+            prepared.append((name, data))
+        return prepared
+
+    def expand_layer_write(
+        self, op: PatchOp, layer_data: Mapping[str, Any]
+    ) -> list[PatchOp]:
+        ops = [self.layer_write_op(op, layer_data)]
+        # A field reset must clear every entry of the model that sets it,
+        # or the leftover alias value still applies after the merge.
+        match op.path.split("/", 3):
+            case ["", "models", token, field] if isinstance(op, RemoveOperationPatch):
+                key = unescape_json_pointer_token(token)
+                models = normalize_model_configs(layer_data.get("models"))
+                if not isinstance(models, Mapping):
+                    return ops
+                name = unescape_json_pointer_token(field)
+                seen = {ops[0].path}
+                for candidate in settings_keys(models, key, self._alias_targets):
+                    payload = models.get(candidate)
+                    if not isinstance(payload, Mapping) or name not in payload:
+                        continue
+                    path = "/".join([
+                        "",
+                        "models",
+                        escape_json_pointer_token(candidate),
+                        field,
+                    ])
+                    if path not in seen:
+                        seen.add(path)
+                        ops.append(op.model_copy(update={"path": path}))
+        return ops
+
+    def layer_write_op(self, op: PatchOp, layer_data: Mapping[str, Any]) -> PatchOp:
+        update: dict[str, Any] = {}
+        match op.path.split("/", 3):
+            case ["", "models", token, *rest]:
+                key = unescape_json_pointer_token(token)
+                models = normalize_model_configs(layer_data.get("models"))
+                if isinstance(models, Mapping):
+                    keys = settings_keys(models, key, self._alias_targets)
+                    layer_key = keys[0] if keys else key
+                    if isinstance(op, RemoveOperationPatch) and rest:
+                        # A remove must land where the field actually is, not
+                        # where a set would go.
+                        field = unescape_json_pointer_token(rest[0])
+                        for candidate in keys or [key]:
+                            payload = models.get(candidate)
+                            if isinstance(payload, Mapping) and field in payload:
+                                layer_key = candidate
+                                break
+                    if layer_key != key:
+                        update["path"] = "/".join([
+                            "",
+                            "models",
+                            escape_json_pointer_token(layer_key),
+                            *rest,
+                        ])
+                        # A whole-entry upsert carries the model's alias: it
+                        # must match the key the layer uses, or the patched
+                        # layer fails to normalize.
+                        value = getattr(op, "value", None)
+                        if (
+                            not rest
+                            and isinstance(value, Mapping)
+                            and isinstance(value.get("alias"), str)
+                            and value["alias"] != layer_key
+                        ):
+                            update["value"] = {**value, "alias": layer_key}
+            case ["", "active_model"]:
+                # While a rollout keeps a model's settings under an old name
+                # in a file, the pin names the model the way that file does:
+                # an older Vibe without the catalog, sharing the file, still
+                # resolves it.
+                value = getattr(op, "value", None)
+                if isinstance(value, str):
+                    models = normalize_model_configs(layer_data.get("models"))
+                    if isinstance(models, Mapping):
+                        keys = settings_keys(models, value, self._alias_targets)
+                        if keys and keys[0] != value:
+                            update["value"] = keys[0]
+            case _:
+                pass
+        return op.model_copy(update=update) if update else op
+
+    @property
+    def catalog_aliases(self) -> Mapping[str, str]:
+        """Each catalog alias that selects a model, mapped to the model's key."""
+        return MappingProxyType(self._alias_targets)
+
+    def layer_models(self, layer_data: Mapping[str, Any]) -> Mapping[str, Any]:
+        """A layer's model entries keyed on the model each one applies to.
+
+        An entry keyed on a catalog alias is merged into its model's, in the
+        order ``prepare_layers`` uses.
+        """
+        models = normalize_model_configs(layer_data.get("models"))
+        if not isinstance(models, Mapping):
+            return {}
+        return models_on_catalog_ids(models, self._alias_targets)
+
+    def resolve_model_name(self, name: str) -> str:
+        """The model key ``name`` selects: itself, or the model a catalog alias
+        names.
+        """
+        if name in self.models:
+            return name
+        return self._alias_targets.get(name, name)
+
+    def check_layer_keys(self, layers: Sequence[tuple[str, Mapping[str, Any]]]) -> None:
+        from vibe.core.config._setting_keys import (
+            UnusedConfigKeysError,
+            check_strict_config_env,
+            find_unused_keys,
+            notice,
+        )
+
+        check_strict_config_env()
+        issues = find_unused_keys(type(self), layers)
+        if not issues:
+            return
+        if self.strict_config:
+            raise UnusedConfigKeysError(issues)
+        for issue in issues:
+            logger.warning(
+                "Config setting ignored: %s (%s)", issue.describe(), issue.layer
+            )
+        self._validation_warnings.extend(notice(issues))
 
     @classmethod
     def validate_merged(
@@ -431,13 +660,17 @@ class VibeConfigSchema(ConfigSchema):
         defined_entries: dict[str, dict[str, tuple[str, ...]]],
     ) -> Self:
         data, orphans = _without_orphan_model_overrides(data)
+        data, thinking_warnings = _without_blank_thinking_levels(data)
         config = super().validate_merged(
             data, origins=origins, defined_entries=defined_entries
         )
+        for message in thinking_warnings:
+            logger.warning("%s", message)
+            config._validation_warnings.append(message)
         # The missing-pin warning already named a pinned orphan: one notice
         # per model, not one per config value. Only the fallback's own alias
-        # is skipped — a pin that resolves through a catalog alias fires no
-        # fallback, and its orphaned override keeps its warning.
+        # is skipped: settings under an alias two models claim stay orphaned
+        # and keep their warning.
         for alias in orphans:
             if alias == config._missing_pin:
                 continue
@@ -486,6 +719,9 @@ class VibeConfigSchema(ConfigSchema):
     # The catalog's recommended model ID, populated at runtime by the model
     # catalog layer: the default below a live GrowthBook routed default.
     catalog_recommended_model: Annotated[str, WithReplaceMerge()] = ""
+    # The default GrowthBook picks among the catalog's models, populated at
+    # runtime by the catalog filter: the default above the recommendation.
+    catalog_default_model: Annotated[str, WithReplaceMerge()] = ""
     # Extra models injected into the dropdown at runtime by the GrowthBook layer,
     # for exposure/rollout without changing the default. Unlike
     # ``routed_model_config``, these never influence ``resolve_default_model_alias``.
@@ -534,17 +770,15 @@ class VibeConfigSchema(ConfigSchema):
             " Unset leaves the feature on automatic selection."
         ),
     )
-    auto_compact_threshold: Annotated[int, WithReplaceMerge()] = Field(
-        default=UNSET_AUTO_COMPACT_THRESHOLD,
+    auto_compact_threshold: Annotated[int | None, WithReplaceMerge()] = Field(
+        default=None,
+        gt=0,
         description=(
-            "Token count before automatic compaction for models that declare "
-            "neither their own threshold nor a context window. Models with a "
-            f"window compact at {int(AUTO_COMPACT_WINDOW_RATIO * 100)}% of it "
-            "instead."
+            "Token count before automatic compaction for models without their "
+            "own threshold. Unset uses each model's default, derived from its "
+            "context window. A threshold outside the range the window allows is "
+            "moved into that range, with a warning."
         ),
-        # The sentinel means "no layer set one" and resolves to a rule, not a
-        # number; the published schema must not advertise it as the default.
-        json_schema_extra=_suppress_unset_default,
     )
     active_transcribe_model: Annotated[str, WithReplaceMerge()] = (
         DEFAULT_ACTIVE_TRANSCRIBE_MODEL_CONFIG.alias
@@ -574,17 +808,16 @@ class VibeConfigSchema(ConfigSchema):
         dict[str, dict[str, Any]],
         WithDeepMerge(),
         BeforeValidator(_normalize_tool_configs),
-        AfterValidator(_reject_shell_timeouts_above_their_maximum),
+        AfterValidator(_reject_invalid_shell_timeouts),
     ] = Field(default_factory=dict)
-    tool_paths: Annotated[
-        list[Path], WithConcatMerge(), BeforeValidator(_expand_paths)
-    ] = Field(
-        default_factory=list,
+    outside_workdir: Annotated[OutsideWorkdirPolicy, WithReplaceMerge()] = Field(
+        default=OutsideWorkdirPolicy.ASK,
         description=(
-            "Additional directories or files to explore for custom tools. "
-            "Paths may be absolute or relative to the current working directory. "
-            "Directories are shallow-searched for tool definition files, "
-            "while files are loaded directly if valid."
+            "What happens when a file or shell tool call reaches a path outside the"
+            " working directory and its added directories: 'ask' prompts for"
+            " approval, 'deny' refuses the call and tells the agent why, so it keeps"
+            " working. Allowlisted paths are unaffected. Override per tool with"
+            " 'outside_workdir' under [tools.<name>]."
         ),
     )
     enabled_tools: Annotated[list[str], WithReplaceMerge()] = Field(
@@ -621,6 +854,16 @@ class VibeConfigSchema(ConfigSchema):
             " stabilized; when enabled, document_library is requested from the"
             " connector bootstrap alongside web_search."
         ),
+    )
+    experimental_enable_mistral_mcp_connector: Annotated[bool, WithReplaceMerge()] = (
+        Field(
+            default=False,
+            description=(
+                "Experimental: expose the Mistral MCP builtin connector and its"
+                " tools. Rolled out through the vibe_cli_mistral_mcp_connector"
+                " GrowthBook experiment."
+            ),
+        )
     )
     connectors: Annotated[list[ConnectorConfig], WithUnionMerge(merge_key="name")] = (
         Field(
@@ -666,22 +909,14 @@ class VibeConfigSchema(ConfigSchema):
             "Applies in both interactive and programmatic (-p/--prompt) mode."
         ),
     )
-    # Smart approve rollout, driven by GrowthBook (see experiments/active.py). The two
-    # flags are independent, mirroring model routing (#49523): one exposes the mode in
-    # the picker, the other makes it the default. Kept off by default so smart approve
-    # ships dark until a cohort is opted in.
+    # Kept off by default so smart approve ships dark until a cohort is opted in.
+    # The vibe_cli_default_agent experiment makes a mode the default by setting
+    # default_agent itself.
     smart_approve_available: Annotated[bool, WithReplaceMerge()] = Field(
         default=False,
         description=(
             "Expose the smart-approve mode in the mode picker/cycle. "
             "Set by the vibe_cli_smart_approve experiment; does not change the default."
-        ),
-    )
-    smart_approve_default: Annotated[bool, WithReplaceMerge()] = Field(
-        default=False,
-        description=(
-            "Make smart-approve the default mode (implies it is available). "
-            "Set by the vibe_cli_smart_approve_default experiment."
         ),
     )
     enable_auto_approve: Annotated[bool, WithReplaceMerge()] = Field(
@@ -720,13 +955,29 @@ class VibeConfigSchema(ConfigSchema):
             " is set. Supports glob patterns and regex with 're:' prefix."
         ),
     )
+    enabled_plugins: Annotated[list[str], WithConcatMerge()] = Field(
+        default_factory=list,
+        description=(
+            "Names of installed plugins to turn on that are off by default."
+            " 'disabled_plugins' wins when a plugin is in both."
+        ),
+    )
+    disabled_plugins: Annotated[list[str], WithConcatMerge()] = Field(
+        default_factory=list,
+        description=(
+            "Names of installed plugins to disable. A disabled plugin stays"
+            " installed but contributes nothing to sessions."
+        ),
+    )
     experimental_enable_registry_skills: Annotated[bool, WithReplaceMerge()] = Field(
         default=False,
         description=(
             "Experimental: pull shared workspace skills from Mistral"
             " (api.mistral.ai) and make them available alongside local skills."
-            " Requires a Mistral provider and API key. Local and builtin skills take"
-            " precedence on name collision."
+            " Requires a Mistral provider and API key. On a name collision the"
+            " project's skills win over global ones, skill_paths included, and"
+            " within a scope a local skill wins over a shared one. Builtin skills"
+            " are named vibe:<name>, so they never collide."
         ),
     )
     experimental_enable_model_catalog: Annotated[bool, WithReplaceMerge()] = Field(
@@ -736,6 +987,36 @@ class VibeConfigSchema(ConfigSchema):
             " provider at session start and cache it per user on disk. Requires"
             " a Mistral provider and API key; any failure silently falls back"
             " to local config."
+        ),
+    )
+    experimental_enable_local_projects: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "Experimental, in development: switch Vibe Desktop to local projects"
+            " (local_projects.toml) instead of project links. Not used yet."
+            " Read once when Vibe Desktop starts its app server."
+        ),
+    )
+    enable_pr_monitoring: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "Detect pull requests and merge requests created during"
+            " a session (gh pr create, glab mr create) and discover the ones that"
+            " already exist for the session's repository at session load"
+            " (gh pr list, glab mr list), persist them as session artifacts,"
+            " keep their status in sync with the provider, and expose them via"
+            " the artifacts/ RPC namespace. Requires gh/glab (system-installed or"
+            " bundled)."
+        ),
+    )
+    experimental_local_runtime_session_api: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "Experimental: the app server drives local Sessions through the"
+            " Session API instead of calling the local runtime directly. Set by"
+            " the vibe_cli_local_runtime_session_api_migration experiment; the"
+            " VIBE_EXPERIMENTAL_LOCAL_RUNTIME_SESSION_API environment variable"
+            " takes precedence. Read when a Session opens."
         ),
     )
 
@@ -773,11 +1054,36 @@ class VibeConfigSchema(ConfigSchema):
     cursor_blink: Annotated[bool, WithReplaceMerge()] = Field(
         default=True, description="Blink the input cursor. Disable for a steady cursor."
     )
+    vim_keybindings: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description="Edit the prompt input with vim Normal and Insert modes.",
+    )
     show_greeting: Annotated[bool, WithReplaceMerge()] = Field(
         default=True,
         description="Show greeting at startup (Mistral providers only, once per 24h).",
     )
     autocopy_to_clipboard: Annotated[bool, WithReplaceMerge()] = True
+    enable_mouse_capture: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "Capture the mouse for scrolling, clicks and in-app selection. "
+            "Disable to keep the terminal's native text selection."
+        ),
+    )
+    enable_sticky_prompt: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "Pin the prompt of the conversation section at the top of the "
+            "transcript while scrolling; a click scrolls back to it."
+        ),
+    )
+    enable_file_autocomplete: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "Offer @ file mentions with repository file completion. Disable to "
+            "skip building the file index and watching the filesystem for it."
+        ),
+    )
     file_watcher_for_autocomplete: Annotated[bool, WithReplaceMerge()] = True
     ask_confirmation_on_exit: Annotated[bool, WithReplaceMerge()] = True
     displayed_workdir: Annotated[str, WithReplaceMerge()] = Field(
@@ -792,7 +1098,7 @@ class VibeConfigSchema(ConfigSchema):
     )
     voice_mode_enabled: Annotated[bool, WithReplaceMerge()] = False
     narrator_enabled: Annotated[bool, WithReplaceMerge()] = False
-    show_thinking_nodes: Annotated[bool, WithReplaceMerge()] = False
+    show_thinking_nodes: Annotated[bool, WithReplaceMerge()] = True
     show_subagent_status_list: Annotated[bool, WithReplaceMerge()] = Field(
         default=True,
         description=(
@@ -805,6 +1111,17 @@ class VibeConfigSchema(ConfigSchema):
         ge=0,
         le=100,
         description="Maximum number of recent managed worktrees kept locally.",
+    )
+    worktree_copy_on_write: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        description=(
+            "macOS only: create managed worktrees of a trusted"
+            " repository by cloning an idle template checkout with APFS"
+            " copy-on-write, which uses less disk and is faster on large"
+            " repositories. Keeps one template checkout per repository under"
+            " ~/.vibe/worktrees/.templates, and sets extensions.worktreeConfig"
+            " in the repository's .git/config. Falls back to a normal checkout."
+        ),
     )
     bypass_tool_permissions: Annotated[bool, WithReplaceMerge()] = False
     raise_on_compaction_failure: Annotated[bool, WithReplaceMerge()] = Field(
@@ -830,12 +1147,45 @@ class VibeConfigSchema(ConfigSchema):
             "the agent works alone."
         ),
     )
+    max_subagents: Annotated[int, WithReplaceMerge()] = Field(
+        default=32,
+        ge=1,
+        description=(
+            "Maximum number of subagents that can be alive at once; a spawn "
+            "beyond this fails until a subagent is stopped."
+        ),
+    )
+    max_concurrent_subagents: Annotated[int, WithReplaceMerge()] = Field(
+        default=32,
+        ge=1,
+        description=(
+            "Maximum number of subagents running a turn at the same time; "
+            "spawning or messaging beyond this fails until a subagent "
+            "finishes its turn."
+        ),
+    )
     compaction_prompt_id: Annotated[str, WithReplaceMerge()] = UtilityPrompt.COMPACT
     title_prompt_id: Annotated[str, WithReplaceMerge()] = UtilityPrompt.SESSION_TITLE
     include_commit_signature: Annotated[bool, WithReplaceMerge()] = True
-    include_model_info: Annotated[bool, WithReplaceMerge()] = True
+    include_model_info: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        deprecated="No longer used; remove this setting from your config.",
+        description="Retired: accepted for older configs, with no effect.",
+    )
     include_project_context: Annotated[bool, WithReplaceMerge()] = True
-    include_prompt_detail: Annotated[bool, WithReplaceMerge()] = True
+    include_prompt_detail: Annotated[bool, WithReplaceMerge()] = Field(
+        default=True,
+        deprecated="No longer used; remove this setting from your config.",
+        description="Retired: accepted for older configs, with no effect.",
+    )
+    strict_config: Annotated[bool, WithReplaceMerge()] = Field(
+        default=False,
+        description=(
+            "Refuse a config with settings Vibe does not use (unknown, retired, or"
+            " without effect) instead of warning about them. For programmatic and"
+            " headless runs; also VIBE_STRICT_CONFIG=1."
+        ),
+    )
     enable_update_checks: Annotated[bool, WithReplaceMerge()] = True
     enable_auto_update: Annotated[bool, WithReplaceMerge()] = True
     enable_notifications: Annotated[bool, WithReplaceMerge()] = True
@@ -850,24 +1200,30 @@ class VibeConfigSchema(ConfigSchema):
         ge=0,
         description=(
             "Seconds of silence after the model starts answering before the "
-            "response counts as stalled. 0 disables the limit. Unified harness only."
+            "response counts as stalled and is retried once. 0 allows the same "
+            "silence as before the first output (api_timeout). Unified harness only."
+        ),
+    )
+    agent_max_output_tokens: Annotated[int, WithReplaceMerge()] = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Output token cap sent as max_tokens on every agent and subagent "
+            "request, whatever the provider, held to the model's max output and "
+            "to the room the context window leaves above the compaction "
+            "threshold. 0 sends a cap only where the provider requires one: the "
+            "model's max_output_tokens. Unified harness only."
         ),
     )
     compaction_max_output_tokens: Annotated[int, WithReplaceMerge()] = Field(
-        default=DEFAULT_COMPACTION_MAX_OUTPUT_TOKENS,
+        default=0,
         ge=0,
         description=(
-            "Output token cap for compaction requests, below any model or session "
-            "cap. 0 leaves compaction at the same cap as other requests. Unified "
-            "harness only."
-        ),
-    )
-    compaction_thinking: Annotated[ThinkingLevel | None, WithReplaceMerge()] = Field(
-        default=None,
-        description=(
-            "Thinking level for the first compaction request. Unset keeps the "
-            "compaction model's own level. The fallback request always runs "
-            "without reasoning. Unified harness only."
+            "Output token cap sent as max_tokens on every compaction request, "
+            "whatever the provider, held to the compaction model's max output and "
+            "to the room its context window leaves above the compaction "
+            "threshold. 0 sends a cap only where the provider requires one: the "
+            "compaction model's max_output_tokens. Unified harness only."
         ),
     )
     compaction_reasoning_limit_tokens: Annotated[int, WithReplaceMerge()] = Field(
@@ -875,8 +1231,11 @@ class VibeConfigSchema(ConfigSchema):
         ge=0,
         description=(
             "Approximate reasoning tokens after which the first compaction "
-            "request is abandoned for a fallback request without tools or "
-            "reasoning. 0 disables the limit. Unified harness only."
+            "request is stopped, as if cut off at its output limit, and the "
+            "summary is asked for once more, briefly, without tools and with "
+            "reasoning off or at its lowest level. Reasoning is no longer "
+            "watched once the answer starts. 0 disables the limit. Unified "
+            "harness only."
         ),
     )
     output_limit_retries: Annotated[int, WithReplaceMerge()] = Field(
@@ -888,20 +1247,21 @@ class VibeConfigSchema(ConfigSchema):
             "the turn on the first cut-off answer. Unified harness only."
         ),
     )
-    output_token_reserve: Annotated[int, WithReplaceMerge()] = Field(
-        default=DEFAULT_OUTPUT_TOKEN_RESERVE,
-        ge=0,
-        description=(
-            "Tokens kept free when a request's output cap is clipped to the room "
-            "its input leaves in the model's context window. Clipping needs the "
-            "model's max_context_length. Unified harness only."
-        ),
+    api_connect_timeout: Annotated[float, WithReplaceMerge()] = Field(
+        default=10.0,
+        deprecated="No longer used; remove this setting from your config.",
+        description="Retired: accepted for older configs, with no effect.",
     )
-    api_connect_timeout: Annotated[float, WithReplaceMerge()] = (
-        DEFAULT_API_CONNECT_TIMEOUT
+    api_write_timeout: Annotated[float, WithReplaceMerge()] = Field(
+        default=30.0,
+        deprecated="No longer used; remove this setting from your config.",
+        description="Retired: accepted for older configs, with no effect.",
     )
-    api_write_timeout: Annotated[float, WithReplaceMerge()] = DEFAULT_API_WRITE_TIMEOUT
-    api_pool_timeout: Annotated[float, WithReplaceMerge()] = DEFAULT_API_POOL_TIMEOUT
+    api_pool_timeout: Annotated[float, WithReplaceMerge()] = Field(
+        default=10.0,
+        deprecated="No longer used; remove this setting from your config.",
+        description="Retired: accepted for older configs, with no effect.",
+    )
     vibe_base_url: Annotated[str, WithReplaceMerge()] = DEFAULT_VIBE_BASE_URL
     vibe_code_sessions_base_url: Annotated[str, WithReplaceMerge()] = (
         "https://chat.mistral.ai"
@@ -925,24 +1285,12 @@ class VibeConfigSchema(ConfigSchema):
         default_factory=ExperimentsConfig
     )
 
-    def smart_approve_offered(self) -> bool:
-        """Whether smart-approve is exposed in the mode picker/cycle.
-
-        Making it the default implies it is offered, so a cohort can be defaulted
-        into it without also flipping the availability flag.
-        """
-        return self.smart_approve_available or self.smart_approve_default
-
-    def resolve_default_agent(self) -> str:
-        """The default agent, honoring the smart-approve default experiment."""
-        if self.smart_approve_default:
-            return BuiltinAgentName.SMART_APPROVE
-        return self.default_agent
-
     def resolve_default_model_alias(self) -> str:
         available = self.available_models()
         if self.routed_default_model and self.routed_default_model in available:
             return self.routed_default_model
+        if self.catalog_default_model in available:
+            return self.catalog_default_model
         if self.catalog_recommended_model in available:
             return self.catalog_recommended_model
         if DEFAULT_ACTIVE_MODEL_CONFIG.alias in available or not available:
@@ -950,13 +1298,24 @@ class VibeConfigSchema(ConfigSchema):
             return DEFAULT_ACTIVE_MODEL_CONFIG.alias
         return next(iter(available))
 
+    def _matches_allowed(self, model: ModelConfig) -> bool:
+        if name_matches(model.name, self.allowed_models):
+            return True
+        # Catalog aliases match too: a retired built-in's names (e.g. its wire
+        # name) are published as aliases of the catalog model replacing it, so
+        # an allowlist written against the built-in keeps matching.
+        return any(
+            name_matches(alias, self.allowed_models)
+            for alias in self.catalog_model_aliases.get(model.alias, [])
+        )
+
     def available_models(self) -> dict[str, ModelConfig]:
         if not self.allowed_models:
             return self.models
         allowed = {
             alias: model
             for alias, model in self.models.items()
-            if name_matches(model.name, self.allowed_models)
+            if self._matches_allowed(model)
         }
         if self.origin_of("allowed_models") == "admin":
             # An administrator's policy must fail closed: an invalid policy must
@@ -1131,33 +1490,6 @@ class VibeConfigSchema(ConfigSchema):
             f"TTS provider '{model.provider}' for TTS model '{model.name}' not found in configuration."
         )
 
-    def build_tool_allowlist_update(
-        self,
-        tool_name: str,
-        patterns: list[str],
-        *,
-        current_allowlist: list[str] | None = None,
-    ) -> dict[str, Any] | None:
-        """Extend a tool's allowlist in memory and return the persist payload.
-
-        Returns ``None`` when every pattern is already allowlisted. Callers
-        persist the returned payload; the in-memory config is kept current so
-        repeated calls merge from fresh state.
-        """
-        if tool_name in _SESSION_PATTERN_WILDCARD_TOOLS:
-            patterns = [_strip_session_pattern_wildcard(p) for p in patterns]
-        allowlist: list[str] = list(
-            current_allowlist
-            if current_allowlist is not None
-            else self.tools.get(tool_name, {}).get("allowlist", [])
-        )
-        new_patterns = [p for p in patterns if p not in allowlist]
-        if not new_patterns:
-            return None
-        merged = sorted(allowlist + new_patterns)
-        self.tools.setdefault(tool_name, {})["allowlist"] = merged
-        return {"tools": {tool_name: {"allowlist": merged}}}
-
     @property
     def system_prompt(self) -> str:
         return load_system_prompt(self.system_prompt_id)
@@ -1226,33 +1558,24 @@ class VibeConfigSchema(ConfigSchema):
         object.__setattr__(self, "models", models)
         return self
 
+    _refuse_zero_threshold = field_validator("auto_compact_threshold", mode="before")(
+        refuse_zero_auto_compact_threshold
+    )
+
     @model_validator(mode="after")
     def _apply_auto_compact_threshold(self) -> VibeConfigSchema:
-        # A threshold is a deliberate cap when a layer actually provided it:
-        # UNSET marks "no layer set one" (the default layer materializes field
-        # defaults into the merge, so unset-ness must live in the value). A
-        # cap is honored while it can fire — at or above a declared window the
-        # provider rejects the request before compaction ever runs — and 0
-        # stays a cap meaning "never compact".
-        global_cap = self.auto_compact_threshold
-        global_set = global_cap != UNSET_AUTO_COMPACT_THRESHOLD
-        global_value = global_cap if global_set else DEFAULT_AUTO_COMPACT_THRESHOLD
-        models = {}
-        for alias, model in self.models.items():
-            window = model.max_context_length
-            cap = model.auto_compact_threshold
-            if cap != UNSET_AUTO_COMPACT_THRESHOLD and (window is None or cap < window):
-                models[alias] = model
-                continue
-            if global_set and (window is None or global_value < window):
-                threshold = global_value
-            elif window:
-                threshold = int(window * AUTO_COMPACT_WINDOW_RATIO)
-            else:
-                threshold = global_value
-            models[alias] = model.model_copy(
-                update={"auto_compact_threshold": threshold}
-            )
+        # A model without its own threshold takes the global one. With neither,
+        # the threshold stays unset and the session derives it from the model's
+        # context window; a threshold outside its window's range fails there.
+        threshold = self.auto_compact_threshold
+        if threshold is None:
+            return self
+        models = {
+            alias: model
+            if model.auto_compact_threshold is not None
+            else model.model_copy(update={"auto_compact_threshold": threshold})
+            for alias, model in self.models.items()
+        }
         object.__setattr__(self, "models", models)
         return self
 
@@ -1268,8 +1591,18 @@ class VibeConfigSchema(ConfigSchema):
         )
         for alias, reason in index.dropped.items():
             warn_ignored_alias(alias, reason)
+        object.__setattr__(self, "_alias_targets", index.targets)
         if target := index.targets.get(self.active_model):
             object.__setattr__(self, "active_model", target)
+        utility = {
+            feature.value: index.targets[alias]
+            for feature, alias in self.utility_models.configured()
+            if alias in index.targets
+        }
+        if utility:
+            object.__setattr__(
+                self, "utility_models", self.utility_models.model_copy(update=utility)
+            )
         return self
 
     @model_validator(mode="after")
@@ -1285,12 +1618,61 @@ class VibeConfigSchema(ConfigSchema):
             # an unreachable catalog and a typo all look the same from here.
             message = (
                 f"Model '{unknown}' is not available — running '{label or fallback}'. "
-                "Pick a model with /model to stop this notice."
+                "Pick another model to stop this notice."
             )
             logger.warning("%s", message)
             self._validation_warnings.append(message)
             object.__setattr__(self, "_missing_pin", unknown)
             object.__setattr__(self, "active_model", UNPINNED_ACTIVE_MODEL)
+        return self
+
+    @model_validator(mode="after")
+    def _warn_unlisted_thinking(self) -> VibeConfigSchema:
+        # The provider still judges the word; the warning flags a likely typo,
+        # and the pickers offer the level beside the model's own to move off it.
+        for model in self.models.values():
+            if not model.thinking_is_set:
+                continue
+            # Like the harness: a standard word in any case, a model's own as written.
+            written = model.thinking.strip()
+            if written.lower() in THINKING_LEVELS or written in model.thinking_levels:
+                continue
+            if self._mistral_sdk_drops_thinking(model):
+                continue
+            message = (
+                f"Model '{model.alias}': thinking {model.thinking!r} is neither a "
+                f"standard level ({', '.join(THINKING_LEVELS)}) nor in its "
+                f"thinking_levels ({', '.join(model.thinking_levels)}); the "
+                "provider may refuse it. Pick another thinking level."
+            )
+            logger.warning("%s", message)
+            self._validation_warnings.append(message)
+        return self
+
+    def _mistral_sdk_drops_thinking(self, model: ModelConfig) -> bool:
+        if not model.thinking_is_set:
+            return False
+        written = model.thinking.strip()
+        if written.lower() in THINKING_LEVELS or written in _mistral_efforts():
+            return False
+        return any(
+            provider.name == model.provider and provider.backend == Backend.MISTRAL
+            for provider in self.providers
+        )
+
+    @model_validator(mode="after")
+    def _warn_thinking_the_mistral_sdk_drops(self) -> VibeConfigSchema:
+        for model in self.models.values():
+            if not self._mistral_sdk_drops_thinking(model):
+                continue
+            message = (
+                f"Model '{model.alias}': the Mistral client cannot send thinking "
+                f"{model.thinking!r}, so its requests go without a thinking level "
+                f"(it sends {', '.join(_mistral_thinking_levels())}). Pick another "
+                "thinking level."
+            )
+            logger.warning("%s", message)
+            self._validation_warnings.append(message)
         return self
 
     @model_validator(mode="after")
@@ -1422,18 +1804,22 @@ class VibeConfigSchema(ConfigSchema):
         return self
 
 
+def outside_workdir_denied(config: VibeConfigSchema) -> bool:
+    """Whether outside-workdir access is refused globally or for any tool."""
+    return config.outside_workdir is OutsideWorkdirPolicy.DENY or any(
+        tool.get("outside_workdir") == OutsideWorkdirPolicy.DENY
+        for tool in config.tools.values()
+    )
+
+
 def create_default_config() -> dict[str, Any]:
-    from vibe.core.tools.manager import ToolManager
+    from vibe.core.tools.manager import discover_tool_defaults
 
     config_dict = VibeConfigSchema.model_construct().model_dump(
         mode="json", exclude_none=True
     )
-    # The unset sentinel is merge-internal; a default config handed to an
-    # external consumer must not carry it into a human-facing file.
-    if config_dict.get("auto_compact_threshold") == UNSET_AUTO_COMPACT_THRESHOLD:
-        del config_dict["auto_compact_threshold"]
     if isinstance(config_dict.get("models"), dict):
         config_dict["models"] = serialize_model_configs(config_dict["models"])
-    if tool_defaults := ToolManager.discover_tool_defaults():
+    if tool_defaults := discover_tool_defaults():
         config_dict["tools"] = tool_defaults
     return config_dict

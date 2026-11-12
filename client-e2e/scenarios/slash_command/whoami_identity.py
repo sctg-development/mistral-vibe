@@ -4,6 +4,17 @@ from e2e.app_server.scenario import Timeline
 
 timeline: Timeline = ["/whoami\r"]
 
+request_methods = {"providerAuth/read"}
+screen_contains = (
+    "Name: Ada Lovelace",
+    "Email: ada@example.com",
+    "Workspace: Analytical Engine",
+    "Organization: Mistral",
+    "Plan: Team",
+    "API key: ****wxyz",
+    "Access scope: shared_only",
+)
+
 handshake = {
     "identity/read": {
         "identity": {
@@ -18,11 +29,14 @@ handshake = {
     "account/read": {
         "account": {
             "status": "ready",
-            "plan": {"kind": "chat", "name": "TEAM", "title": "[Subscription] Pro"},
+            "plan": {"kind": "chat", "name": "TEAM", "title": "Team"},
             "planOffer": None,
             "rateLimitAction": None,
-            "teleportEligible": True,
-            "teleportAction": None,
+            "apiKey": {
+                "preview": "****wxyz",
+                "scope": "workspace",
+                "accessScope": "shared_only",
+            },
         }
     },
 }

@@ -1,6 +1,6 @@
 //! Slash-command resolution: aliases, bare exit synonyms, arguments and side-channel routing.
 
-use vibe_rs::commands::{argument_hint, is_side_channel, parse};
+use vibe_rs::commands::{argument_hint, is_side_channel, parse, waits_for_jobs};
 use vibe_rs::input_modes::{classify, ClassifiedInput};
 
 #[test]
@@ -11,6 +11,7 @@ fn aliases_resolve_to_their_canonical_command() {
         ("/clean", "/clear"),
         ("/continue", "/resume"),
         ("/connectors", "/mcp"),
+        ("/fork", "/branch"),
         (":q", "/exit"),
         (":quit", "/exit"),
     ] {
@@ -23,6 +24,7 @@ fn command_words_are_case_insensitive_and_trimmed() {
     assert_eq!(parse("/HELP"), Some("/help"));
     assert_eq!(parse("  /Model  "), Some("/model"));
     assert_eq!(parse("/Connectors"), Some("/mcp"));
+    assert_eq!(parse("/FORK"), Some("/branch"));
 }
 
 #[test]
@@ -68,7 +70,7 @@ fn bare_exit_synonyms_exit_only_as_the_whole_input() {
 }
 
 #[test]
-fn read_only_commands_run_while_busy_and_pickers_wait_for_idle() {
+fn commands_a_turn_never_reads_run_while_busy_and_the_others_wait_for_idle() {
     for command in [
         "/help",
         "/status",
@@ -79,6 +81,12 @@ fn read_only_commands_run_while_busy_and_pickers_wait_for_idle() {
         "/rename",
         "/data-retention",
         "/exit",
+        "/theme",
+        "/log-level",
+        "/voice",
+        "/proxy-setup",
+        "/branch",
+        "/fork",
     ] {
         assert!(is_side_channel(command), "{command} runs while busy");
     }
@@ -86,15 +94,26 @@ fn read_only_commands_run_while_busy_and_pickers_wait_for_idle() {
         "/config",
         "/model",
         "/thinking",
-        "/theme",
-        "/voice",
         "/resume",
         "/clear",
         "/compact",
         "/rewind",
-        "/mcp",
         "/reload",
+        "/mcp",
+        "/connectors",
+        "/plugins",
+        "/reload-plugins",
     ] {
         assert!(!is_side_channel(command), "{command} waits for idle");
+    }
+}
+
+#[test]
+fn side_channel_settings_wait_for_running_jobs() {
+    for command in ["/theme", "/log-level", "/voice", "/proxy-setup", "/branch"] {
+        assert!(waits_for_jobs(command), "{command} waits for jobs");
+    }
+    for command in ["/help", "/exit", "/status"] {
+        assert!(!waits_for_jobs(command), "{command} runs during jobs");
     }
 }

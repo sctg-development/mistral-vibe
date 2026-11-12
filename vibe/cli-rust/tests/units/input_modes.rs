@@ -6,6 +6,9 @@ use vibe_rs::input;
 use vibe_rs::input_modes::{
     classify, classify_submitted, submitted_value, ClassifiedInput, InputMode,
 };
+use vibe_rs::skill::Skill;
+
+use crate::support::{ctrl, key};
 
 #[test]
 fn full_text_keeps_mode_prefix_outside_the_editable_body() {
@@ -34,7 +37,7 @@ fn a_loaded_message_stays_a_prompt_whatever_its_first_character() {
 
 #[test]
 fn input_classification_distinguishes_bash_skill_and_prompt() {
-    let skills = vec![("Review-PR".to_owned(), "Review the current PR".to_owned())];
+    let skills = vec![Skill::new("Review-PR", "Review the current PR")];
 
     assert_eq!(classify("!", &skills), ClassifiedInput::EmptyBash);
     assert_eq!(
@@ -69,14 +72,25 @@ fn input_classification_distinguishes_bash_skill_and_prompt() {
 }
 
 #[test]
-fn teleport_commands_are_classified_as_commands_without_configuration() {
-    for command in ["/teleport", "/remote-project"] {
-        assert_eq!(
-            classify(command, &[]),
-            ClassifiedInput::SlashCommand { command }
-        );
-        assert!(!vibe_rs::commands::is_side_channel(command));
-    }
+fn removed_teleport_syntax_is_a_prompt() {
+    assert_eq!(
+        classify("/teleport", &[]),
+        ClassifiedInput::Prompt {
+            text: "/teleport".to_owned()
+        }
+    );
+    assert_eq!(
+        classify("&deploy", &[]),
+        ClassifiedInput::Prompt {
+            text: "&deploy".to_owned()
+        }
+    );
+    assert_eq!(
+        classify("/remote-project", &[]),
+        ClassifiedInput::Prompt {
+            text: "/remote-project".to_owned()
+        }
+    );
 }
 
 #[test]
@@ -141,14 +155,13 @@ fn a_mode_character_opens_its_mode_only_over_empty_or_fully_selected_text() {
     assert_eq!((input.cursor, input.anchor), (0, None));
 
     let mut input = ChatInput::default();
-    let ctrl = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL);
-    assert!(!input.apply_mode_key(&ctrl));
+    assert!(!input.apply_mode_key(&ctrl('/')));
     assert_eq!(input.mode, InputMode::Prompt);
 }
 
 #[test]
 fn backspace_at_the_start_leaves_the_mode_and_keeps_the_text() {
-    for mode in [InputMode::Slash, InputMode::Bash, InputMode::Teleport] {
+    for mode in [InputMode::Slash, InputMode::Bash] {
         let mut input = prompt("config", 0, None);
         input.mode = mode;
         assert!(input.apply_mode_key(&key(KeyCode::Backspace)));
@@ -169,6 +182,22 @@ fn backspace_at_the_start_leaves_the_mode_and_keeps_the_text() {
 
     let mut input = prompt("config", 0, None);
     assert!(!input.apply_mode_key(&key(KeyCode::Backspace)));
+}
+
+#[test]
+fn ctrl_h_at_the_start_leaves_the_mode_like_backspace() {
+    for modifiers in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ] {
+        let mut input = prompt("config", 0, None);
+        input.mode = InputMode::Slash;
+        assert!(input.apply_mode_key(&KeyEvent::new(KeyCode::Char('h'), modifiers)));
+        assert_eq!(
+            (input.mode, input.input.as_str()),
+            (InputMode::Prompt, "config")
+        );
+    }
 }
 
 #[test]
@@ -212,10 +241,6 @@ fn pasting_over_the_whole_prompt_opens_the_mode() {
 
     assert_eq!(app.chat_input.mode, InputMode::Slash);
     assert_eq!(app.chat_input.input, "model");
-}
-
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 fn prompt(text: &str, cursor: usize, anchor: Option<usize>) -> ChatInput {

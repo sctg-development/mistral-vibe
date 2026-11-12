@@ -56,7 +56,8 @@ pub struct Recording {
 impl Recording {
     /// Signal end-of-audio; the pipeline flushes and later emits `Finished`.
     pub fn stop(&self) {
-        self.signal.stop(self.started.elapsed());
+        self.signal
+            .stop(crate::clock::real_now().duration_since(self.started));
         self.stop.store(true, Ordering::Relaxed);
     }
 
@@ -72,6 +73,7 @@ impl Recording {
 #[cfg(feature = "voice")]
 pub fn start(
     cfg: &TranscriptionConfig,
+    credential_client: Option<Arc<crate::server::Client>>,
     peak: Arc<AtomicU32>,
     events: Sender<VoiceEvent>,
 ) -> Result<Recording, String> {
@@ -96,8 +98,16 @@ pub fn start(
     let task_cancel = cancel.clone();
     let task_stop = stop.clone();
     let task_signal = signal.clone();
-    let task = tokio::spawn(async move {
-        let result = transcribe::transcribe(&cfg, &api_key, sample_rate, chunks_rx, &events).await;
+    let task = crate::work::spawn_daemon(async move {
+        let result = transcribe::transcribe(
+            &cfg,
+            credential_client.as_deref(),
+            &api_key,
+            sample_rate,
+            chunks_rx,
+            &events,
+        )
+        .await;
         if task_cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -124,7 +134,7 @@ pub fn start(
     Ok(Recording {
         stop,
         signal,
-        started: Instant::now(),
+        started: crate::clock::real_now(),
         cancel,
         task,
     })
@@ -138,6 +148,7 @@ pub fn start(
 #[cfg(not(feature = "voice"))]
 pub fn start(
     _cfg: &TranscriptionConfig,
+    _credential_client: Option<Arc<crate::server::Client>>,
     _peak: Arc<AtomicU32>,
     _events: Sender<VoiceEvent>,
 ) -> Result<Recording, String> {

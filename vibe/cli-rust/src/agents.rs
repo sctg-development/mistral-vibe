@@ -1,12 +1,15 @@
 //! Agent modes: Shift+Tab cycles the primary agents and switches the session.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::Value;
 
-use crate::app::{App, Status};
-use crate::server::{method, AgentSafety, AgentSummary, AgentSwitchParams, AgentType, Client};
+use crate::app::{App, Severity, Status};
+use crate::server::{
+    method, AgentSafety, AgentSummary, AgentSwitchParams, AgentType, Client, RuntimeSnapshot,
+};
 use crate::utils::startup_cache::StartupConfig;
 
 /// Delay before the switch spinner replaces the prompt marker.
@@ -19,8 +22,9 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 pub struct Event {
     /// The agent this round-trip asked for.
     pub target: String,
-    /// The runtime snapshot the switch returned, or `None` when it failed.
-    pub runtime: Option<Value>,
+    /// The runtime snapshot the switch returned, or the server's reason when
+    /// it refused.
+    pub runtime: Result<Value, String>,
 }
 
 /// Seed the agents the UI paints and cycles before the app server answers,
@@ -53,15 +57,12 @@ pub fn apply_runtime(app: &mut App, response: &Value) {
     let Some(runtime) = response.get("runtime") else {
         return;
     };
-    if let Some(agents) = runtime.get("agents").and_then(Value::as_array) {
-        app.agents.all = agents
-            .iter()
-            .filter_map(|agent| serde_json::from_value(agent.clone()).ok())
-            .collect();
+    if let Some(agents) = RuntimeSnapshot::read(response).and_then(|r| r.agents) {
+        app.agents.all = agents;
     }
     let Some(active) = runtime
         .get("activeAgent")
-        .and_then(|active| serde_json::from_value::<AgentSummary>(active.clone()).ok())
+        .and_then(|active| AgentSummary::deserialize(active).ok())
     else {
         return;
     };
@@ -75,8 +76,18 @@ pub fn apply_runtime(app: &mut App, response: &Value) {
             .unwrap_or(false);
     }
     if app.agents.desired.is_none() {
-        app.agents.active = active;
+        set_active(app, active);
     }
+}
+
+/// Adopt the server's running agent. A refused switch was a step away from the
+/// agent that ran then: once another one runs, Shift+Tab cycles from it, and a
+/// snapshot that keeps the same agent keeps the refusal.
+pub fn set_active(app: &mut App, active: AgentSummary) {
+    if active.name != app.agents.active.name {
+        app.agents.refused = None;
+    }
+    app.agents.active = active;
 }
 
 /// Whether every tool call is auto-approved for the agent being painted
@@ -105,7 +116,7 @@ pub fn indicator_agent_name(agent: &AgentSummary, bypass_tool_permissions: bool)
     name
 }
 
-/// Safety driving the chat input border.
+/// Safety driving the chat input's mode label color.
 pub fn indicator_safety(agent: &AgentSummary, bypass_tool_permissions: bool) -> AgentSafety {
     if bypass_tool_permissions {
         AgentSafety::Yolo
@@ -128,15 +139,18 @@ pub fn switching(app: &App) -> bool {
 
 /// Shift+Tab: paint the next primary agent at once and ask the server to switch.
 /// Presses coalesce: a switch already in flight cycles from the pending target,
-/// not the active one.
+/// not the active one; after a refused switch, the press cycles from the
+/// refused target so the cycle can pass it.
 pub fn cycle(app: &mut App, client: &Arc<Client>) {
     if app.agents.installing {
         return;
     }
+    let refused = app.agents.refused.take();
     let base = app
         .agents
         .desired
         .clone()
+        .or(refused)
         .unwrap_or_else(|| app.agents.active.name.clone());
     let Some(target) = next_agent(app, &base) else {
         return;
@@ -186,11 +200,9 @@ fn switch(app: &mut App, client: &Arc<Client>, agent_name: String) {
         app.agents.switch_active = false;
         return;
     };
-    app.agents.spinner_at = Some(Instant::now() + MODE_SWITCH_SPINNER_DELAY);
+    app.agents.spinner_at = Some(crate::clock::now() + MODE_SWITCH_SPINNER_DELAY);
     let client = client.clone();
-    let tx = app.agents.tx.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
+    crate::ui_event::spawn(app, async move {
         let params = AgentSwitchParams {
             session_id,
             agent_name: agent_name.clone(),
@@ -199,12 +211,11 @@ fn switch(app: &mut App, client: &Arc<Client>, agent_name: String) {
         let runtime = client
             .request(method::SESSION_AGENT_UPDATE, params)
             .await
-            .ok();
-        let event = Event {
+            .map_err(|error| crate::server::request_error::describe(&error));
+        Event {
             target: agent_name,
             runtime,
-        };
-        crate::input::deliver(tx, event, &pending).await;
+        }
     });
 }
 
@@ -222,11 +233,20 @@ pub fn apply_event(app: &mut App, client: &Arc<Client>, event: Event) {
     app.agents.switch_active = false;
     app.agents.spinner_at = None;
     app.agents.switching_indicator = false;
-    if let Some(runtime) = &event.runtime {
-        apply_runtime(app, runtime);
+    match &event.runtime {
+        Ok(runtime) => {
+            app.agents.refused = None;
+            apply_runtime(app, runtime);
+        }
+        // The server keeps the running agent: say why, and remember the
+        // target so the next Shift+Tab steps past it instead of asking again.
+        Err(error) => {
+            app.agents.refused = Some(event.target.clone());
+            let message = format!("Failed to switch agent: {error}");
+            crate::notices::inline(app, Severity::Error, &message);
+        }
     }
     send_desired(app, client);
-    app.commit_finished();
 }
 
 /// The armed spinner is due: replace the prompt marker.

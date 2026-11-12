@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 import re
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 import uuid
@@ -12,6 +12,10 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from vibe.app_server.protocol import (
+    SESSION_LIMIT_DEPTH,
+    SESSION_LIMIT_HOPS,
+    SESSION_LIMIT_STARTED_SESSIONS,
+    SessionLimitRefusal,
     SessionSpawnCheckout,
     SessionSpawnNewWorktree,
     SessionSpawnParams,
@@ -25,7 +29,13 @@ if TYPE_CHECKING:
 
 START_SESSION_TOOL_NAME = "start_session"
 
-START_SESSION_TOOL_DESCRIPTION = """\
+# Runaway backstops, high enough that normal use never reaches them. Only a
+# session the user started may start sessions.
+MAX_TURN_STARTED_SESSIONS: Final = 32
+# Session messages and starts in a row with no user message between them.
+MAX_SESSION_HOPS: Final = 32
+
+START_SESSION_TOOL_DESCRIPTION = f"""\
 Start a separate coding session that works on a task on its own, next to this \
 one. Use it when the user asks for something to be done in another session, or \
 for a side task that should not interrupt the current work. Never use it to \
@@ -41,7 +51,9 @@ the user names the session: left out, the session names itself from its work. \
 It runs like this one, on the same model, thinking level and approval policy; \
 set `model` or `reasoning_effort` only when the user asks for one. When you \
 tell the user, link the new session as in the result's `message`; do not \
-quote its id."""
+quote its id. A session started by another session cannot start sessions \
+itself, and one turn starts at most {MAX_TURN_STARTED_SESSIONS} sessions: past \
+that, do the work here."""
 
 SPAWN_TIMEOUT_SECONDS = 120.0
 
@@ -85,11 +97,13 @@ class SpawnModel:
 
 
 def spawn_models(config: VibeConfigSchema) -> tuple[SpawnModel, ...]:
+    from vibe.app_server._projection import offered_levels
+
     return tuple(
         SpawnModel(
             alias=model.alias,
             display_name=model.display_name,
-            levels=tuple(model.thinking_levels),
+            levels=tuple(offered_levels(config, model)),
         )
         for model in config.available_models().values()
     )
@@ -114,8 +128,13 @@ def start_session_input_schema(models: Sequence[SpawnModel]) -> dict[str, Any]:
     levels = "; ".join(
         f"{model.alias}: {', '.join(model.levels)}" for model in models if model.levels
     )
+    # The standard levels, then any level of a model's own its config lists.
+    offered_levels = dict.fromkeys((
+        *THINKING_LEVELS,
+        *(level for model in models for level in model.levels),
+    ))
     properties["reasoning_effort"] = {
-        "anyOf": [{"type": "string", "enum": list(THINKING_LEVELS)}, {"type": "null"}],
+        "anyOf": [{"type": "string", "enum": list(offered_levels)}, {"type": "null"}],
         "default": None,
         "description": (
             "How hard the model thinks, only when the user asks, among the levels "
@@ -132,7 +151,8 @@ class SessionSettings:
     """What a session runs on, which a session it starts inherits."""
 
     model: str
-    reasoning_effort: ThinkingLevel
+    # None when the config leaves it unset: the model's lowest setting applies.
+    reasoning_effort: ThinkingLevel | None
     approval_policy: str
 
 
@@ -140,7 +160,7 @@ def session_settings(config: VibeConfigSchema, agents: AgentManager) -> SessionS
     model = config.get_active_model()
     return SessionSettings(
         model=model.alias,
-        reasoning_effort=model.thinking,
+        reasoning_effort=model.thinking if model.thinking_is_set else None,
         approval_policy=agents.active_profile.name,
     )
 
@@ -150,8 +170,16 @@ class SessionSpawnOrigin:
     checkout: SessionSpawnCheckout
     settings: SessionSettings
     models: tuple[SpawnModel, ...] = ()
-    # Another session started this one and the user has not written to it yet.
-    awaits_user: bool = False
+    # Other names that pick one of ``models``, mapped to its alias: a name the
+    # model catalog renamed.
+    model_names: Mapping[str, str] = field(default_factory=dict)
+    # Session messages and starts that led to the running turn since a user
+    # wrote.
+    hops: int = 0
+    started_by: str | None = None
+    # Sessions the running turn started; `count_turn_start` adds to it.
+    turn_starts: int = 0
+    count_turn_start: Callable[[int], None] = lambda _delta: None
 
 
 class StartSessionResult(BaseModel):
@@ -164,7 +192,11 @@ class StartSessionResult(BaseModel):
 
 
 class SessionSpawnError(Exception):
-    pass
+    def __init__(
+        self, message: str, *, reason: SessionLimitRefusal | None = None
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 type SessionOriginResolver = Callable[[str], SessionSpawnOrigin]
@@ -189,10 +221,25 @@ async def run_start_session(
     a model retry is a new call with a new key.
     """
     origin = origin_of(parent_session_id)
-    if origin.awaits_user:
+    if origin.started_by is not None:
         raise SessionSpawnError(
-            "Another session started this one, so it cannot start sessions until "
-            "the user writes to it. Do the task here."
+            "Another session started this one, so it cannot start sessions. Do "
+            "the task here, or tell the user what should run separately.",
+            reason=SESSION_LIMIT_DEPTH,
+        )
+    if origin.hops >= MAX_SESSION_HOPS:
+        raise SessionSpawnError(
+            f"Sessions have messaged or started each other {MAX_SESSION_HOPS} "
+            "times in a row without the user writing, so this one cannot start "
+            "sessions until the user does. Do the task here, or tell the user.",
+            reason=SESSION_LIMIT_HOPS,
+        )
+    if origin.turn_starts >= MAX_TURN_STARTED_SESSIONS:
+        raise SessionSpawnError(
+            f"This turn already started {MAX_TURN_STARTED_SESSIONS} sessions, "
+            "the most one turn may. Do the rest of the work here, or tell the "
+            "user.",
+            reason=SESSION_LIMIT_STARTED_SESSIONS,
         )
     inherited = origin.settings
     model, reasoning_effort = _model_choice(args, origin)
@@ -211,7 +258,10 @@ async def run_start_session(
         model=model,
         reasoning_effort=reasoning_effort,
         approval_policy=inherited.approval_policy,
+        hops=origin.hops + 1,
     )
+    # Counted before the client answers, so starts made at once see each other.
+    origin.count_turn_start(1)
     try:
         async with asyncio.timeout(SPAWN_TIMEOUT_SECONDS):
             spawned = await spawner.spawn_session(params)
@@ -223,9 +273,14 @@ async def run_start_session(
             "started. Do not start it again before the user has checked their "
             "sessions."
         ) from exc
+    except BaseException:
+        # Refused, so no session exists; a timeout above keeps the slot.
+        origin.count_turn_start(-1)
+        raise
     title = spawned.title or args.title
     return StartSessionResult(
-        session_id=spawned.session_id,
+        # The client's id is the one its peer tools take.
+        session_id=spawned.client_session_id or spawned.session_id,
         title=title,
         url=spawned.url,
         message=_started_message(title, spawned.url),
@@ -239,9 +294,14 @@ def _model_choice(
     offered, so that model's default applies.
     """
     inherited = origin.settings
-    model = args.model or inherited.model
+    picked = (
+        origin.model_names.get(args.model, args.model)
+        if args.model is not None
+        else None
+    )
+    model = picked or inherited.model
     offered = {candidate.alias: candidate for candidate in origin.models}
-    if args.model is not None and args.model not in offered:
+    if picked is not None and picked not in offered:
         raise SessionSpawnError(
             f"There is no model {args.model!r}. Pick one of: {', '.join(offered)}."
         )
@@ -270,6 +330,8 @@ def _escape_link_label(label: str) -> str:
 
 
 __all__ = [
+    "MAX_SESSION_HOPS",
+    "MAX_TURN_STARTED_SESSIONS",
     "SPAWN_TIMEOUT_SECONDS",
     "START_SESSION_TOOL_DESCRIPTION",
     "START_SESSION_TOOL_NAME",

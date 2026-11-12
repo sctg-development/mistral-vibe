@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::app::App;
+use crate::app::{App, Severity};
 use crate::observability::level::{self, LogLevelChain, DEFAULT_LOG_LEVEL, LOG_LEVELS};
 use crate::server::Client;
 
@@ -117,9 +117,9 @@ pub fn apply_event(app: &mut App, event: Event) {
         // Nothing else reconciles this tier -- `config/read` only runs at
         // startup -- so an unpersisted level must not stay in the chain.
         level::set_config_log_level(restore.as_deref());
-        crate::ui::notice::show(app, &format!("Failed to persist log level: {error}"), 4);
+        let message = format!("Failed to persist log level: {error}");
+        crate::notices::inline(app, Severity::Error, &message);
     }
-    app.commit_finished();
 }
 
 /// Esc applies: the session tier lands in-process, the config tier is persisted.
@@ -145,7 +145,12 @@ pub fn apply(app: &mut App, client: &Arc<Client>) {
         );
     }
     let chain = level::get_log_level_chain();
-    crate::ui::notice::show(app, &feedback(&previous, &chain, config_cleared), 4);
+    crate::ui::notice::show(
+        app,
+        Severity::Information,
+        &feedback(&previous, &chain, config_cleared),
+        4,
+    );
 }
 
 /// Only report what actually moved.
@@ -179,23 +184,17 @@ fn write_config(
     let Some(session_id) = app.session.session_id.clone() else {
         return;
     };
-    let tx = app.log_level_picker.tx.clone();
     let client = client.clone();
-    let pending = app.commit_started();
-    tokio::spawn(async move {
+    crate::ui_event::spawn(app, async move {
         let op = if cleared {
             json!({"op": "remove", "path": LOG_LEVEL_PATH, "targetLayer": null})
         } else {
             json!({"op": "set", "path": LOG_LEVEL_PATH, "value": level, "targetLayer": null})
         };
-        let event =
-            match crate::config_write::write(&client, &session_id, vec![op], "log level picker")
-                .await
-            {
-                Ok(_) => Event::Applied,
-                Err(error) => Event::Failed { error, restore },
-            };
-        crate::input::deliver(tx, event, &pending).await;
+        match crate::config_write::write(&client, &session_id, vec![op], "log level picker").await {
+            Ok(_) => Event::Applied,
+            Err(error) => Event::Failed { error, restore },
+        }
     });
 }
 

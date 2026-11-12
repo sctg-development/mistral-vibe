@@ -20,20 +20,30 @@ pytest.importorskip("mistralai_vibe_local_harness.vibe")
 
 from tests.stubs.local_sandbox import (
     EXECUTE_COMPLETION,
+    FakeFailingSandbox,
     RecordingSandbox,
     ScriptedModel,
     build_trusted_project,
     run_turn,
 )
+from vibe.app_server._model import validate_wire
 from vibe.app_server._sandbox_skills import SKILLS_DIRNAME, SandboxSkills
 from vibe.app_server.local import (
     ClientDescriptor,
     LocalHarnessHost,
     LocalHarnessOptions,
 )
-from vibe.app_server.protocol import ClientCapabilities, ClientInfo, SessionOptions
+from vibe.app_server.models import SkillSummary
+from vibe.app_server.protocol import (
+    ClientCapabilities,
+    ClientInfo,
+    ConfigReadParams,
+    ConfigReadResponse,
+    SessionOptions,
+    SkillsSetEnabledParams,
+)
 from vibe.core.agents.models import BuiltinAgentName
-from vibe.core.skills.models import SkillInfo
+from vibe.core.skills.models import RegistryRef, SkillInfo
 
 pytestmark = [
     # Whole sessions with subprocess tools: slower than a unit test under load.
@@ -43,14 +53,22 @@ pytestmark = [
     ),
 ]
 
+
 _TASK = "SKILL_TASK"
+
+
 _BUILTIN_SKILLS = Path(__file__).parents[2] / "vibe/plugins/builtins/vibe/skills"
+
+
 # Only the commands that write a copy carry these: the helper's install
 # operation, and the file a large request is streamed into.
 _INSTALL_MARKER = " skills-install "
+
+
 _UPLOAD_MARKERS = (_INSTALL_MARKER, "mistralai-vibe-request-")
+
+
 _BASE_DIR = re.compile(r"Base directory for this skill: ([^\\\n]+)")
-_SKILL_PATH = re.compile(r"<path>([^<]+/SKILL\.md)</path>")
 
 
 @pytest.fixture
@@ -149,9 +167,9 @@ async def test_the_builtin_skills_are_copied_once_and_reused_by_a_later_run(
     *Do*: Run a session that loads the built-in `vibe:vibe` skill, then a
     second one on the same sandbox.
     *Assert*: The first run uploads once, and its copies hold the built-in
-    skills' files; the model is told sandbox paths for every skill and for the
-    loaded one's base directory; the second run uploads nothing and is told
-    the same paths; neither touches the workspace.
+    skills' files; the model is told the loaded skill's sandbox base
+    directory; the second run uploads nothing and is told the same directory;
+    neither touches the workspace.
     """
     # Do
     first, first_input = await _run_skill(project, monkeypatch, "vibe:vibe")
@@ -172,19 +190,12 @@ async def test_the_builtin_skills_are_copied_once_and_reused_by_a_later_run(
     assert _uploads(second) == []
 
     root = f"{sandbox_tmp}/{SKILLS_DIRNAME}/"
-    paths = _SKILL_PATH.findall(first_input)
-    assert len(paths) == len(builtins)
-    assert all(path.startswith(root) for path in paths)
-    assert {path.removeprefix(root).removesuffix("/SKILL.md") for path in paths} == (
-        set(copies)
-    )
     vibe_digest = next(
         digest
         for digest, copy in copies.items()
         if copy["SKILL.md"] == builtins["vibe"]
     )
     assert _BASE_DIR.findall(first_input) == [f"{root}{vibe_digest}"]
-    assert _SKILL_PATH.findall(second_input) == paths
     assert _BASE_DIR.findall(second_input) == [f"{root}{vibe_digest}"]
     assert str(_BUILTIN_SKILLS) not in first_input
     assert _workspace_changes(project) == ""
@@ -221,7 +232,6 @@ async def test_a_user_skill_is_copied_with_its_files(
     assert sorted(copy) == ["SKILL.md", "scripts/run.sh"]
     base_dir = f"{sandbox_tmp}/{SKILLS_DIRNAME}/{digest}"
     assert _BASE_DIR.findall(model_input) == [base_dir]
-    assert f"<path>{base_dir}/SKILL.md</path>" in model_input
     assert "<file>scripts/run.sh</file>" in model_input
     assert str(skill_dir) not in model_input
     assert _workspace_changes(project) == ""
@@ -251,7 +261,6 @@ async def test_a_project_skill_is_read_in_the_sandbox_and_wins_over_a_user_skill
     assert "Project release." in model_input
     assert "User release." not in model_input
     assert _BASE_DIR.findall(model_input) == [str(skill_dir)]
-    assert f"<path>{skill_dir}/SKILL.md</path>" in model_input
     assert "<file>checklist.md</file>" in model_input
     assert not any(
         b"Project release." in copy["SKILL.md"]
@@ -381,6 +390,47 @@ async def test_a_skill_over_the_size_limits_is_left_out(
 
 
 @pytest.mark.asyncio
+async def test_a_skill_every_copy_leaves_out_is_logged_once_and_reported_each_time(
+    tmp_path: Path, project: Path, sandbox_tmp: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    large = _host_skill(
+        tmp_path / "host" / "large", "large", files={"a.bin": b"x" * (257 * 1024)}
+    )
+    skills = SandboxSkills(RecordingSandbox(project))
+
+    with caplog.at_level(logging.WARNING):
+        reported = [await skills.install([large]) for _ in range(3)]
+
+    assert [[issue.file for issue in issues] for issues in reported] == [
+        [str(large.skill_path)]
+    ] * 3
+    dropped = [r for r in caplog.records if "Dropped skill" in r.getMessage()]
+    assert len(dropped) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_that_cannot_list_skills_leaves_out_only_those_without_a_copy(
+    tmp_path: Path, project: Path, sandbox_tmp: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    notes = _host_skill(tmp_path / "host" / "notes", "notes", files={})
+    fresh = _host_skill(tmp_path / "host" / "fresh", "fresh", files={})
+    sandbox = FakeFailingSandbox(project)
+    skills = SandboxSkills(sandbox)
+    await skills.install([notes])
+    sandbox.failing["skills-scan"] = "the helper is gone"
+
+    with caplog.at_level(logging.WARNING):
+        reported = [await skills.install([notes, fresh]) for _ in range(2)]
+
+    assert [[issue.file for issue in issues] for issues in reported] == [
+        [str(fresh.skill_path)]
+    ] * 2
+    assert skills.locate(notes) is not None
+    unlisted_logs = [r for r in caplog.records if "not list them" in r.getMessage()]
+    assert len(unlisted_logs) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_skills_directory_others_can_write_is_not_used(
     tmp_path: Path, project: Path, sandbox_tmp: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -407,3 +457,50 @@ async def test_a_skills_directory_others_can_write_is_not_used(
     assert issue.file == str(skill.skill_path)
     assert "other users can reach" in issue.message
     assert any("other users can reach" in r.getMessage() for r in caplog.records)
+
+
+def _registry_skill(
+    directory: Path, name: str, *, version: int, alias: str | None = "latest"
+) -> SkillInfo:
+    """``alias`` None pins the version's number."""
+    skill = _host_skill(directory, name, files={})
+    return skill.model_copy(
+        update={"registry": RegistryRef(skill_id="cid", version=version, alias=alias)}
+    )
+
+
+@pytest.mark.asyncio
+async def test_skills_lists_the_sandboxs_project_skills_and_turns_them_off(
+    project: Path, sandbox_tmp: Path
+) -> None:
+    _write_skill(project / ".agents" / "skills" / "release", "release", "Release.")
+    host = LocalHarnessHost()
+    session = await host.start(_options(RecordingSandbox(project)))
+
+    try:
+        skills = session.resources.skills
+        listed = await skills.read_installed()
+        client = await skills._connection.connect()
+        summary = validate_wire(
+            ConfigReadResponse,
+            await client.request(
+                "config/read", ConfigReadParams(session_id=session.session_id)
+            ),
+        )
+        relisted = await skills._mutate(
+            "skills/setEnabled",
+            SkillsSetEnabledParams(
+                session_id=session.session_id, name="release", enabled=False
+            ),
+        )
+    finally:
+        await session.close()
+        await host.close()
+
+    def release(rows: list[SkillSummary]) -> tuple[str, bool, bool]:
+        (row,) = [row for row in rows if row.name == "release"]
+        return row.scope, row.enabled, row.locked
+
+    assert release(listed) == ("project", True, False)
+    assert summary.skills_count == 1
+    assert release(relisted) == ("project", False, False)

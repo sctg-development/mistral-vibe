@@ -9,6 +9,7 @@ from threading import Event
 from git import Repo
 import pytest
 
+from tests.stubs.background_worker import in_process_worktree_housekeeping
 from vibe.app_server._worktree_cleanup import WorktreeCleanup, session_finished
 from vibe.app_server._worktree_session import SessionWorktrees
 from vibe.core.git.worktree import (
@@ -18,6 +19,7 @@ from vibe.core.git.worktree import (
     WorktreeRepository,
 )
 from vibe.core.git.worktree.record import WorktreeClaim
+from vibe.core.trusted_folders import TrustedFoldersManager
 
 
 def _init_repo(root: Path) -> Repo:
@@ -199,10 +201,15 @@ def test_a_failed_reap_does_not_stop_later_cleanup(
     other, _ = _managed_worktree(tmp_path, "other")
     reap_if_finished = ManagedWorktree.reap_if_finished
 
-    def fail_first(managed: ManagedWorktree, finished: SessionFinished) -> object:
+    def fail_first(
+        managed: ManagedWorktree,
+        finished: SessionFinished,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+    ) -> object:
         if managed.claim == failing_managed.claim:
             raise OSError("disk unavailable")
-        return reap_if_finished(managed, finished)
+        return reap_if_finished(managed, finished, trust_store=trust_store)
 
     monkeypatch.setattr(ManagedWorktree, "reap_if_finished", fail_first)
 
@@ -262,13 +269,11 @@ def test_releasing_the_final_session_hold_removes_an_archived_worktree(
     _init_repo(tmp_path)
     worktree, managed = _managed_worktree(tmp_path, "closing")
     service = WorktreeCleanup(session_finished=_archived)
-    monkeypatch.setattr(
-        "vibe.app_server._worktree_session.worktree_cleanup", lambda: service
-    )
+    worktrees = SessionWorktrees(housekeeping=in_process_worktree_housekeeping(service))
     managed.hold("session-a")
 
     # Do
-    SessionWorktrees.release(worktree.root, "session-a")
+    worktrees.release(worktree.root, "session-a")
 
     # Assert
     assert service.wait_idle(timeout=30)
@@ -284,11 +289,16 @@ def test_a_reap_that_fails_once_is_retried(
     reap_if_finished = ManagedWorktree.reap_if_finished
     attempts: list[int] = []
 
-    def fail_once(target: ManagedWorktree, finished: SessionFinished) -> object:
+    def fail_once(
+        target: ManagedWorktree,
+        finished: SessionFinished,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+    ) -> object:
         attempts.append(1)
         if len(attempts) == 1:
             raise OSError("index.lock exists")
-        return reap_if_finished(target, finished)
+        return reap_if_finished(target, finished, trust_store=trust_store)
 
     monkeypatch.setattr(ManagedWorktree, "reap_if_finished", fail_once)
 
@@ -309,7 +319,12 @@ def test_retries_stop_after_the_last_delay(
     worktree, _ = _managed_worktree(tmp_path, "broken")
     attempts: list[int] = []
 
-    def always_fail(_target: ManagedWorktree, _finished: SessionFinished) -> object:
+    def always_fail(
+        _target: ManagedWorktree,
+        _finished: SessionFinished,
+        *,
+        trust_store: TrustedFoldersManager | None = None,
+    ) -> object:
         attempts.append(1)
         raise OSError("disk unavailable")
 
@@ -356,3 +371,129 @@ def test_a_session_with_unreadable_metadata_keeps_its_worktree(tmp_path: Path) -
     (session_dir / "meta.json").write_text("{not json")
 
     assert session_finished(session_dir) is False
+
+
+@pytest.mark.parametrize("trust", ["untrusted", "session", "persisted"])
+def test_background_worker_uses_injected_persisted_source_policy(
+    tmp_path: Path, trust: str
+) -> None:
+    from vibe.core.trusted_folders import trusted_folders_manager
+
+    root = tmp_path / "source"
+    repo = _init_repo(root)
+    marker = tmp_path / "clean-ran"
+    repo.git.config("filter.cleanup.clean", f"echo clean >> '{marker}'; sed 's/^S://'")
+    repo.git.config("filter.cleanup.smudge", "sed 's/^/S:/'")
+    (root / ".gitattributes").write_text("*.txt filter=cleanup\n")
+    repo.index.add([".gitattributes"])
+    repo.index.commit("filter")
+    store = trusted_folders_manager.for_session()
+    if trust == "persisted":
+        store.add_trusted(root)
+    elif trust == "session":
+        store.trust_for_session(root)
+    # The global singleton's temporary grant must never authorize this worker.
+    trusted_folders_manager.trust_for_session(root)
+    worktree, managed = _managed_worktree(root, "background-filter")
+    (worktree.root / "file.txt").write_text("S:changed\n")
+    marker.unlink(missing_ok=True)
+    service = WorktreeCleanup(
+        session_finished=_archived, retry_delays=(), trust_store=store
+    )
+    service.schedule(worktree.root)
+    assert service.wait_idle(timeout=30)
+    if trust == "persisted":
+        recovery = managed.claim.read_recovery()
+        assert recovery is not None
+        assert marker.exists()
+        assert repo.git.show(f"{recovery.snapshot_ref}:file.txt") == "changed"
+    else:
+        assert worktree.root.exists()
+        assert (worktree.root / "file.txt").read_text() == "S:changed\n"
+        assert managed.claim.read_recovery() is None
+        assert not marker.exists()
+    repo.close()
+
+
+def _break_checkout(root: Path) -> None:
+    (root / ".git").unlink()
+
+
+def test_a_broken_checkout_is_reported_once_then_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """*Prepare*: A finished worktree whose checkout lost its `.git`.
+    *Do*: Reap it, sweep, and prune it, again and again.
+    *Assert*: One warning, no retry scheduled, and the directory is kept.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    worktree, _ = _managed_worktree(tmp_path, "lost-git")
+    _break_checkout(worktree.root)
+    cleanup = WorktreeCleanup(session_finished=_archived, retry_delays=(0.01,) * 3)
+
+    # Do
+    with caplog.at_level("WARNING", logger="vibe"):
+        for _ in range(3):
+            cleanup.schedule(worktree.root)
+            assert cleanup.wait_idle(timeout=30)
+            cleanup.sweep()
+            assert cleanup.wait_idle(timeout=30)
+        cleanup.prune(0)
+
+    # Assert
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert [r.getMessage() for r in warnings] == [warnings[0].getMessage()], (
+        "reported more than once"
+    )
+    assert "checkout is broken" in warnings[0].getMessage()
+    assert worktree.root.is_dir()
+
+
+def test_a_broken_checkout_is_looked_at_again_once_it_changes(tmp_path: Path) -> None:
+    """*Prepare*: A broken worktree already reported.
+    *Do*: Repair its checkout, then reap it.
+    *Assert*: The reap runs and removes it.
+    """
+    # Prepare
+    _init_repo(tmp_path)
+    worktree, _ = _managed_worktree(tmp_path, "repaired")
+    git_file = (worktree.root / ".git").read_text()
+    _break_checkout(worktree.root)
+    cleanup = WorktreeCleanup(session_finished=_archived, retry_delays=())
+    cleanup.schedule(worktree.root)
+    assert cleanup.wait_idle(timeout=30)
+
+    # Do
+    (worktree.root / ".git").write_text(git_file)
+    cleanup.schedule(worktree.root)
+
+    # Assert
+    assert cleanup.wait_idle(timeout=30)
+    assert not worktree.root.exists()
+
+
+def test_prune_skips_a_broken_checkout_and_removes_the_next_oldest(
+    tmp_path: Path,
+) -> None:
+    _init_repo(tmp_path)
+    with WorktreeRepository.open(tmp_path) as repository:
+        broken = repository.prepare_auto(suggested_name="broken")
+        oldest_whole = repository.prepare_auto(suggested_name="whole")
+        newest = repository.prepare_auto(suggested_name="newest")
+    for prepared in (broken, oldest_whole, newest):
+        managed = ManagedWorktree.at(prepared.root)
+        assert managed is not None
+        managed.hold("starter")
+        managed.release_holder("starter")
+    _break_checkout(broken.root)
+    cleanup = WorktreeCleanup(session_finished=lambda _dir: False)
+
+    # Over the limit by one: a broken checkout is skipped, as a failed
+    # removal always was, so the next oldest goes in its place.
+    removed = cleanup.prune(2)
+
+    assert removed == 1
+    assert broken.root.is_dir()
+    assert not oldest_whole.root.exists()
+    assert newest.root.is_dir()

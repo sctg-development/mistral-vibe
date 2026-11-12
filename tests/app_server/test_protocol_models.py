@@ -261,6 +261,16 @@ def test_agent_config_carries_app_server_and_vibe_launch_fields() -> None:
     assert config.tools[0].input_schema == {"type": "object"}
 
 
+@pytest.mark.parametrize(
+    "project", [{"kind": "local"}, {"kind": "cloud", "id": ""}, {"kind": "none"}]
+)
+def test_session_start_rejects_a_project_stamp_without_a_project(
+    project: dict[str, str],
+) -> None:
+    with pytest.raises(ValidationError):
+        validate_wire(SessionStartParams, {"project": project})
+
+
 def test_session_start_wraps_vibe_configuration_in_agent_config() -> None:
     params = SessionStartParams(
         agent_config=AgentConfig(cwd="/workspace", headless=True), history_limit=100
@@ -287,9 +297,12 @@ def test_session_start_wraps_vibe_configuration_in_agent_config() -> None:
             "headless": True,
             "trustWorkspace": False,
             "mcpServers": [],
+            "terminalKey": None,
+            "systemPrompt": None,
         },
         "historyLimit": 100,
         "idempotencyKey": None,
+        "project": None,
         "kind": "normal",
         "title": None,
         "model": None,
@@ -298,6 +311,11 @@ def test_session_start_wraps_vibe_configuration_in_agent_config() -> None:
         "firstTurn": None,
         "startedBySessionId": None,
     }
+
+
+def test_a_blank_session_system_prompt_is_refused() -> None:
+    with pytest.raises(ValidationError, match="system prompt must not be blank"):
+        AgentConfig(system_prompt=" \n")
 
 
 def test_initialize_accepts_the_desktop_entrypoint_off_the_wire() -> None:
@@ -995,3 +1013,21 @@ def test_validate_backend_wire_still_requires_fields_without_defaults() -> None:
 
     with pytest.raises(ValidationError):
         validate_backend_wire(_Needs, {"unrelated": 1})
+
+
+def test_cumulative_budgets_validate_values_in_every_mode() -> None:
+    """*Prepare*: Interactive and headless session configs with cumulative budgets.
+    *Do*: Validate zero, interactive, negative, and non-finite budget values.
+    *Assert*: Budgets need no headless flag; negative and non-finite values fail.
+    """
+    # Prepare / Do / Assert
+    config = AgentConfig(headless=True, max_session_tokens=0, max_price=0)
+    assert config.max_session_tokens == 0
+    assert config.max_price == 0
+    interactive = AgentConfig(max_session_tokens=10, max_price=1.5)
+    assert interactive.max_session_tokens == 10
+    assert interactive.max_price == 1.5
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        AgentConfig(max_session_tokens=-1)
+    with pytest.raises(ValueError, match="finite number"):
+        AgentConfig(max_price=float("nan"))

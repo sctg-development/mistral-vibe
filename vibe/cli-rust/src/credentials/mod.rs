@@ -5,12 +5,17 @@
 pub mod api_keys;
 pub mod dotenv;
 pub mod keyring;
+pub mod oidc;
 
 /// A non-empty process env value first (empty reads as absent), then the OS
 /// keyring — the single
 /// `ai.mistral.vibe` service only; the legacy `vibe` migration stays on the
 /// server path.
 pub fn resolve_api_key(env_key: &str) -> Option<String> {
+    if env_key == "MISTRAL_API_KEY" && oidc::enabled() {
+        // Optimistic: the server's handshake decides whether a session is stored.
+        return Some(oidc::API_KEY_MARKER.into());
+    }
     if env_key.is_empty() {
         return None;
     }

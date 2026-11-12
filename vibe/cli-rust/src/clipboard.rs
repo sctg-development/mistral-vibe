@@ -1,13 +1,26 @@
-//! Clipboard I/O: the native platform tool with an OSC 52 fallback.
+//! Clipboard I/O: the native platform tool, then tmux forwarding or an OSC 52 fallback.
+
+mod tmux;
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 
+/// Hint shown when the native copy is unverified.
+pub const NATIVE_COPY_HINT: &str =
+    "if paste fails, Shift+select (Option in iTerm2, Fn in Terminal.app)";
+/// Local Linux/BSD hint: VTE terminals ignore OSC 52, so suggest native selection or a clipboard tool.
+pub const LINUX_COPY_HINT: &str = "if paste fails, Shift+select or install xclip";
+
 /// Clipboard port: the only side-effecting clipboard surface.
 pub trait Clipboard: Send + Sync {
     /// Copy `text` to the clipboard, returning whether the native copy was verified.
     fn copy(&self, text: &str) -> bool;
+
+    /// Hint appended to the notice of an unverified copy.
+    fn unverified_hint(&self) -> &'static str {
+        NATIVE_COPY_HINT
+    }
 }
 
 /// Production adapter: native tool plus OSC 52 fallback.
@@ -23,8 +36,18 @@ impl Clipboard for SystemClipboard {
         } else {
             copy_native(text)
         };
-        copy_osc52(text);
+        if !tmux::copy(text) {
+            copy_osc52(text);
+        }
         verified
+    }
+
+    fn unverified_hint(&self) -> &'static str {
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && !is_ssh_session() {
+            LINUX_COPY_HINT
+        } else {
+            NATIVE_COPY_HINT
+        }
     }
 }
 
@@ -58,12 +81,18 @@ pub fn copy_to_clipboard(text: &str) -> bool {
         .copy(text)
 }
 
+/// Hint for an unverified copy from the installed sink, the generic one without a sink.
+pub fn unverified_hint() -> &'static str {
+    SINK.get()
+        .map_or(NATIVE_COPY_HINT, |sink| sink.unverified_hint())
+}
+
 /// Skip the native tool over SSH so OSC 52 carries the copy.
 fn is_ssh_session() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
 }
 
-/// Pipe `text` into the platform clipboard tool (pbcopy/wl-copy/xclip/xsel/clip).
+/// Pipe `text` into the first platform clipboard tool that succeeds (pbcopy/wl-copy/xclip/xsel/clip).
 fn copy_native(text: &str) -> bool {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
@@ -76,25 +105,29 @@ fn copy_native(text: &str) -> bool {
             ("xsel", &["--clipboard", "--input"]),
         ]
     };
-    for (program, args) in candidates {
-        let Ok(mut child) = Command::new(program)
-            .args(*args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            continue; // tool not installed; try the next one
-        };
-        let wrote = child
-            .stdin
-            .take()
-            .map(|mut stdin| stdin.write_all(text.as_bytes()).is_ok())
-            .unwrap_or(false);
-        let status = child.wait();
-        return wrote && status.map(|s| s.success()).unwrap_or(false);
-    }
-    false
+    // A missing tool, or e.g. wl-copy outside Wayland, falls through to the next one.
+    candidates
+        .iter()
+        .any(|(program, args)| pipe(program, args, text))
+}
+
+/// Pipe `text` into `program`, returning whether it ran and exited successfully.
+fn pipe(program: &str, args: &[&str], text: &str) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let wrote = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    let succeeded = child.wait().is_ok_and(|status| status.success());
+    wrote && succeeded
 }
 
 /// Copy `text` via OSC 52 on stdout, tmux-passthrough wrapped.

@@ -9,8 +9,13 @@ from typing import Annotated, cast
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints
 
 from mistralai_vibe_local_harness.protocol import (
+    RustContentBlock,
+    RustEnabledFileSystem,
+    RustImageContentBlock,
     RustProtocolError,
+    RustReadFileSupport,
     RustRuntimeBuiltinToolCallAction,
+    RustTextContentBlock,
     RustToolFailedEvent,
     RustToolFailureResult,
     RustToolSucceededEvent,
@@ -25,6 +30,9 @@ from mistralai_vibe_local_harness.vibe._sandbox import (
 )
 from mistralai_vibe_local_harness.vibe._sandbox_helper import FileToolName
 
+FILE_SYSTEM = RustEnabledFileSystem(read_file=RustReadFileSupport(images="native"))
+"""The file system tools of a Vibe Session: ``read_file`` returns an image file
+as the image itself, which Core shows to a model that reads images."""
 DEFAULT_LINE_LIMIT = _sandbox_helper.DEFAULT_LINE_LIMIT
 MAX_READ_BYTES = _sandbox_helper.MAX_READ_BYTES
 MAX_WRITE_BYTES = _sandbox_helper.MAX_WRITE_BYTES
@@ -76,31 +84,27 @@ class WriteFileAnnotations(BaseModel):
     previous_content: str
 
 
-class SearchReplaceBlock(BaseModel):
-    old_str: str = Field(min_length=1)
-    new_str: str
+class EditArgs(BaseModel):
+    file_path: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    old_string: str = Field(min_length=1)
+    new_string: str
     replace_all: bool = False
 
 
-class SearchReplaceArgs(BaseModel):
-    file_path: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
-    content: list[SearchReplaceBlock] = Field(min_length=1)
-
-
-class SearchReplaceResult(BaseModel):
+class EditResult(BaseModel):
     file: str
     lines_changed: int
     warnings: list[str] = Field(default_factory=list)
 
 
-class SearchReplacePreviewBlock(BaseModel):
+class EditPreviewBlock(BaseModel):
     old_start_line: int
     new_start_line: int
     old_lines: list[str]
     new_lines: list[str]
 
 
-class SearchReplaceAnnotations(BaseModel):
+class EditAnnotations(BaseModel):
     """Applied replacement previews and the text the edit replaced.
 
     ``previous_content`` is the file's whole pre-edit text, carried so readers
@@ -109,16 +113,31 @@ class SearchReplaceAnnotations(BaseModel):
     UTF-8 or was larger than the write annotation cap.
     """
 
-    blocks: list[SearchReplacePreviewBlock]
+    blocks: list[EditPreviewBlock]
     previous_content: str | None = None
+
+
+class ReadFileImage(BaseModel):
+    data: str
+    mime_type: str
 
 
 class ReadFileResponse(BaseModel):
     result: ReadFileResult
     annotations: None = None
+    image: ReadFileImage | None = None
 
     def meta(self) -> dict[str, JsonValue] | None:
         return None
+
+    def content(self) -> list[RustContentBlock]:
+        """What the model reads: the image a read returned, after the result."""
+        if self.image is None:
+            return []
+        return [
+            RustTextContentBlock(text=self.result.model_dump_json()),
+            RustImageContentBlock(data=self.image.data, mime_type=self.image.mime_type),
+        ]
 
 
 class WriteFileResponse(BaseModel):
@@ -131,17 +150,23 @@ class WriteFileResponse(BaseModel):
         previous = WriteFileAnnotations(previous_content=self.annotations)
         return {WRITE_FILE_ANNOTATION_KEY: previous.model_dump(mode="json")}
 
+    def content(self) -> list[RustContentBlock]:
+        return []
 
-class SearchReplaceResponse(BaseModel):
-    result: SearchReplaceResult
-    annotations: list[SearchReplacePreviewBlock]
+
+class EditResponse(BaseModel):
+    result: EditResult
+    annotations: list[EditPreviewBlock]
     previous_content: str | None = None
 
     def meta(self) -> dict[str, JsonValue] | None:
-        previews = SearchReplaceAnnotations(
+        previews = EditAnnotations(
             blocks=self.annotations, previous_content=self.previous_content
         )
         return {SEARCH_REPLACE_ANNOTATION_KEY: previews.model_dump(mode="json")}
+
+    def content(self) -> list[RustContentBlock]:
+        return []
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,18 +174,14 @@ class FileTool:
     """How one file tool's arguments and helper response are read."""
 
     name: FileToolName
-    arguments: type[ReadFileArgs] | type[WriteFileArgs] | type[SearchReplaceArgs]
-    response: (
-        type[ReadFileResponse] | type[WriteFileResponse] | type[SearchReplaceResponse]
-    )
+    arguments: type[ReadFileArgs] | type[WriteFileArgs] | type[EditArgs]
+    response: type[ReadFileResponse] | type[WriteFileResponse] | type[EditResponse]
 
 
 FILE_TOOLS: Mapping[str, FileTool] = {
     "file_system.read_file": FileTool("read_file", ReadFileArgs, ReadFileResponse),
     "file_system.write_file": FileTool("write_file", WriteFileArgs, WriteFileResponse),
-    "file_system.search_replace": FileTool(
-        "search_replace", SearchReplaceArgs, SearchReplaceResponse
-    ),
+    "file_system.edit": FileTool("edit", EditArgs, EditResponse),
 }
 
 
@@ -197,7 +218,10 @@ async def execute_file_tool(
     except (OSError, UnicodeError, ValueError) as exc:
         return _failed(action, str(exc))
     return _succeeded(
-        action, response.result.model_dump(mode="json"), meta=response.meta()
+        action,
+        response.result.model_dump(mode="json"),
+        content=response.content(),
+        meta=response.meta(),
     )
 
 
@@ -218,20 +242,20 @@ async def _run_file_tool(
     authorized_path: Path | None,
 ) -> JsonValue:
     sandbox = config.sandbox
+    raw_path = arguments[_sandbox_helper.FILE_TOOL_PATH_KEYS[tool.name]]
     on_host = sandbox is None or (
         tool.name == "read_file"
         and _is_within(
-            authorized_path
-            or sandbox_path(
-                str(arguments[_sandbox_helper.FILE_TOOL_PATH_KEYS[tool.name]]),
-                cwd=config.workspace.cwd,
-            ),
+            authorized_path or sandbox_path(str(raw_path), cwd=config.workspace.cwd),
             additional_read_roots,
         )
     )
     request = {
         "tool": tool.name,
         "arguments": arguments,
+        # A new file's default line ending comes from the platform on the
+        # user's machine, and from nearby files in a sandbox.
+        "sandbox": not on_host,
         "policy": _path_policy(
             config,
             authorized_path,
@@ -247,15 +271,56 @@ async def _run_file_tool(
             ),
         ),
     }
-    if on_host or sandbox is None:
-        return await asyncio.to_thread(_sandbox_helper.run_file_tool, request)
-    return await run_helper(
-        sandbox,
-        "file",
-        request,
-        timeout=SANDBOX_FILE_TOOL_TIMEOUT_SECONDS,
-        crashes=config.helper_crashes,
-    )
+    # The provider is asked for parallel tool calls, so two calls can target
+    # one file in the same turn. Both read the pre-edit text before either
+    # writes, and the atomic rename makes the loser's edit vanish without an
+    # error, so writes to one path are serialised. Reads share the lock too:
+    # one that interleaves a write returns either the whole before-state or
+    # the whole after-state, never a torn one.
+    async with _file_tool_lock(raw_path, config, authorized_path):
+        if on_host or sandbox is None:
+            return await asyncio.to_thread(_sandbox_helper.run_file_tool, request)
+        return await run_helper(
+            sandbox,
+            "file",
+            request,
+            timeout=SANDBOX_FILE_TOOL_TIMEOUT_SECONDS,
+            crashes=config.helper_crashes,
+        )
+
+
+_FILE_TOOL_LOCKS: dict[str, asyncio.Lock] = {}
+_FILE_TOOL_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _file_tool_lock(
+    raw_path: JsonValue, config: LocalRuntimeAdapterConfig, authorized: Path | None
+) -> asyncio.Lock:
+    # Locks belong to one event loop; a stale lock from another loop is never
+    # taken, so the table is rebuilt when the loop changes.
+    global _FILE_TOOL_LOCK_LOOP
+    loop = asyncio.get_running_loop()
+    if _FILE_TOOL_LOCK_LOOP is not loop:
+        _FILE_TOOL_LOCKS.clear()
+        _FILE_TOOL_LOCK_LOOP = loop
+    if authorized is not None:
+        key = str(authorized)
+    elif config.sandbox is None:
+        target = Path(str(raw_path)).expanduser()
+        if not target.is_absolute():
+            target = Path(config.workspace.cwd) / target
+        key = str(target.resolve())
+    else:
+        # This host's file system may not hold the path, or may link it
+        # elsewhere, so the key is the sandbox-normalized path as written,
+        # the same normalization the sandbox applies. A ``~`` path stays
+        # unexpanded because the sandbox's home is unknown here, so ``~/a``
+        # and its expanded spelling still take different locks.
+        key = str(sandbox_path(str(raw_path), cwd=config.workspace.cwd))
+    lock = _FILE_TOOL_LOCKS.get(key)
+    if lock is None:
+        lock = _FILE_TOOL_LOCKS[key] = asyncio.Lock()
+    return lock
 
 
 def _read_roots(
@@ -311,10 +376,12 @@ def _succeeded(
     action: RustRuntimeBuiltinToolCallAction,
     structured_content: dict[str, JsonValue],
     *,
+    content: list[RustContentBlock],
     meta: dict[str, JsonValue] | None = None,
 ) -> RustToolSucceededEvent:
     result: dict[str, JsonValue] = {
-        "structured_content": cast(JsonValue, structured_content)
+        "content": [block.model_dump(mode="json") for block in content],
+        "structured_content": cast(JsonValue, structured_content),
     }
     if meta is not None:
         result["_meta"] = cast(JsonValue, meta)
@@ -339,4 +406,4 @@ def _failed(
     )
 
 
-__all__ = ["execute_file_tool"]
+__all__ = ["FILE_SYSTEM", "execute_file_tool"]

@@ -12,15 +12,9 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-env = {
-    "VIBE_REPLAY_SETTLE_BUSY": "1",
-    "VIBE_TYPING_GRACE_PERIOD_MS": "0",
-    "VIBE_INPUT_GRACE_PERIOD_MS": "0",
-}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0", "VIBE_INPUT_GRACE_PERIOD_MS": "0"}
 handshake = {"callback/result": {"accepted": True}}
-capture_startup = False
-capture_steps = {1, 2}
-expected_titles = ("? Vibe", "? Vibe")
+expected_titles = ("Vibe", ">> Vibe", "? Vibe", "? Vibe")
 _QUESTIONS = [{"question": "Which mode?", "options": [{"label": "Fast"}]}]
 _INPUT = {"command": "printf 'approved\\n'"}
 
@@ -36,5 +30,4 @@ timeline: Timeline = [
     "\r",
 ]
 
-settle_per_key = True
 screen_contains = ("Which mode?",)

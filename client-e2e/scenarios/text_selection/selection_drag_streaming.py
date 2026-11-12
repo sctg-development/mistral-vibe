@@ -5,9 +5,7 @@ from __future__ import annotations
 from e2e.app_server.events import assistant_delta, assistant_msg, turn_started, user_msg
 from e2e.app_server.scenario import Timeline
 
-env = {"SSH_TTY": "/dev/pts/0", "VIBE_REPLAY_SETTLE_BUSY": "1"}
-capture_startup = False
-capture_steps = {2, 3, 4, 5, 6}
+env = {"SSH_TTY": "/dev/pts/0"}
 
 _ASSISTANT_ID = "streaming-assistant"
 _LINE = "The quick brown fox jumps over the lazy dog on line {:02d}."
@@ -35,6 +33,4 @@ timeline: Timeline = [
     {"release": 1},
 ]
 
-# Each key must land on a settled UI: batching changes the outcome here.
-settle_per_key = True
 screen_contains = ("A line streamed back at the bottom.",)

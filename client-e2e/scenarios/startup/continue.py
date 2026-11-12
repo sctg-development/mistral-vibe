@@ -1,8 +1,9 @@
-"""`--continue` resumes the most recent saved session at startup."""
+"""`--continue` asks the server for this terminal's last session in the folder and resumes it."""
 
 from __future__ import annotations
 
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 client_args = ("--continue",)
-timeline: Timeline = []
+request_methods = {"session/continue"}
+timeline: Timeline = [take_snapshot()]

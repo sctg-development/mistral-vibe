@@ -53,9 +53,9 @@ fn notification_replay_is_bounded_without_losing_pending_delivery() {
     let turn_id = "notification-retention";
     let first = runtime.start_turn(turn_id, "collect results");
     let notifications = [
-        process_notification("old", "process-old", "old result"),
-        process_notification("middle", "process-middle", "middle result"),
-        process_notification("recent", "process-recent", "recent result"),
+        subagent_notification("old", "researcher", "old result"),
+        subagent_notification("middle", "researcher", "middle result"),
+        subagent_notification("recent", "researcher", "recent result"),
     ];
     for notification in &notifications {
         runtime.receive_notification(turn_id, notification, &[&first]);
@@ -106,6 +106,50 @@ fn notification_replay_is_bounded_without_losing_pending_delivery() {
         ],
     );
     runtime.finish_turn_with_text(turn_id, &third, "done");
+}
+
+/// *Prepare*: A delivered background-process notification and a restored received-only ID.
+/// *Do*: Retry the delivered ID, then restore a checkpoint that still lists the other ID.
+/// *Assert*: Delivery releases the process ID; a received entry from the checkpoint still suppresses.
+#[test]
+fn delivered_process_notification_ids_are_released_but_restored_ids_still_suppress() {
+    // Prepare
+    let turn_id = "process-notification-identity";
+    let mut runtime = SynchronousRuntime::new(config());
+    let first = runtime.start_turn(turn_id, "collect results");
+    let delivered = process_notification("delivered", "process-delivered", "build done");
+    let restored = process_notification("restored", "process-restored", "test done");
+    runtime.receive_notification(turn_id, &delivered, &[&first]);
+    let second = runtime
+        .apply(
+            text_completion(&first, "continue"),
+            running(turn_id)
+                .dispatch(llm_call(1))
+                .observe(assistant_text_committed(turn_id, &first, "continue"))
+                .observe(notification_delivered(
+                    turn_id,
+                    observed_notification(&delivered),
+                )),
+        )
+        .only_action();
+    let released_checkpoint = runtime.checkpoint_value();
+    let mut checkpoint = released_checkpoint.clone();
+    checkpoint["notifications"]
+        .as_array_mut()
+        .expect("checkpoint notifications are an array")
+        .push(json!({"type": "received", "id": "restored"}));
+
+    // Do
+    runtime.receive_notification(turn_id, &delivered, &[&second]);
+    runtime.restore_checkpoint_value(checkpoint, config());
+    runtime.apply(restored.clone(), running(turn_id).keep(&second));
+
+    // Assert
+    assert_eq!(released_checkpoint["notifications"], json!([]));
+    assert_eq!(
+        runtime.checkpoint_value()["notifications"],
+        json!([{"type": "received", "id": "restored"}])
+    );
 }
 
 /// *Prepare*: An active Session with room for one pending notification.
@@ -177,7 +221,7 @@ fn one_subagent_completion_notification_reaches_the_model() {
     let turn_id = "turn-one-subagent";
     let mut runtime = SynchronousRuntime::new(config());
     let first_completion = runtime.start_turn(turn_id, "delegate one investigation");
-    let source = "async function main() { return tools.agents.spawn({ name: 'researcher', message: 'Investigate the issue' }); }";
+    let source = "async function main() { return tools.agents.spawn({ name: 'researcher', message: 'Investigate the issue', instructions: 'Work.' }); }";
 
     // Do
     let spawn_action = runtime
@@ -188,10 +232,7 @@ fn one_subagent_completion_notification_reaches_the_model() {
             source,
             [runtime_tool(
                 "agents.spawn",
-                json!({
-                    "name": "researcher",
-                    "message": "Investigate the issue",
-                }),
+                json!({"name": "researcher", "message": "Investigate the issue", "instructions": "Work."}),
             )],
         )
         .only_action();
@@ -326,7 +367,7 @@ fn parallel_subagents_receive_messages_and_completion_notifications() {
     let turn_id = "turn-parallel-subagents";
     let mut runtime = SynchronousRuntime::new(config());
     let first_completion = runtime.start_turn(turn_id, "coordinate two researchers");
-    let spawn_source = "async function main() { return Promise.all([tools.agents.spawn({ name: 'alpha', message: 'Investigate alpha' }), tools.agents.spawn({ name: 'beta', message: 'Investigate beta' })]); }";
+    let spawn_source = "async function main() { return Promise.all([tools.agents.spawn({ name: 'alpha', message: 'Investigate alpha', instructions: 'Work.' }), tools.agents.spawn({ name: 'beta', message: 'Investigate beta', instructions: 'Work.' })]); }";
 
     // Do
     let spawn_actions = runtime
@@ -338,11 +379,11 @@ fn parallel_subagents_receive_messages_and_completion_notifications() {
             [
                 runtime_tool(
                     "agents.spawn",
-                    json!({"name": "alpha", "message": "Investigate alpha"}),
+                    json!({"name": "alpha", "message": "Investigate alpha", "instructions": "Work."}),
                 ),
                 runtime_tool(
                     "agents.spawn",
-                    json!({"name": "beta", "message": "Investigate beta"}),
+                    json!({"name": "beta", "message": "Investigate beta", "instructions": "Work."}),
                 ),
             ],
         )
@@ -759,7 +800,7 @@ fn steering_combines_subagent_and_background_process_notifications() {
     let turn_id = "turn-combined-steering";
     let mut runtime = SynchronousRuntime::new(config_with_background_processes());
     let first_completion = runtime.start_turn(turn_id, "delegate research and start the build");
-    let source = "async function main() { return Promise.all([tools.agents.spawn({ name: 'researcher', message: 'Investigate' }), tools.process.start({ command: 'build' })]); }";
+    let source = "async function main() { return Promise.all([tools.agents.spawn({ name: 'researcher', message: 'Investigate', instructions: 'Work.' }), tools.process.start({ command: 'build' })]); }";
     let tool_actions = runtime
         .complete_with_typescript_program(
             turn_id,
@@ -769,7 +810,7 @@ fn steering_combines_subagent_and_background_process_notifications() {
             [
                 runtime_tool(
                     "agents.spawn",
-                    json!({"name": "researcher", "message": "Investigate"}),
+                    json!({"name": "researcher", "message": "Investigate", "instructions": "Work."}),
                 ),
                 runtime_tool("process.start", json!({"command": "build"})),
             ],

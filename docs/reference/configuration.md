@@ -13,8 +13,29 @@ The effective order is:
 2. `ModelCatalogLayer`, materialized from the cached or fetched model catalog
    when `experimental_enable_model_catalog` is on; it contributes models, which
    every layer above can override field by field, and the aliases a pin can
-   name them by;
-3. `GrowthbookLayer`, materialized from remote or hydrated experiment assignments;
+   name them by. While it lists at least one model, the built-in default
+   models from layer 1 are not available anymore, so a catalog alias may take
+   a built-in's name;
+3. `GrowthbookLayer`, materialized from remote or hydrated experiment
+   assignments. The `vibe_cli_model_catalog` flag turns
+   `experimental_enable_model_catalog` on from here, below the TOML layers, so
+   a user's `false` keeps the catalog off. While that flag is on, this layer
+   leaves out the two older model flags: `vibe_cli_extra_models`, which adds
+   models, and `vibe_cli_default_routing_model`, which adds a model and makes
+   it the default (the "routed default"). The catalog lists its own models and
+   recommends its own default; when it supplies none, the built-in models
+   remain. The `vibe_cli_model_catalog_filter` flag filters the catalog's
+   data before the merge, as if the catalog itself had sent it filtered:
+   `hide` drops models, `order` lists ids first in the picker, `default`
+   picks the default, and `settings` sets per-model fields (request settings,
+   display name, thinking levels, image support and prices; never the
+   context window, `name`, `provider` or `alias`). A model is named by its
+   id or one of its catalog aliases; a name that matches no catalog model is
+   ignored with a warning, an unknown key silently, and a malformed key, item
+   or setting is dropped on its own with a warning. The filter reaches only
+   users GrowthBook reaches, and the client applies it, like an
+   `allowed_models` the org's admin config sets: neither is access control,
+   which only the server can enforce;
 4. the user TOML layer (`~/.vibe/config.toml`) when the `"user"` source is
    enabled, followed by the project TOML layer (a discovered trusted
    `.vibe/config.toml`) when the `"project"` source is enabled;
@@ -77,10 +98,13 @@ the session neither scopes nor records it.
 An `active_model` that names one of a catalog model's `aliases` is first
 resolved to that model's ID. An `active_model` absent from the merged model
 list is then normalized to the empty, unpinned sentinel. Default resolution
-then applies: the GrowthBook routed default, then the model catalog's
-recommendation, then the built-in default, each skipped when `allowed_models`
-excludes it. The invalid source value is left untouched and reported as a
-validation warning that names no cause.
+then applies: the GrowthBook routed default (absent while the
+`vibe_cli_model_catalog` flag is on), then the catalog filter's `default`, then
+the model catalog's recommendation, then the first available model (the
+built-in default only when no catalog model is available), each skipped when
+`allowed_models` excludes it. The
+invalid source value is left untouched and reported as a validation warning
+that names no cause.
 
 A model entry without `provider` only overrides a model another layer defines.
 When no layer defines that model, the entry is left out of the merged config and
@@ -116,6 +140,36 @@ servers are override-layer values. Forks and child sessions receive independent
 orchestrator copies. Child-only values, such as child session logging, are
 written to the copied override layer rather than persisted into the parent's
 TOML.
+
+## Settings Vibe does not use
+
+`VibeConfigSchema.check_layer_keys` checks the keys of the user TOML, a
+supplied user config, the trusted project TOML and the active agent profile
+against the schema (`vibe.core.config._setting_keys`). It reports:
+
+- a key that is not a setting, with the closest setting name when there is one;
+- a retired setting, such as `include_model_info`; and
+- a setting with no effect under the unified harness, such as `[tools.grep]` or
+  `tools.read_file.max_read_bytes`.
+
+A tool setting is checked against the tool's own settings model. Settings of a
+tool that is not builtin, such as an MCP tool, are not checked.
+
+By default each finding is a warning. It is logged, shown at startup, written to
+stderr and the export by `vibe -p`, and returned in `validation_warnings` by
+`config/read`. With `strict_config = true` in a config file, or
+`VIBE_STRICT_CONFIG=1`, the config is refused with `UnusedConfigKeysError`
+instead. Clients receive `invalid_params` with data `{"kind": "configuration"}`
+for a session start, a session read, and a picker read without a session
+(`config/read`, `agents/list`, `skills/list`). `VIBE_STRICT_CONFIG` takes a boolean,
+such as `1`, `true`, `yes` or `on` to refuse and `0`, `false`, `no` or `off` to
+warn; any other non-empty value is refused, because the environment layer would
+otherwise drop it and leave strict mode off.
+
+`vibe config schema` prints the JSON schema of every setting, served by
+`config/schema`. It includes each builtin tool's settings under `tools`, marks
+retired settings as deprecated, and sets `additionalProperties: false` so an
+editor can flag unknown keys.
 
 ## App-server config boundary
 
@@ -186,3 +240,22 @@ Before attachment, launchers may read startup configuration for process setup.
 The session-less `setup/*` API persists onboarding choices and credentials;
 `config/write` serves attached sessions. The server owns keyring and
 `$VIBE_HOME/.env` credential custody.
+
+## Administrator environment variables
+
+`VIBE_CUSTOM_CONSOLE_URL` pins the console URL for VS Code and Vibe CLI
+sign-in. It supports centrally managed deployments: when set, sign-in is
+prefilled with that console and redirected into its normal login flow, and the
+domain can no longer be changed. The manual API-key sign-in path stays
+available.
+
+The value may be a full URL or a bare domain. Scheme-less values are upgraded
+to `https://`; an explicit `http://` is kept (useful for local auth gateways);
+trailing slashes are stripped. The variable name is matched case-insensitively.
+An unset, empty, or invalid value means no pin, and an invalid value logs a
+warning rather than blocking sign-in.
+
+The pin fixes the browser sign-in host only. In a split-horizon deployment
+whose configured browser auth base matches the pin, the configured
+`browser_auth_api_base_url` is preserved (the API base otherwise derives as
+`{pin}/api`), and account calls keep the CLI-reachable API base's origin.

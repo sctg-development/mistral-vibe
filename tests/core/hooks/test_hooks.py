@@ -6,6 +6,7 @@ import shlex
 import sys
 from typing import Any
 
+import pytest
 import tomli_w
 
 from vibe.core.hooks.config import load_hooks_file, load_hooks_from_fs
@@ -207,7 +208,7 @@ class TestConfigLoading:
         assert result.hooks[0].match == "bash"
         assert result.hooks[1].match == "re:read_.*"
 
-    def test_match_field_rejected_on_post_agent(self, config_dir: Path) -> None:
+    def test_match_field_selects_agents_on_post_agent(self, config_dir: Path) -> None:
         _write_hooks_toml(
             config_dir / "hooks.toml",
             [
@@ -215,13 +216,95 @@ class TestConfigLoading:
                     "name": "h",
                     "type": "post_agent",
                     "command": "echo ok",
-                    "match": "bash",
+                    "match": "main",
+                }
+            ],
+        )
+        result = load_hooks_from_fs()
+        assert result.issues == []
+        assert result.hooks[0].match == "main"
+
+    def test_strict_still_rejected_on_post_agent(self, config_dir: Path) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {
+                    "name": "h",
+                    "type": "post_agent",
+                    "command": "echo ok",
+                    "match": "main",
+                    "strict": True,
                 }
             ],
         )
         result = load_hooks_from_fs()
         assert result.hooks == []
-        assert any("match" in i.message for i in result.issues)
+        assert any("strict" in i.message for i in result.issues)
+
+    def test_pre_agent_and_notification_hooks_load(self, config_dir: Path) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {
+                    "name": "guard",
+                    "type": "pre_agent",
+                    "command": "echo ok",
+                    "match": "main",
+                    "strict": True,
+                },
+                {
+                    "name": "notify",
+                    "type": "notification",
+                    "command": "echo ok",
+                    "match": "re:approval_requested|turn_completed",
+                },
+            ],
+        )
+        result = load_hooks_from_fs()
+        assert result.issues == []
+        assert [h.type for h in result.hooks] == [
+            HookType.PRE_AGENT,
+            HookType.NOTIFICATION,
+        ]
+
+    def test_session_hooks_load(self, config_dir: Path) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {
+                    "name": "load-context",
+                    "type": "session_start",
+                    "command": "echo ok",
+                    "match": "startup",
+                },
+                {
+                    "name": "export",
+                    "type": "session_end",
+                    "command": "echo ok",
+                    "match": "exit",
+                },
+            ],
+        )
+        result = load_hooks_from_fs()
+        assert result.issues == []
+        assert [h.type for h in result.hooks] == [
+            HookType.SESSION_START,
+            HookType.SESSION_END,
+        ]
+
+    @pytest.mark.parametrize(
+        "hook_type", ["notification", "session_start", "session_end"]
+    )
+    def test_strict_rejected_on_observing_hooks(
+        self, config_dir: Path, hook_type: str
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [{"name": "h", "type": hook_type, "command": "echo ok", "strict": True}],
+        )
+        result = load_hooks_from_fs()
+        assert result.hooks == []
+        assert any("pre_agent" in i.message for i in result.issues)
 
     def test_empty_match_rejected(self, config_dir: Path) -> None:
         _write_hooks_toml(

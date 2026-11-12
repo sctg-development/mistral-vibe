@@ -26,8 +26,8 @@ from vibe.app_server.models import (
     CompletedEffectState,
     EffectResultDisplay,
     FailedEffectState,
-    FileEditEffectBatchInput,
     FileEditEffectDetail,
+    FileEditEffectInput,
     FileEditEffectOutput,
     FileReadEffectDetail,
     FileReadEffectOutput,
@@ -103,6 +103,34 @@ def test_projects_unified_read_file_with_nullable_limit() -> None:
             was_truncated=False,
         )
     )
+
+
+def test_an_image_read_says_it_read_the_image() -> None:
+    entry = _effect(
+        "file_system.read_file",
+        {"path": "shot.png"},
+        result={
+            "content": [
+                {"type": "text", "text": "{}"},
+                {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+            ],
+            "structured_content": {
+                "path": "/workspace/shot.png",
+                "content": "Image file (image/png, 5 bytes).",
+                "file_size_bytes": 5,
+                "returned_bytes": 0,
+                "offset": 0,
+                "lines_read": 0,
+                "was_truncated": False,
+            },
+        },
+    )
+
+    projected = project_unified_history_entry(entry)
+
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    assert projected.state.display.message == "the image /workspace/shot.png"
 
 
 @pytest.mark.parametrize(
@@ -189,6 +217,48 @@ def test_projects_unified_write_file_over_an_existing_file() -> None:
     assert projected.state.display.verb == "Updated"
 
 
+@pytest.mark.parametrize(
+    ("previous", "content", "written"),
+    [
+        ("one\r\ntwo\r\n", "alpha\nbeta\r\n", "alpha\r\nbeta\r\n"),
+        ("one\ntwo\n", "alpha\r\nbeta\r\n", "alpha\nbeta\n"),
+        ("one\rtwo\r", "alpha\nbeta\n", "alpha\rbeta\r"),
+        ("one", "alpha\r\nbeta\n", "alpha\r\nbeta\n"),
+    ],
+)
+def test_projects_a_write_with_the_line_endings_of_the_replaced_file(
+    previous: str, content: str, written: str
+) -> None:
+    """*Prepare*: A write over a file with known line endings.
+    *Do*: Project the completed call.
+    *Assert*: The written content carries the replaced file's dominant line
+    ending, as the Runtime wrote it, or stands as given without one.
+    """
+    # Prepare
+    entry = _effect(
+        "write_file",
+        {"path": "notes.txt", "content": content},
+        result={
+            "structured_content": {
+                "path": "/workspace/notes.txt",
+                "bytes_written": len(written),
+                "file_existed": True,
+            },
+            "_meta": {"mistralai.vibe.sdk.write_file": {"previous_content": previous}},
+        },
+    )
+
+    # Do
+    projected = project_unified_history_entry(entry)
+
+    # Assert
+    assert isinstance(projected, PublicEffectEntry)
+    assert isinstance(projected.state, CompletedEffectState)
+    output = FileWriteEffectOutput.model_validate(projected.state.output)
+    assert output.content == written
+    assert output.previous_content == previous
+
+
 def test_projects_unified_write_file_the_runtime_could_not_diff() -> None:
     # The Runtime omits the annotation for a file too large or not text.
     entry = _effect(
@@ -229,20 +299,19 @@ def test_leaves_a_write_generic_when_the_runtime_omits_file_existed() -> None:
     assert isinstance(projected.detail, GenericEffectDetail)
 
 
-def test_projects_unified_batched_search_replace_and_occurrences() -> None:
+def test_projects_unified_edit_and_occurrences() -> None:
     entry = _effect(
-        "file_system.search_replace",
+        "file_system.edit",
         {
             "file_path": "notes.txt",
-            "content": [
-                {"old_str": "alpha", "new_str": "beta"},
-                {"old_str": "one", "new_str": "two", "replace_all": True},
-            ],
+            "old_string": "one\n",
+            "new_string": "two\n",
+            "replace_all": True,
         },
         result={
             "structured_content": {
                 "file": "/workspace/notes.txt",
-                "lines_changed": 3,
+                "lines_changed": 2,
                 "warnings": ["review generated content"],
             },
             "_meta": {
@@ -251,8 +320,8 @@ def test_projects_unified_batched_search_replace_and_occurrences() -> None:
                         {
                             "old_start_line": 2,
                             "new_start_line": 2,
-                            "old_lines": ["alpha"],
-                            "new_lines": ["beta"],
+                            "old_lines": ["one\n"],
+                            "new_lines": ["two\n"],
                         },
                         {
                             "old_start_line": 5,
@@ -270,29 +339,23 @@ def test_projects_unified_batched_search_replace_and_occurrences() -> None:
 
     assert isinstance(projected, PublicEffectEntry)
     assert isinstance(projected.detail, FileEditEffectDetail)
-    assert isinstance(projected.detail.input, FileEditEffectBatchInput)
-    assert [change.old_string for change in projected.detail.input.changes] == [
-        "alpha",
-        "one",
-    ]
-    assert projected.detail.input.changes[1].replace_all
+    assert projected.detail.input == FileEditEffectInput(
+        file_path="notes.txt", old_string="one\n", new_string="two\n", replace_all=True
+    )
     assert isinstance(projected.state, CompletedEffectState)
     output = FileEditEffectOutput.model_validate(projected.state.output)
     assert output.old_string is None
     assert output.new_string is None
     assert [
         (item.start_line, item.old_text, item.new_text) for item in output.occurrences
-    ] == [(2, "alpha", "beta"), (5, "one\n", "two\n")]
+    ] == [(2, "one\n", "two\n"), (5, "one\n", "two\n")]
     assert projected.state.display.warnings == ["review generated content"]
 
 
-def test_projects_search_replace_carried_preedit_text_and_anchors() -> None:
+def test_projects_edit_carried_preedit_text_and_anchors() -> None:
     entry = _effect(
-        "file_system.search_replace",
-        {
-            "file_path": "notes.txt",
-            "content": [{"old_str": "one\n", "new_str": "two\n"}],
-        },
+        "file_system.edit",
+        {"file_path": "notes.txt", "old_string": "one\n", "new_string": "two\n"},
         result={
             "structured_content": {
                 "file": "/workspace/notes.txt",
@@ -327,15 +390,12 @@ def test_projects_search_replace_carried_preedit_text_and_anchors() -> None:
     ] == [(2, 2, "one\n", "two\n")]
 
 
-def test_projects_search_replace_without_carried_text_stays_positional() -> None:
+def test_projects_edit_without_carried_text_stays_positional() -> None:
     # A runtime predating the carried pre-edit text annotates blocks only;
     # the reversal falls back to the hunks alone.
     entry = _effect(
-        "file_system.search_replace",
-        {
-            "file_path": "notes.txt",
-            "content": [{"old_str": "alpha", "new_str": "beta"}],
-        },
+        "file_system.edit",
+        {"file_path": "notes.txt", "old_string": "alpha", "new_string": "beta"},
         result={
             "structured_content": {
                 "file": "/workspace/notes.txt",
@@ -635,10 +695,10 @@ def test_self_wait_label_hides_the_raw_tool_key() -> None:
     assert isinstance(projected, PublicEffectEntry)
     assert isinstance(projected.detail, GenericEffectDetail)
     assert projected.detail.display.verb == "Waiting"
-    assert projected.detail.display.message == "for input"
+    assert projected.detail.display.message == "for background work"
     assert isinstance(projected.state, CompletedEffectState)
     assert projected.state.display.verb == "Waited"
-    assert projected.state.display.message == "for input"
+    assert projected.state.display.message == "for background work"
 
 
 @pytest.mark.parametrize(
@@ -933,8 +993,8 @@ def test_edit_write_and_grep_paths_display_relative(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     target = str(root / "notes.txt")
     edit = _effect(
-        "file_system.search_replace",
-        {"file_path": target, "content": [{"old_str": "a", "new_str": "b"}]},
+        "file_system.edit",
+        {"file_path": target, "old_string": "a", "new_string": "b"},
         error="failed",
     )
     write = _effect(
@@ -1723,6 +1783,26 @@ def _generic_detail(name: str, input_value: object) -> dict[str, object]:
             "Scheduled",
             "cron 0 9 * * 1-5 (local time): review CI",
         ),
+        (
+            {
+                "action": "schedule",
+                "interval_seconds": 60,
+                "prompt": "CI watch\nCheck CI and report failures.",
+            },
+            "Scheduling",
+            "Scheduled",
+            "every 1 minute: CI watch",
+        ),
+        (
+            {
+                "action": "schedule",
+                "interval_seconds": 60,
+                "prompt": "\n  CI watch\nCheck CI and report failures.",
+            },
+            "Scheduling",
+            "Scheduled",
+            "every 1 minute: CI watch",
+        ),
         ({"action": "list"}, "Listing", "Listed", "scheduled prompts"),
         (
             {"action": "cancel", "id": "abc"},
@@ -1892,8 +1972,12 @@ async def test_cron_executor_result_projects_through_the_public_boundary(
     from vibe.app_server._unified_scheduled_loops import UnifiedScheduledLoops
 
     store = UnifiedScheduledLoops(tmp_path / "loops.json", persistent=lambda: False)
+
+    async def resolve_loops(_session_id: str) -> UnifiedScheduledLoops:
+        return store
+
     executor = VibeProvidedTools().executor_factory(
-        tmp_path, max_todos=lambda: 10, scheduled_loops=lambda _: store
+        tmp_path, max_todos=lambda: 10, scheduled_loops=resolve_loops
     )("session-1")
     arguments: JsonObject = {
         "action": "schedule",

@@ -1,8 +1,7 @@
 //! Silent incomplete-stream continuations: retry budget, queued-prompt guard, and the /retry offer.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -11,10 +10,11 @@ use vibe_rs::commands::retry::MAX_INCOMPLETE_STREAM_RETRIES;
 use vibe_rs::commands::CommandEvent;
 use vibe_rs::event_handler::apply_notification;
 use vibe_rs::message_queue::QueueItem;
-use vibe_rs::server::{notification, Client, HistoryEntry, MessageContent, Notification};
+use vibe_rs::server::{notification, Client, Notification};
 
-const RETRY_HINT: &str =
-    "Run /retry [additional instructions] to continue the interrupted response.";
+use crate::support::{messages, queued};
+
+const RETRY_HINT: &str = "Run /retry [additional instructions] to try again.";
 
 struct Harness {
     app: App,
@@ -44,7 +44,7 @@ impl Harness {
     fn start_turn(&mut self) {
         self.app.session.active_turn_id = Some("turn".into());
         self.app.set_status(Status::Generating {
-            since: Instant::now(),
+            since: vibe_rs::clock::now(),
         });
     }
 
@@ -67,29 +67,11 @@ impl Harness {
         frame["method"].as_str().unwrap_or_default().to_owned()
     }
 
-    /// Background commands still unsettled: each auto-retry starts one.
-    fn unsettled_commands(&self) -> u32 {
-        self.app.pending_commits.load(Ordering::Relaxed)
-    }
-
     fn error_rows(&self) -> Vec<String> {
-        self.app
-            .view
-            .transcript
-            .lines()
-            .filter_map(|line| match line.entry {
-                HistoryEntry::Message(message) if message.role == "command_error" => Some(
-                    message
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            MessageContent::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect(),
-                ),
-                _ => None,
-            })
+        messages(&self.app)
+            .into_iter()
+            .filter(|(role, _)| role == "command_error")
+            .map(|(_, text)| text)
             .collect()
     }
 }
@@ -111,8 +93,7 @@ async fn two_silent_continuations_then_the_third_truncation_offers_retry_once() 
 
     harness.truncate_stream();
     assert_eq!(
-        harness.unsettled_commands(),
-        MAX_INCOMPLETE_STREAM_RETRIES,
+        harness.app.session.incomplete_stream_retries, MAX_INCOMPLETE_STREAM_RETRIES,
         "no third continuation"
     );
     let errors = harness.error_rows();
@@ -128,24 +109,14 @@ async fn a_queued_prompt_is_not_overtaken_by_a_silent_continuation() {
     let mut harness = Harness::new();
     harness.app.queue.items.push(QueueItem {
         queue_item_id: Some("queued-1".into()),
-        message_id: "queued-row".into(),
-        server_message_id: "queued-row".into(),
-        text: "t2".into(),
-        images: Vec::new(),
-        mentions: None,
-        sent: true,
-        ever_sent: true,
-        revision: 0,
-        replacing: false,
+        ..queued("queued-row", "t2")
     });
 
     harness.truncate_stream();
     assert_eq!(
-        harness.unsettled_commands(),
-        0,
+        harness.app.session.incomplete_stream_retries, 0,
         "no continuation turn/start"
     );
-    assert_eq!(harness.app.session.incomplete_stream_retries, 0);
     let errors = harness.error_rows();
     assert_eq!(errors.len(), 1);
     assert!(errors[0].contains(RETRY_HINT));

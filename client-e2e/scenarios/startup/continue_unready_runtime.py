@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from e2e.app_server.mcp import handshake as mcp_handshake, server
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 handshake = mcp_handshake([server("weather", transport="http", status="needs_auth")])
 handshake["runtime/read"]["ready"] = False
@@ -22,11 +22,11 @@ handshake["runtime/read"]["runtime"].update({
 # The deferred init is awaited before the notices and the runtime they read.
 request_methods = {"session/ready/wait"}
 client_args = ("--continue",)
-timeline: Timeline = []
+timeline: Timeline = [take_snapshot()]
 
 screen_contains = (
     "Saved session restored.",
     "MCP server 'weather' needs OAuth authentication.",
     "devstral-small",
-    "50k/200k tokens (25%)",
+    "ctx █▌     50k/200k",
 )

@@ -9,9 +9,7 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
-
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1"}
+from e2e.app_server.scenario import Timeline, take_snapshot
 
 # A removal only counts once the server says the item is gone, so answer the
 # request with the queue update it would have emitted.
@@ -19,9 +17,6 @@ on_request = {"session/turn/queue/remove": [turn_queue_updated([queued_turn(2)])
 
 _UP = "\x1b[A"
 _BACKSPACE = "\x7f"
-
-settle_per_key = True
-capture_steps = {1, 2, 3, 4, 5}
 
 timeline: Timeline = [
     "first\r",
@@ -33,4 +28,5 @@ timeline: Timeline = [
     "third\r",
     _UP,
     _BACKSPACE,
+    take_snapshot(),
 ]

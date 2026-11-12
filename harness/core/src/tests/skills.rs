@@ -41,7 +41,7 @@ fn tool_call_completion(
                 "arguments_json": arguments.to_string(),
             }],
             "finish_reason": "tool_call",
-            "usage": null,
+            "usage": {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "cached_input_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0},
         },
     })
 }
@@ -137,7 +137,7 @@ fn direct_skill_route_preserves_prompt_catalog_and_restore() {
     assert!(messages.contains("without calling `skill` again"));
     assert!(messages.contains("Connector names and unlisted names"));
     assert!(messages.contains("Review &lt;code&gt; safely."));
-    assert!(messages.contains("/skills/zeta&lt;&amp;/SKILL.md"));
+    assert!(!messages.contains("/skills/zeta"));
     let zeta_index = messages
         .find("zeta-review")
         .expect("root skill is rendered");

@@ -12,6 +12,7 @@ from types import MappingProxyType
 from keyring.errors import KeyringError
 
 from vibe.utils.keyring import get_api_key_from_keyring, set_api_key_in_keyring
+from vibe.utils.oidc_marker import oidc_enabled
 from vibe.utils.secrets import holding_secrets
 
 POOL_ENV_SUFFIX = "S"
@@ -23,6 +24,7 @@ class ApiKeySource(StrEnum):
     SESSION = "session"
     ENVIRONMENT = "environment"
     KEYRING = "keyring"
+    OIDC = "oidc"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +48,8 @@ class ApiKeyOrigin:
                 return f"env var {self.env_var}"
             case ApiKeySource.KEYRING:
                 return "the keyring"
+            case ApiKeySource.OIDC:
+                return "the CLI OIDC session"
 
 
 # The credentials of the code running in this context, by environment variable
@@ -139,6 +143,31 @@ def add_pooled_key(api_key_env_var: str, api_key: str) -> bool:
     return True
 
 
+def uses_cli_oidc_credential(env_key: str) -> bool:
+    """Whether ``env_key`` resolves from the CLI OIDC session, never an API key.
+
+    Shared by resolution and ``/status``, so the reported source cannot claim
+    an API-key source that resolution never reads.
+    """
+    # fork: the Vibe sign-in key is renamed VIBE_API_KEY here, so both names mean "the Mistral key".
+    return env_key in {"MISTRAL_API_KEY", "VIBE_API_KEY"} and oidc_enabled()
+
+
+def _first_pooled_key(env_key: str) -> tuple[str, ApiKeyOrigin] | None:
+    """The first pooled account, standing in for a missing single key.
+
+    Multi-account setups may only define the plural variable
+    (``VIBE_API_KEYS``); its first key stands in for the single one so the
+    rest of the CLI (account lookups, auth state) keeps working.
+    """
+    plural = pool_env_var(env_key)
+    if pooled := split_keys(os.environ.get(plural)):
+        return pooled[0], ApiKeyOrigin(ApiKeySource.ENVIRONMENT, plural)
+    if stored := stored_pool_keys(env_key):
+        return stored[0], ApiKeyOrigin(ApiKeySource.KEYRING, plural)
+    return None
+
+
 def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None:
     """The key for ``env_key`` and where it was read from, or ``None``.
 
@@ -150,6 +179,11 @@ def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None
     """
     if not env_key:
         return None
+    if uses_cli_oidc_credential(env_key):
+        from vibe.setup.auth._oidc_runtime import stored_oidc_credential
+
+        token = stored_oidc_credential()
+        return (token, ApiKeyOrigin(ApiKeySource.OIDC, env_key)) if token else None
     credentials = _session_credentials.get()
     if credentials is not None and (token := credentials.get(env_key)):
         return token, ApiKeyOrigin(ApiKeySource.SESSION, env_key)
@@ -159,15 +193,7 @@ def resolve_api_key_with_origin(env_key: str) -> tuple[str, ApiKeyOrigin] | None
     if resolved is not None:
         source, token = resolved
         return token, ApiKeyOrigin(source, env_key)
-    # Multi-account setups may only define the plural variable
-    # (``VIBE_API_KEYS``); its first key stands in for the single one so the
-    # rest of the CLI (account lookups, auth state) keeps working.
-    plural = pool_env_var(env_key)
-    if pooled := split_keys(os.environ.get(plural)):
-        return pooled[0], ApiKeyOrigin(ApiKeySource.ENVIRONMENT, plural)
-    if stored := stored_pool_keys(env_key):
-        return stored[0], ApiKeyOrigin(ApiKeySource.KEYRING, plural)
-    return None
+    return _first_pooled_key(env_key)
 
 
 def resolve_api_key(env_key: str) -> str | None:

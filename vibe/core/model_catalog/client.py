@@ -3,7 +3,7 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
-import httpx
+import httpx2
 
 from vibe.core.model_catalog._constants import (
     MODEL_CATALOG_TIMEOUT_SECONDS,
@@ -13,11 +13,14 @@ from vibe.core.model_catalog.models import (
     ModelCatalogResponse,
     parse_model_catalog_response,
 )
+from vibe.core.platform_auth._http import PlatformCredentialUnavailable
+from vibe.core.platform_auth._mistral import credential_request
 from vibe.observability.logging import logger
 from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
 if TYPE_CHECKING:
     from vibe.core.config import ProviderConfig
+    from vibe.core.platform_auth import PlatformCredentialProvider
 
 
 class ModelCatalogClient:
@@ -42,19 +45,21 @@ class ModelCatalogClient:
     def _client(self) -> VibeAsyncHTTPClient:
         if self._http is None:
             self._http = VibeAsyncHTTPClient(
-                timeout=httpx.Timeout(MODEL_CATALOG_TIMEOUT_SECONDS),
+                timeout=httpx2.Timeout(MODEL_CATALOG_TIMEOUT_SECONDS),
                 verify=build_ssl_context(),
             )
         return self._http
 
-    async def fetch(self, api_key: str) -> ModelCatalogResponse | None:
+    async def fetch(
+        self, credentials: PlatformCredentialProvider
+    ) -> ModelCatalogResponse | None:
         if self._url is None:
             return None
         try:
-            response = await self._client.get(
-                self._url, headers={"Authorization": f"Bearer {api_key}"}
+            response = await credential_request(
+                credentials, "GET", self._url, client=self._client
             )
-        except httpx.HTTPError as exc:
+        except (httpx2.HTTPError, PlatformCredentialUnavailable) as exc:
             logger.warning("Model catalog request failed: %s", exc)
             return None
 
@@ -81,3 +86,16 @@ class ModelCatalogClient:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+
+
+async def fetch_model_catalog(
+    api_base: str, credentials: PlatformCredentialProvider
+) -> ModelCatalogResponse | None:
+    """One request to the catalog of the provider at ``api_base``; ``None``
+    when it failed.
+    """
+    client = ModelCatalogClient(url=build_model_catalog_url(api_base))
+    try:
+        return await client.fetch(credentials)
+    finally:
+        await client.aclose()

@@ -6,6 +6,7 @@ from pydantic import Field
 
 from vibe.app_server._model import ProtocolModel
 from vibe.config_values import (
+    DEFAULT_THINKING_LEVELS as DEFAULT_THINKING_LEVELS,
     THINKING_LEVELS as THINKING_LEVELS,
     AudioClient,
     SpeechOutputFormat,
@@ -32,7 +33,7 @@ class ModelConfigView(ProtocolModel):
     # The levels the active model offers; defaulted so a client against an
     # older server still renders the five (ADR 0014).
     thinking_levels: list[ThinkingLevel] = Field(
-        default_factory=lambda: list(THINKING_LEVELS)
+        default_factory=lambda: list(DEFAULT_THINKING_LEVELS)
     )
     # Expected delivery of file-backed images; None means the runtime has not
     # advertised a delivery mode. Native model support alone is not a fallback policy.
@@ -95,8 +96,16 @@ class ConfigView(ProtocolModel):
     disable_welcome_banner_animation: bool
     # Preserve blinking when reading an older app-server response (ADR 0014).
     cursor_blink: bool = True
+    # Preserve the plain input when reading an older app-server response (ADR 0014).
+    vim_keybindings: bool = False
     show_greeting: bool
     autocopy_to_clipboard: bool
+    # Preserve mouse capture when reading an older app-server response (ADR 0014).
+    enable_mouse_capture: bool = True
+    # Preserve the pinned prompt when reading an older app-server response (ADR 0014).
+    enable_sticky_prompt: bool = True
+    # Preserve @ file completion when reading an older app-server response (ADR 0014).
+    enable_file_autocomplete: bool = True
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
     voice_mode_enabled: bool
@@ -114,6 +123,8 @@ class ConfigView(ProtocolModel):
     # Datalake events stay server-gated; clients never decide that.
     enable_telemetry: bool = True
     experimental_enable_registry_skills: bool = False
+    experimental_enable_local_projects: bool = False
+    enable_pr_monitoring: bool = True
     models: list[ModelConfigView]
     transcribe_models: list[str]
     tts_models: list[str]

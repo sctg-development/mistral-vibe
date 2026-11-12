@@ -9,6 +9,18 @@ use crate::core::wire::message::{Message, ToolOutcome};
 use crate::core::wire::tool::{ProtocolError, StructuredContent, ToolResult};
 
 pub(crate) fn invalid_tool_call_result(reason: String) -> ToolResult {
+    invalid_tool_call_result_with_code("invalid_tool_call", reason)
+}
+
+/// Arguments the tool's own schema accepted but its handler could not parse.
+/// The model still gets an `InvalidToolCall` and can carry on, but the code
+/// marks the failure as a mismatch between the schema and the handler rather
+/// than a model mistake.
+pub(crate) fn tool_arguments_contract_mismatch_result(reason: String) -> ToolResult {
+    invalid_tool_call_result_with_code("tool_arguments_contract_mismatch", reason)
+}
+
+fn invalid_tool_call_result_with_code(code: &str, reason: String) -> ToolResult {
     ToolResult::Failure {
         content: text_content(
             json!({
@@ -22,7 +34,7 @@ pub(crate) fn invalid_tool_call_result(reason: String) -> ToolResult {
         structured_content: StructuredContent::Absent,
         meta: None,
         error: ProtocolError {
-            code: "invalid_tool_call".to_string(),
+            code: code.to_string(),
             message: reason,
             retryable: false,
             details: Value::Null,
@@ -107,24 +119,30 @@ pub(crate) fn model_tool_result_content(result: &ToolResult) -> Vec<ContentBlock
 }
 
 pub(crate) fn model_visible_content_block(mut block: ContentBlock) -> Option<ContentBlock> {
-    let annotations = match &block {
+    if !is_model_visible(&block) {
+        return None;
+    }
+    strip_model_hidden_content_fields(&mut block);
+    Some(block)
+}
+
+/// Whether the model sees `block`: a known block type whose audience, if
+/// set, includes the assistant.
+pub(crate) fn is_model_visible(block: &ContentBlock) -> bool {
+    let annotations = match block {
         ContentBlock::Text(content) => &content.annotations,
         ContentBlock::Image(content) => &content.annotations,
         ContentBlock::Audio(content) => &content.annotations,
         ContentBlock::ResourceLink(resource) => &resource.annotations,
         ContentBlock::Resource(content) => &content.annotations,
-        _ => return None,
+        _ => return false,
     };
-    if annotations.as_ref().is_some_and(|annotations| {
+    !annotations.as_ref().is_some_and(|annotations| {
         annotations
             .audience
             .as_ref()
             .is_some_and(|audience| !audience.is_empty() && !audience.contains(&Role::Assistant))
-    }) {
-        return None;
-    }
-    strip_model_hidden_content_fields(&mut block);
-    Some(block)
+    })
 }
 
 pub(crate) fn model_tool_result_message(
@@ -222,5 +240,40 @@ mod tests {
             StructuredContent::present(json!({"stdout": "ignored"})),
         )));
         assert_eq!(text, "partial output and the timeout");
+    }
+
+    ///
+    /// *Prepare*: A tool image with an older Vibe's file link and another field in its
+    /// metadata, and annotations.
+    /// *Do*: Make it model-visible.
+    /// *Assert*: No metadata or annotations survive: a file link is no image metadata.
+    ///
+    #[test]
+    fn a_tool_image_keeps_no_metadata_when_made_model_visible() {
+        // Prepare
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "image",
+            "data": "aGVsbG8=",
+            "mimeType": "image/png",
+            "annotations": {"priority": 0.5},
+            "_meta": {
+                "mistralai.vibe.harness/file-image-resource-link": {
+                    "type": "resource_link",
+                    "uri": "file:///workspace/screenshot.png",
+                    "name": "screenshot.png",
+                },
+                "client": "hidden",
+            },
+        }))
+        .expect("image block is valid");
+
+        // Do
+        let visible = model_visible_content_block(block).expect("image stays visible");
+
+        // Assert
+        assert_eq!(
+            serde_json::to_value(visible).expect("block serializes"),
+            json!({"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"})
+        );
     }
 }

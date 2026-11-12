@@ -3,12 +3,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::ChatInput;
+use crate::skill::Skill;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InputMode {
     Bash,
     Slash,
-    Teleport,
     #[default]
     Prompt,
 }
@@ -18,7 +18,6 @@ impl InputMode {
         match self {
             Self::Bash => Some('!'),
             Self::Slash => Some('/'),
-            Self::Teleport => Some('&'),
             Self::Prompt => None,
         }
     }
@@ -28,7 +27,6 @@ impl InputMode {
         match character {
             '!' => Some(Self::Bash),
             '/' => Some(Self::Slash),
-            '&' if crate::commands::has_command("/teleport") => Some(Self::Teleport),
             _ => None,
         }
     }
@@ -44,7 +42,6 @@ impl InputMode {
         match self {
             Self::Bash => "! ",
             Self::Slash => "/ ",
-            Self::Teleport => "& ",
             Self::Prompt => "> ",
         }
     }
@@ -52,7 +49,6 @@ impl InputMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClassifiedInput {
-    Teleport { target: String },
     SlashCommand { command: &'static str },
     Skill { command: String, name: String },
     Bash { command: String },
@@ -60,15 +56,7 @@ pub enum ClassifiedInput {
     Prompt { text: String },
 }
 
-pub fn classify(value: &str, skills: &[(String, String)]) -> ClassifiedInput {
-    if let Some(target) = value
-        .strip_prefix('&')
-        .filter(|_| crate::commands::has_command("/teleport"))
-    {
-        return ClassifiedInput::Teleport {
-            target: target.trim().to_owned(),
-        };
-    }
+pub fn classify(value: &str, skills: &[Skill]) -> ClassifiedInput {
     if let Some(command) = crate::commands::parse(value) {
         return match command {
             "/loop" => ClassifiedInput::Prompt {
@@ -79,13 +67,13 @@ pub fn classify(value: &str, skills: &[(String, String)]) -> ClassifiedInput {
     }
     if let Some(rest) = value.strip_prefix('/') {
         let name = rest.split_whitespace().next().unwrap_or_default();
-        if let Some((skill, _)) = skills
+        if let Some(skill) = skills
             .iter()
-            .find(|(skill, _)| skill.eq_ignore_ascii_case(name))
+            .find(|skill| skill.name.eq_ignore_ascii_case(name))
         {
             return ClassifiedInput::Skill {
                 command: value.to_owned(),
-                name: skill.clone(),
+                name: skill.name.clone(),
             };
         }
     }
@@ -102,7 +90,7 @@ pub fn classify(value: &str, skills: &[(String, String)]) -> ClassifiedInput {
     }
 }
 
-/// Pasted text that only looks prefixed (paths, code, markdown images); a paste never opens teleport.
+/// Pasted text that only looks prefixed (paths, code, markdown images).
 fn pasted_literally(mode: InputMode, rest: &str) -> bool {
     let word = rest.split_whitespace().next().unwrap_or_default();
     match mode {
@@ -110,13 +98,12 @@ fn pasted_literally(mode: InputMode, rest: &str) -> bool {
             .chars()
             .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')),
         InputMode::Bash => rest.starts_with('['),
-        InputMode::Teleport => true,
         InputMode::Prompt => false,
     }
 }
 
 fn literal_prefix(mode: InputMode, value: &str) -> bool {
-    mode == InputMode::Prompt && value.trim_start().starts_with(['/', '!', '&'])
+    mode == InputMode::Prompt && value.trim_start().starts_with(['/', '!'])
 }
 
 /// Trimmed submitted text; one leading space stays when it keeps a prompt's mode character literal.
@@ -129,11 +116,7 @@ pub fn submitted_value(mode: InputMode, text: &str) -> String {
 }
 
 /// In prompt mode, a leading mode character (typed after the text or behind whitespace) is message text.
-pub fn classify_submitted(
-    mode: InputMode,
-    value: &str,
-    skills: &[(String, String)],
-) -> ClassifiedInput {
+pub fn classify_submitted(mode: InputMode, value: &str, skills: &[Skill]) -> ClassifiedInput {
     if literal_prefix(mode, value) {
         // The server still invokes a leading skill, so it keeps its skill telemetry.
         return match classify(value.trim_start(), skills) {
@@ -169,7 +152,10 @@ impl ChatInput {
 
     /// Open a typed mode over empty or fully selected text, or leave it on Backspace at the start.
     pub fn apply_mode_key(&mut self, key: &KeyEvent) -> bool {
-        if let KeyCode::Char(character) = key.code {
+        // Some terminals send Ctrl+H for Backspace.
+        let ctrl_h =
+            key.code == KeyCode::Char('h') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if let (KeyCode::Char(character), false) = (key.code, ctrl_h) {
             let modified = key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
@@ -183,7 +169,10 @@ impl ChatInput {
         }
         let at_start = self.cursor == 0
             && crate::chat_input::selection_range(&self.input, self.cursor, self.anchor).is_none();
-        if key.code != KeyCode::Backspace || self.mode == InputMode::Prompt || !at_start {
+        if !(key.code == KeyCode::Backspace || ctrl_h)
+            || self.mode == InputMode::Prompt
+            || !at_start
+        {
             return false;
         }
         self.mode = InputMode::Prompt;
@@ -216,7 +205,6 @@ impl ChatInput {
         let (mode, body) = match text.as_bytes().first() {
             Some(b'!') => (InputMode::Bash, &text[1..]),
             Some(b'/') => (InputMode::Slash, &text[1..]),
-            Some(b'&') => (InputMode::Teleport, &text[1..]),
             _ => (InputMode::Prompt, text.as_str()),
         };
         self.load(mode, body.to_owned());

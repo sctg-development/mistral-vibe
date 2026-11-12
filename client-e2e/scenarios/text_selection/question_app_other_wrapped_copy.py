@@ -11,14 +11,8 @@ from e2e.app_server.events import (
 )
 from e2e.app_server.scenario import Timeline
 
-env = {
-    "VIBE_REPLAY_SETTLE_BUSY": "1",
-    "VIBE_TYPING_GRACE_PERIOD_MS": "0",
-    "SSH_TTY": "/dev/pts/0",
-}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0", "SSH_TTY": "/dev/pts/0"}
 handshake = {"callback/result": {"accepted": True}}
-capture_startup = False
-capture_steps = {5, 6}
 
 _LONG = (
     "We need something embedded, ideally SQLite with WAL enabled, because the CLI "
@@ -54,6 +48,3 @@ timeline: Timeline = [
     paste(f"{_LONG}\nAlso: no daemon"),
     _DRAG_TO_FIELD_END,
 ]
-
-# Each key must land on a settled UI: batching changes the outcome here.
-settle_per_key = True

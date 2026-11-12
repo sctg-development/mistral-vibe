@@ -15,12 +15,12 @@ behaviour, the host owns the session.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 from typing import Any, Protocol
 
 from vibe.app_server._dispatch import DispatchResult, RequestFailure, method_not_found
 from vibe.app_server._model import ProtocolModel, validate_wire
+from vibe.app_server._skill_toggles import set_skill_enabled
 from vibe.app_server.models import (
     SkillCatalogEntry,
     SkillDetailView,
@@ -55,6 +55,7 @@ from vibe.app_server.protocol import (
 )
 from vibe.core.config import VibeConfigSchema
 from vibe.core.config.orchestrator import ConfigOrchestrator
+from vibe.core.platform_auth import PlatformCredentialFactory
 from vibe.core.skills.models import SkillScope
 from vibe.core.skills.registry import (
     RegistrySkillsError,
@@ -68,7 +69,6 @@ from vibe.core.skills.registry import (
     list_catalog,
     list_skill_versions,
     project_scope_available,
-    publish_local_pins,
     remove_skill,
     set_skill_alias,
     set_skill_latest,
@@ -97,6 +97,11 @@ class SkillsHost(Protocol):
         ...
 
     @property
+    def credentials(self) -> PlatformCredentialFactory | None:
+        """The connection's platform credential the registry calls carry."""
+        ...
+
+    @property
     def skill_roots(self) -> list[Path]:
         """Project roots a scoped install may write into."""
         ...
@@ -114,7 +119,9 @@ class SkillsHost(Protocol):
         ...
 
     def installed_skills(self) -> list[SkillSummary]:
-        """Rows for the browser: one per name+scope, not de-duped."""
+        """Rows for the browser: one per name, scope and source, each marked
+        active when its name resolves to it.
+        """
         ...
 
     async def refresh(self) -> RuntimeSnapshot:
@@ -198,6 +205,10 @@ class SkillsController:
         return DispatchResult(response, runtime_updated=runtime_updated)
 
     def _list(self, params: SkillsListParams) -> SkillsListResponse:
+        if params.session_id is None:
+            raise RequestFailure(
+                ProtocolErrorCode.INVALID_PARAMS, "skills/list needs a sessionId here"
+            )
         self._host.require_session(params.session_id)
         return SkillsListResponse(skills=self._host.list_skills())
 
@@ -210,7 +221,8 @@ class SkillsController:
         config = self._host.config
         roots = self._host.skill_roots
         project_available = project_scope_available(roots)
-        authenticated = await has_registry_endpoint(config)
+        credentials = self._host.credentials
+        authenticated = await has_registry_endpoint(config, credentials=credentials)
         if not authenticated:
             return SkillsCatalogResponse(
                 skills=[],
@@ -220,9 +232,10 @@ class SkillsController:
                 authenticated=False,
             )
         try:
-            catalog = await list_catalog(config)
+            catalog = await list_catalog(config, credentials=credentials)
             updates = {
-                u.name: u.latest_version for u in await check_updates(config, roots)
+                u.name: u.latest_version
+                for u in await check_updates(config, roots, credentials=credentials)
             }
         except Exception:
             return SkillsCatalogResponse(
@@ -246,7 +259,9 @@ class SkillsController:
 
     async def _versions(self, params: SkillsVersionsParams) -> SkillsVersionsResponse:
         self._host.require_session(params.session_id)
-        versions = await list_skill_versions(self._host.config, params.skill_id)
+        versions = await list_skill_versions(
+            self._host.config, params.skill_id, credentials=self._host.credentials
+        )
         return SkillsVersionsResponse(
             versions=[
                 SkillVersionView(version=v.version, aliases=list(v.aliases))
@@ -256,7 +271,11 @@ class SkillsController:
 
     async def _updates(self, params: SkillsUpdatesParams) -> SkillsUpdatesResponse:
         self._host.require_session(params.session_id)
-        updates = await check_new_versions(self._host.config, self._host.skill_roots)
+        updates = await check_new_versions(
+            self._host.config,
+            self._host.skill_roots,
+            credentials=self._host.credentials,
+        )
         return SkillsUpdatesResponse(
             updates=[
                 SkillUpdateView(
@@ -271,15 +290,18 @@ class SkillsController:
     async def _detail(self, params: SkillsDetailParams) -> SkillsDetailResponse:
         self._host.require_session(params.session_id)
         config = self._host.config
+        credentials = self._host.credentials
         detail = await get_skill_details(
-            config, params.skill_id, version=params.version
+            config, params.skill_id, version=params.version, credentials=credentials
         )
         if detail is not None:
             return SkillsDetailResponse(
                 detail=SkillDetailView.model_validate(detail.model_dump())
             )
         try:
-            body = await get_skill_body(config, params.skill_id, version=params.version)
+            body = await get_skill_body(
+                config, params.skill_id, version=params.version, credentials=credentials
+            )
         except RegistrySkillsError:
             body = None
         return SkillsDetailResponse(detail=None, body=body)
@@ -294,6 +316,7 @@ class SkillsController:
                 alias=params.alias,
                 scope=self._scope(params.scope),
                 roots=self._host.skill_roots,
+                credentials=self._host.credentials,
             )
         except RegistrySkillsError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, exc.reason) from exc
@@ -310,6 +333,7 @@ class SkillsController:
                 params.version,
                 self._scope(params.scope),
                 self._host.skill_roots,
+                credentials=self._host.credentials,
             )
         except RegistrySkillsError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, exc.reason) from exc
@@ -325,6 +349,7 @@ class SkillsController:
                 params.name,
                 self._scope(params.scope),
                 self._host.skill_roots,
+                credentials=self._host.credentials,
             )
         except RegistrySkillsError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, exc.reason) from exc
@@ -339,6 +364,7 @@ class SkillsController:
                 params.alias,
                 self._scope(params.scope),
                 self._host.skill_roots,
+                credentials=self._host.credentials,
             )
         except RegistrySkillsError as exc:
             raise RequestFailure(ProtocolErrorCode.INVALID_PARAMS, exc.reason) from exc
@@ -362,24 +388,12 @@ class SkillsController:
     ) -> RuntimeMutationResponse:
         self._begin_mutation(params.session_id)
         self._require_toggleable(params.name)
-
-        def toggle(current: Any) -> list[str]:
-            names = [str(name) for name in current or []]
-            if params.enabled:
-                return [name for name in names if name != params.name]
-            return names if params.name in names else [*names, params.name]
-
-        failures = await self._host.config_orchestrator.mutate_field(
-            "/disabled_skills",
-            toggle,
+        await set_skill_enabled(
+            self._host.config_orchestrator,
+            params.name,
+            params.enabled,
             reason="toggle a skill from the skills browser",
-            default=[],
         )
-        if failures:
-            raise RequestFailure(
-                ProtocolErrorCode.INTERNAL_ERROR,
-                f"Failed to update configuration: {failures[0]}",
-            ) from failures[0]
         return await self._refreshed()
 
     async def _convert_local(
@@ -423,8 +437,6 @@ class SkillsController:
         self._host.require_session(session_id)
 
     async def _refreshed(self) -> RuntimeMutationResponse:
-        with contextlib.suppress(RegistrySkillsError, OSError):
-            await publish_local_pins(self._host.skill_roots)
         return RuntimeMutationResponse(runtime=await self._host.refresh())
 
     def _scope(self, scope: str) -> SkillScope:

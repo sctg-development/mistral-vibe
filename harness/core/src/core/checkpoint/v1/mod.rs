@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::config::HarnessConfig;
-use crate::core::features::compaction::CompactionBudget;
+use crate::core::config::{ContextSettings, HarnessConfig};
+use crate::core::features::compaction::{CompactionBudgets, EstimateCorrection};
 use crate::core::hooks::HookPoint;
 use crate::core::hooks::hook_action_id;
 use crate::core::model_context::ModelContext;
@@ -17,7 +17,7 @@ use crate::core::wire::tool::ToolCall;
 
 use self::context::CheckpointContext;
 use self::notification::CheckpointNotifications;
-use self::turn::CheckpointTurnState;
+use self::turn::{CheckpointTurnState, CompactionRestore};
 
 mod context;
 mod notification;
@@ -37,6 +37,15 @@ pub(super) struct CheckpointV1 {
     compaction_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_reported_context_tokens: Option<u64>,
+    /// Absent in checkpoints captured before the estimate correction existed,
+    /// and while it is 1.
+    #[serde(
+        default = "no_estimate_correction",
+        skip_serializing_if = "is_no_estimate_correction"
+    )]
+    estimate_correction: f64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rebuilt_since_reply: bool,
     turn: CheckpointTurnState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_finished_turn_id: Option<String>,
@@ -52,30 +61,49 @@ impl CheckpointV1 {
             context: CheckpointContext::capture(&state.context)?,
             compaction_count: state.compaction_count,
             last_reported_context_tokens: state.last_reported_context_tokens,
+            estimate_correction: state.estimate_correction.factor(),
+            rebuilt_since_reply: state.rebuilt_since_reply,
             turn: CheckpointTurnState::capture(&state.turn)?,
             last_finished_turn_id: state.last_finished_turn_id.clone(),
             notifications: CheckpointNotifications::capture(&state.notifications),
         })
     }
 
-    pub(super) fn restore(self, config: HarnessConfig) -> Result<HarnessState, String> {
+    /// Restores the checkpoint under `config`, moved there first from
+    /// `moved_from` when given. The move comes before a pending compaction is
+    /// fitted, since new model facts reset the estimate correction that fit
+    /// uses.
+    pub(super) fn restore(
+        self,
+        config: HarnessConfig,
+        moved_from: Option<&ContextSettings>,
+    ) -> Result<HarnessState, String> {
         let mut state =
             crate::core::initial_state(config).map_err(|error| error.detail().to_string())?;
         state.context = self.context.restore(
-            &state.config,
-            state.resolved_tools.tool_group_inventory_prompt_section(),
+            state.config(),
+            state.resolved_tools().tool_group_inventory_prompt_section(),
         )?;
         state.compaction_count = self.compaction_count;
         state.last_reported_context_tokens = self.last_reported_context_tokens;
+        state.estimate_correction = EstimateCorrection::restore(self.estimate_correction)?;
+        state.rebuilt_since_reply = self.rebuilt_since_reply;
+        if let Some(previous) = moved_from {
+            crate::core::move_from_settings(&mut state, previous)
+                .map_err(|error| error.detail().to_string())?;
+        }
         let generated_system = state.generated_system_message();
         state.turn = self.turn.restore(
             &state.context,
-            generated_system,
-            state.resolved_tools.top_level_tools(),
-            CompactionBudget {
-                token_threshold: state.config.settings.context.compaction.token_threshold(),
-                image_delivery: state.config.settings.context.image_delivery.compaction,
-                image_cost: state.config.settings.context.image_token_cost,
+            CompactionRestore {
+                generated_system,
+                tools: state.resolved_tools().top_level_tools(),
+                budget: CompactionBudgets::from_settings(
+                    &state.config().settings.context,
+                    state.estimate_correction,
+                )
+                .request,
+                prompts: &state.config().settings.prompts.compaction,
             },
         )?;
         state.last_finished_turn_id = self.last_finished_turn_id;
@@ -86,10 +114,18 @@ impl CheckpointV1 {
         )?;
         state
             .notifications
-            .retain_recent(state.config.settings.context.notifications.recent_ids);
+            .retain_recent(state.config().settings.context.notifications.recent_ids);
         validate_restored_state(&state)?;
         Ok(state)
     }
+}
+
+fn no_estimate_correction() -> f64 {
+    EstimateCorrection::NONE.factor()
+}
+
+fn is_no_estimate_correction(factor: &f64) -> bool {
+    EstimateCorrection::NONE.factor() == *factor
 }
 
 fn validate_restored_state(state: &HarnessState) -> Result<(), String> {
@@ -192,26 +228,8 @@ fn collect_tool_execution_action_ids(
     turn_id: &str,
     ids: &mut HashSet<String>,
 ) -> Result<(), String> {
-    match &execution.state {
-        ToolExecutionState::DirectAwaitingApproval {
-            approval_action_id, ..
-        } => insert_pending_action_id(ids, approval_action_id),
-        ToolExecutionState::DirectAwaitingPreHook {
-            hook_action_id,
-            hook_binding_ids,
-            ..
-        }
-        | ToolExecutionState::DirectAwaitingPostHook {
-            hook_action_id,
-            hook_binding_ids,
-            ..
-        } => {
-            validate_hook_binding_ids(hook_binding_ids)?;
-            insert_pending_action_id(ids, hook_action_id)
-        }
-        ToolExecutionState::DirectPending { call } => {
-            insert_pending_action_id(ids, &call.action_id)
-        }
+    let actions = match &execution.state {
+        ToolExecutionState::Direct(pending) => vec![pending.action(turn_id)],
         ToolExecutionState::ProgramPending { execution } => {
             let actions = execution.pending_actions(turn_id);
             if actions.is_empty() {
@@ -219,44 +237,41 @@ fn collect_tool_execution_action_ids(
                     "pending program checkpoint must contain at least one operation".to_string(),
                 );
             }
-            for action in actions {
-                match action {
-                    Action::Hook {
-                        effect_id,
-                        hook_binding_ids,
-                        ..
-                    } => {
-                        validate_hook_binding_ids(&hook_binding_ids)?;
-                        insert_pending_action_id(ids, &effect_id)?;
-                    }
-                    Action::RuntimeBuiltinTool { effect_id, .. }
-                    | Action::ProvidedTool { effect_id, .. } => {
-                        insert_pending_action_id(ids, &effect_id)?;
-                    }
-                    Action::Completion { .. } => {
-                        return Err(
-                            "pending program checkpoint cannot contain a completion action"
-                                .to_string(),
-                        );
-                    }
-                    Action::Approval { effect_id, .. } => {
-                        insert_pending_action_id(ids, &effect_id)?;
-                    }
-                    Action::Filesystem { .. } => {
-                        return Err(
-                            "pending program checkpoint cannot contain a filesystem action"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-            Ok(())
+            actions
         }
         ToolExecutionState::AwaitingLargeOutputWrite { action_id, .. } => {
-            insert_pending_action_id(ids, action_id)
+            return insert_pending_action_id(ids, action_id);
         }
-        ToolExecutionState::Completed { .. } => Ok(()),
+        ToolExecutionState::Completed { .. } => return Ok(()),
+    };
+    for action in actions {
+        match action {
+            Action::Hook {
+                effect_id,
+                hook_binding_ids,
+                ..
+            } => {
+                validate_hook_binding_ids(&hook_binding_ids)?;
+                insert_pending_action_id(ids, &effect_id)?;
+            }
+            Action::RuntimeBuiltinTool { effect_id, .. }
+            | Action::ProvidedTool { effect_id, .. }
+            | Action::Approval { effect_id, .. } => {
+                insert_pending_action_id(ids, &effect_id)?;
+            }
+            Action::Completion { .. } => {
+                return Err(
+                    "pending tool checkpoint cannot contain a completion action".to_string()
+                );
+            }
+            Action::Filesystem { .. } => {
+                return Err(
+                    "pending tool checkpoint cannot contain a filesystem action".to_string()
+                );
+            }
+        }
     }
+    Ok(())
 }
 
 fn insert_pending_action_id(ids: &mut HashSet<String>, id: &str) -> Result<(), String> {

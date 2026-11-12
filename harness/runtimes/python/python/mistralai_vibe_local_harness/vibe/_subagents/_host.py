@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from mistralai_vibe_local_harness.protocol import JsonObject
 from mistralai_vibe_local_harness.vibe._subagents._models import (
     ChildCommandTarget,
     ChildGenerationRef,
@@ -44,7 +45,10 @@ class ChildSessionHost(Protocol):
         spawn_key: str,
         start_new_actions: bool,
         require_existing: bool,
-    ) -> ChildSessionHandle: ...
+        instructions: str | None = None,
+    ) -> ChildSessionHandle:
+        """Open the child under ``binding``; ``instructions`` replace the binding's."""
+        ...
 
     async def start_child_turn(
         self,
@@ -62,7 +66,10 @@ class ChildSessionHost(Protocol):
         message: str,
         known_generation: ChildGenerationRef,
         operation_key: str,
+        content_meta: JsonObject | None = None,
     ) -> ChildCommandAdmission: ...
+
+    async def wait_for_child_restore(self, child_session_id: str) -> None: ...
 
     async def interrupt_child(
         self,
@@ -91,7 +98,7 @@ class ChildSessionHost(Protocol):
         self, child: ChildSessionHandle, binding: ResolvedChildSessionBinding
     ) -> bool: ...
 
-    async def child_is_quiescent(self, child_session_id: str) -> bool: ...
+    async def child_turn_in_flight(self, child_session_id: str) -> bool: ...
 
     async def delete_child(self, child_session_id: str) -> None: ...
 

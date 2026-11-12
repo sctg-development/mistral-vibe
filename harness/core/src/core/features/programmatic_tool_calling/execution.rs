@@ -4,8 +4,7 @@ use crate::core::error::CoreError;
 use serde_json::Value;
 use serde_json::json;
 
-use crate::core::action_id;
-use crate::core::features::permissions::{GrantKey, PermissionResolution};
+use crate::core::features::permissions::GrantKey;
 use crate::core::features::programmatic_tool_calling::code_mode::{
     self, CodeResult, EvaluationOutcome, EvaluationRequest, ProgramLogs,
 };
@@ -13,8 +12,8 @@ use crate::core::features::programmatic_tool_calling::model::PartialEvaluation;
 use crate::core::features::programmatic_tool_calling::model::ToolKind;
 use crate::core::features::programmatic_tool_calling::model::ToolState;
 use crate::core::features::programmatic_tool_calling::state::{
-    PendingProgramHook, PendingProgramOperation, ProgramContinuation, ProgramExecution,
-    UnfinishedOperation, resolve_tool_state,
+    PendingProgramOperation, ProgramContinuation, ProgramExecution, UnfinishedOperation,
+    resolve_tool_state,
 };
 use crate::core::features::programmatic_tool_calling::time_budget::{
     BUDGET_EXCEEDED, ProgramClock, budget_exceeded_error,
@@ -23,15 +22,15 @@ use crate::core::features::programmatic_tool_calling::{
     CompletedProgramResult, ProgramContext, ProgramOutcome, ProgrammaticName, TypeScriptTool,
 };
 use crate::core::hooks::{
-    HookCall, HookPoint, HookResult, PreToolCallOutput, hook_action_id, hook_failure_tool_result,
-    skipped_tool_result,
+    HookResult, PreToolCallOutput, hook_failure_tool_result, skipped_tool_result,
 };
 use crate::core::step_protocol::Action;
 use crate::core::step_protocol::DeterminismContext;
+use crate::core::tools::execution::external_call::{Admission, HookSide};
 use crate::core::tools::external::{
     ExternalTool, ExternalToolCall, ToolOrigin, effect_id_for_operation,
 };
-use crate::core::tools::result::{model_visible_content_block, permission_denied_result};
+use crate::core::tools::result::model_visible_content_block;
 use crate::core::wire::content::ContentBlock;
 use crate::core::wire::content::text_content;
 use crate::core::wire::tool::{
@@ -66,12 +65,6 @@ pub(super) fn start_program_execution(
     )
 }
 
-enum ProgramResume<'a> {
-    Approval { action_id: &'a str },
-    Tool { action_id: &'a str },
-    Hook { action_id: &'a str },
-}
-
 enum ProgramToolResultDisposition {
     Commit {
         call: ExternalToolCall,
@@ -91,23 +84,19 @@ impl ClassifiedProgramInput {
     fn resume_after_hook(action_id: String, call: &ExternalToolCall, result: ToolResult) -> Self {
         Self {
             accepted_result: Some(accepted_program_result(call.clone(), result.clone())),
-            transition: ProgramInputTransition::ResumeHook { action_id, result },
+            transition: ProgramInputTransition::Resume { action_id, result },
         }
     }
 }
 
 enum ProgramInputTransition {
-    ResumeApproval {
-        action_id: String,
-        result: ToolResult,
-    },
-    ResumeTool {
+    /// Settles the operation that waits for `action_id` and resumes the program.
+    Resume {
         action_id: String,
         result: ToolResult,
     },
     AwaitPostHook {
         action_id: String,
-        call: ExternalToolCall,
         hook_binding_ids: Vec<String>,
         result: ToolResult,
     },
@@ -123,10 +112,6 @@ enum ProgramInputTransition {
         effective_call: ExternalToolCall,
         /// `effective_call` fit to the time budget: the call Core sends.
         sent_call: ExternalToolCall,
-    },
-    ResumeHook {
-        action_id: String,
-        result: ToolResult,
     },
 }
 
@@ -219,25 +204,37 @@ fn evaluate_program_round(
     .map_err(CoreError::invariant)?
     {
         EvaluationOutcome::PartialEvaluation {
-            mut partial_evaluation,
+            partial_evaluation: evaluated,
             logs,
         } => {
             if budget_used {
                 // The program reached its next tool calls after the budget
                 // ran out: it stops before them, so steering gets in.
+                let error = budget_exceeded_error(budget_ms, used_ms);
+                accepted_results.extend(unstarted_program_results(
+                    context,
+                    &partial_evaluation.tool_state,
+                    &evaluated.tool_state,
+                    Some(&error),
+                ));
                 let result = failed_program_tool_result(
                     context.descriptors(),
-                    logs.stdout.as_deref(),
-                    logs.stderr.as_deref(),
-                    &partial_evaluation.tool_state,
-                    &logs.log_positions,
-                    budget_exceeded_error(budget_ms, used_ms),
+                    &logs,
+                    &evaluated.tool_state,
+                    error,
                 )?;
                 return Ok(ControlFlow::Break((
                     ProgramOutcome::Completed(Box::new(CompletedProgramResult { result })),
                     Vec::new(),
                 )));
             }
+            accepted_results.extend(unstarted_program_results(
+                context,
+                &partial_evaluation.tool_state,
+                &evaluated.tool_state,
+                None,
+            ));
+            let mut partial_evaluation = evaluated;
             let mut pending_operations = Vec::new();
             // Operations Core settles without starting them: permission
             // denials and sleeps after the time budget is used up.
@@ -267,16 +264,10 @@ fn evaluate_program_round(
                 };
                 let hook_binding_ids = resolved.pre_hook_binding_ids;
                 let operation = if !hook_binding_ids.is_empty() {
-                    let hook_action_id =
-                        hook_action_id(&operation_call.action_id, HookPoint::PreToolCall);
-                    PendingProgramOperation::awaiting_pre_hook(
-                        operation_call,
-                        hook_action_id,
-                        hook_binding_ids,
-                    )
+                    PendingProgramOperation::awaiting_pre_hook(operation_call, hook_binding_ids)
                 } else {
-                    match context.permission_resolution(&operation_call) {
-                        PermissionResolution::Allow => {
+                    match context.admit(&operation_call) {
+                        Admission::Run => {
                             match clock.fit(&operation_call, budget_ms, now_unix_ms) {
                                 Ok(call) => PendingProgramOperation::pending(&operation_call, call),
                                 Err(result) => {
@@ -286,14 +277,11 @@ fn evaluate_program_round(
                                 }
                             }
                         }
-                        PermissionResolution::Deny => {
-                            unstarted.push(accepted_program_result(
-                                operation_call,
-                                permission_denied_result(),
-                            ));
+                        Admission::Deny(result) => {
+                            unstarted.push(accepted_program_result(operation_call, result));
                             continue;
                         }
-                        PermissionResolution::Ask(grant_key) => {
+                        Admission::Ask(grant_key) => {
                             let programmatic_name =
                                 context.resolve_programmatic_name(&operation_call)?;
                             PendingProgramOperation::awaiting_approval(
@@ -346,12 +334,24 @@ fn evaluate_program_round(
             log_positions,
             result,
         } => {
+            let stop_error = match &result {
+                CodeResult::Error { error } => Some(error),
+                CodeResult::Success { .. } => None,
+            };
+            accepted_results.extend(unstarted_program_results(
+                context,
+                &partial_evaluation.tool_state,
+                &tool_state,
+                stop_error,
+            ));
             let result = completed_program_tool_result(
                 context.descriptors(),
-                stdout.as_deref(),
-                stderr.as_deref(),
+                &ProgramLogs {
+                    stdout,
+                    stderr,
+                    log_positions,
+                },
                 &tool_state,
-                &log_positions,
                 result,
             )?;
             Ok(ControlFlow::Break((
@@ -362,10 +362,8 @@ fn evaluate_program_round(
         EvaluationOutcome::Error { error } => {
             let result = failed_program_tool_result(
                 context.descriptors(),
-                None,
-                None,
+                &ProgramLogs::default(),
                 &partial_evaluation.tool_state,
-                &[],
                 error,
             )?;
             Ok(ControlFlow::Break((
@@ -376,18 +374,99 @@ fn evaluate_program_round(
     }
 }
 
+/// Committed results for the calls of one round that never started, so that
+/// each one is recorded like a call Core denied: calls whose arguments the
+/// sandbox rejected, and, when the program stopped with `stop_error`, calls
+/// still pending.
+fn unstarted_program_results(
+    context: ProgramContext<'_>,
+    before: &[ToolState],
+    after: &[ToolState],
+    stop_error: Option<&Value>,
+) -> Vec<AcceptedProgramResult> {
+    let settled_before = |operation_id: &str| {
+        before.iter().any(|operation| match operation {
+            ToolState::Resolved { id, .. } | ToolState::Rejected { id, .. } => id == operation_id,
+            ToolState::Pending { .. } => false,
+        })
+    };
+    after
+        .iter()
+        .filter_map(|operation| match operation {
+            ToolState::Rejected {
+                kind: ToolKind::External,
+                id,
+                function,
+                error,
+                ..
+            } if !settled_before(id) => Some((id, function, error)),
+            ToolState::Pending {
+                kind: ToolKind::External,
+                id,
+                function,
+            } => stop_error.map(|error| (id, function, error)),
+            _ => None,
+        })
+        .filter_map(|(operation_id, function, error)| {
+            // A Runtime reads a call's arguments as an object; the error names the rejected value.
+            let arguments = if function.arguments.is_object() {
+                function.arguments.clone()
+            } else {
+                json!({})
+            };
+            let resolved = context.resolve_operation(&function.name, arguments)?;
+            let call = ExternalToolCall {
+                action_id: effect_id_for_operation(ToolOrigin::Programmatic, operation_id),
+                call_id: operation_id.clone(),
+                origin: ToolOrigin::Programmatic,
+                call: resolved.tool,
+            };
+            Some(accepted_program_result(call, unstarted_tool_result(error)))
+        })
+        .collect()
+}
+
+fn unstarted_tool_result(error: &Value) -> ToolResult {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    ToolResult::Failure {
+        content: text_content(message.clone()),
+        structured_content: StructuredContent::Absent,
+        meta: None,
+        error: ProtocolError {
+            code: program_error_code(error),
+            message,
+            retryable: false,
+            details: error.get("details").cloned().unwrap_or(Value::Null),
+        },
+    }
+}
+
+/// The protocol code of a program error: a `ToolError` keeps the failed tool's code; other
+/// errors are named by their class.
+fn program_error_code(error: &Value) -> String {
+    let name = error.get("name").and_then(Value::as_str);
+    (name == Some("ToolError"))
+        .then(|| error.get("code").and_then(Value::as_str))
+        .flatten()
+        .or(name)
+        .unwrap_or("ExecutionError")
+        .to_string()
+}
+
 fn completed_program_tool_result(
     descriptors: &[TypeScriptTool],
-    stdout: Option<&str>,
-    stderr: Option<&str>,
+    logs: &ProgramLogs,
     tool_state: &[ToolState],
-    log_positions: &[usize],
     result: CodeResult,
 ) -> Result<ToolResult, CoreError> {
     match result {
         CodeResult::Success { value } => {
             if let Some(blocks) = returned_content_blocks(&value) {
-                let mut content = program_logs(stdout, stderr);
+                let mut content = program_logs(logs);
                 content.extend(blocks);
                 return Ok(ToolResult::Success {
                     content,
@@ -399,7 +478,7 @@ fn completed_program_tool_result(
                 serde_json::to_string(&value)
                     .map_err(|error| CoreError::invariant(error.to_string()))?,
             );
-            content.extend(program_logs(stdout, stderr));
+            content.extend(program_logs(logs));
             content.extend(retained_program_content(descriptors, tool_state));
             Ok(ToolResult::Success {
                 content,
@@ -407,30 +486,19 @@ fn completed_program_tool_result(
                 meta: None,
             })
         }
-        CodeResult::Error { error } => failed_program_tool_result(
-            descriptors,
-            stdout,
-            stderr,
-            tool_state,
-            log_positions,
-            error,
-        ),
+        CodeResult::Error { error } => {
+            failed_program_tool_result(descriptors, logs, tool_state, error)
+        }
     }
 }
 
 fn failed_program_tool_result(
     descriptors: &[TypeScriptTool],
-    stdout: Option<&str>,
-    stderr: Option<&str>,
+    logs: &ProgramLogs,
     tool_state: &[ToolState],
-    log_positions: &[usize],
     error: Value,
 ) -> Result<ToolResult, CoreError> {
-    let code = error
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("ExecutionError")
-        .to_string();
+    let code = program_error_code(&error);
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -442,13 +510,13 @@ fn failed_program_tool_result(
     ));
     if let Some(summary) = program_call_summary(
         tool_state,
-        log_positions,
+        &logs.log_positions,
         |runtime_name| program_display_name(descriptors, runtime_name),
         |_| CallStatus::NotStarted,
     ) {
         content.extend(text_content(summary));
     }
-    content.extend(program_logs(stdout, stderr));
+    content.extend(program_logs(logs));
     content.extend(retained_program_content(descriptors, tool_state));
     Ok(ToolResult::Failure {
         content,
@@ -470,12 +538,12 @@ fn returned_content_blocks(value: &Value) -> Option<Vec<ContentBlock>> {
     serde_json::from_value(value.clone()).ok()
 }
 
-fn program_logs(stdout: Option<&str>, stderr: Option<&str>) -> Vec<ContentBlock> {
+fn program_logs(logs: &ProgramLogs) -> Vec<ContentBlock> {
     let mut content = Vec::new();
-    if let Some(stdout) = stdout.filter(|value| !value.is_empty()) {
+    if let Some(stdout) = logs.stdout.as_deref().filter(|value| !value.is_empty()) {
         content.extend(text_content(format!("stdout:\n{stdout}")));
     }
-    if let Some(stderr) = stderr.filter(|value| !value.is_empty()) {
+    if let Some(stderr) = logs.stderr.as_deref().filter(|value| !value.is_empty()) {
         content.extend(text_content(format!("stderr:\n{stderr}")));
     }
     content
@@ -509,10 +577,11 @@ const SUMMARY_HEAD_ENTRIES: usize = 8;
 const MAX_SUMMARY_NAME_CHARS: usize = 80;
 const CONSOLE_LOG: &str = "console.log";
 
-/// Error codes of operations Core settled without starting them.
-/// A sleep the time budget refused or cut short has no effects, so it counts
-/// as not started too.
-const UNSTARTED_ERROR_CODES: [&str; 4] = [
+/// Error codes of operations that never started. Core and the Runtime check
+/// arguments before any effect. A sleep the time budget refused or cut short
+/// has no effects, so it counts as not started too.
+const UNSTARTED_ERROR_CODES: [&str; 5] = [
+    "invalid_arguments",
     "permission_denied",
     "approval_failed",
     "tool_skipped",
@@ -598,7 +667,7 @@ pub(crate) fn interrupted_program_content(
     ) {
         content.extend(text_content(summary));
     }
-    content.extend(program_logs(logs.stdout.as_deref(), logs.stderr.as_deref()));
+    content.extend(program_logs(&logs));
     content
 }
 
@@ -760,9 +829,11 @@ fn omitted_entries_line(entries: &[SummaryEntry]) -> String {
 
 fn rejected_status(error: &Value) -> CallStatus {
     let name = error.get("name").and_then(Value::as_str);
-    let invalid_arguments =
+    // A checkpoint from before ToolError stores the argument validation report
+    // itself, without an error code.
+    let older_invalid_arguments =
         error.get("type").and_then(Value::as_str) == Some("jsonSchemaArgumentValidationError");
-    if invalid_arguments || name.is_some_and(|name| UNSTARTED_ERROR_CODES.contains(&name)) {
+    if older_invalid_arguments || name.is_some_and(|name| UNSTARTED_ERROR_CODES.contains(&name)) {
         return CallStatus::NotStarted;
     }
     CallStatus::Failed
@@ -895,16 +966,14 @@ impl ProgramExecution {
                 Ok(match disposition {
                     ProgramToolResultDisposition::Commit { call } => ClassifiedProgramInput {
                         accepted_result: Some(accepted_program_result(call, result.clone())),
-                        transition: ProgramInputTransition::ResumeTool { action_id, result },
+                        transition: ProgramInputTransition::Resume { action_id, result },
                     },
                     ProgramToolResultDisposition::AwaitPostHook {
-                        call,
-                        hook_binding_ids,
+                        hook_binding_ids, ..
                     } => ClassifiedProgramInput {
                         accepted_result: None,
                         transition: ProgramInputTransition::AwaitPostHook {
                             action_id,
-                            call,
                             hook_binding_ids,
                             result,
                         },
@@ -918,28 +987,26 @@ impl ProgramExecution {
 
                 Ok(ClassifiedProgramInput {
                     accepted_result: Some(accepted_program_result(call.clone(), result.clone())),
-                    transition: ProgramInputTransition::ResumeApproval { action_id, result },
+                    transition: ProgramInputTransition::Resume { action_id, result },
                 })
             }
             ProgramInput::HookCompleted { action_id, result } => {
                 match (self.pending_hook(&action_id), result) {
                     (
-                        Some(PendingProgramHook::Pre(original)),
+                        Some((HookSide::Pre, original)),
                         HookResult::PreToolCall(PreToolCallOutput::Continue {
                             effective_arguments,
                         }),
                     ) => {
                         let effective_call =
                             context.effective_call(original, effective_arguments)?;
-                        Ok(match context.permission_resolution(&effective_call) {
-                            PermissionResolution::Deny => {
-                                ClassifiedProgramInput::resume_after_hook(
-                                    action_id,
-                                    &effective_call,
-                                    permission_denied_result(),
-                                )
-                            }
-                            PermissionResolution::Ask(grant_key) => ClassifiedProgramInput {
+                        Ok(match context.admit(&effective_call) {
+                            Admission::Deny(result) => ClassifiedProgramInput::resume_after_hook(
+                                action_id,
+                                &effective_call,
+                                result,
+                            ),
+                            Admission::Ask(grant_key) => ClassifiedProgramInput {
                                 accepted_result: None,
                                 transition: ProgramInputTransition::AwaitApprovalAfterPreHook {
                                     action_id,
@@ -949,7 +1016,7 @@ impl ProgramExecution {
                                     grant_key,
                                 },
                             },
-                            PermissionResolution::Allow => match self.clock().fit(
+                            Admission::Run => match self.clock().fit(
                                 &effective_call,
                                 context.settings().max_elapsed_ms,
                                 now_unix_ms,
@@ -971,7 +1038,7 @@ impl ProgramExecution {
                         })
                     }
                     (
-                        Some(PendingProgramHook::Pre(call)),
+                        Some((HookSide::Pre, call)),
                         HookResult::PreToolCall(PreToolCallOutput::Skip { reason }),
                     ) => {
                         let result = skipped_tool_result(reason)?;
@@ -979,28 +1046,26 @@ impl ProgramExecution {
                             action_id, call, result,
                         ))
                     }
-                    (
-                        Some(PendingProgramHook::Post(call)),
-                        HookResult::PostToolCall { tool_result },
-                    ) => Ok(ClassifiedProgramInput::resume_after_hook(
-                        action_id,
-                        call,
-                        self.within_result_limits(call, tool_result, false),
-                    )),
-                    (Some(PendingProgramHook::Pre(_)), _) => Err(CoreError::invalid_command(
+                    (Some((HookSide::Post, call)), HookResult::PostToolCall { tool_result }) => {
+                        Ok(ClassifiedProgramInput::resume_after_hook(
+                            action_id,
+                            call,
+                            self.within_result_limits(call, tool_result, false),
+                        ))
+                    }
+                    (Some((HookSide::Pre, _)), _) => Err(CoreError::invalid_command(
                         "pre-tool hook requires a pre_tool_call result",
                     )),
-                    (Some(PendingProgramHook::Post(_)), _) => Err(CoreError::invalid_command(
+                    (Some((HookSide::Post, _)), _) => Err(CoreError::invalid_command(
                         "post-tool hook requires a post_tool_call result",
                     )),
                     (None, _) => Err(CoreError::invariant("pending program hook was not found")),
                 }
             }
             ProgramInput::HookFailed { action_id, error } => {
-                let pending = self
+                let (_, call) = self
                     .pending_hook(&action_id)
                     .ok_or_else(|| CoreError::invariant("pending program hook was not found"))?;
-                let call = pending.call();
                 let result = hook_failure_tool_result(error);
                 Ok(ClassifiedProgramInput::resume_after_hook(
                     action_id, call, result,
@@ -1049,43 +1114,41 @@ impl ProgramExecution {
         } = self.classify_input(context, input, now_unix_ms)?;
         let mut accepted_results = Vec::from_iter(accepted_result);
         let advance = match transition {
-            ProgramInputTransition::ResumeApproval { action_id, result } => self.resume(
-                context,
-                parent_call,
-                ProgramResume::Approval {
-                    action_id: &action_id,
-                },
-                result,
-                determinism,
-                &mut accepted_results,
-            ),
-            ProgramInputTransition::ResumeTool { action_id, result } => self.resume(
-                context,
-                parent_call,
-                ProgramResume::Tool {
-                    action_id: &action_id,
-                },
-                result,
-                determinism,
-                &mut accepted_results,
-            ),
+            ProgramInputTransition::Resume { action_id, result } => {
+                match self.resolve_pending(&action_id, result)? {
+                    None => Ok(ProgramAdvance::Pending {
+                        actions: Vec::new(),
+                    }),
+                    Some(continuation) => {
+                        let (outcome, actions) = drive_program_execution(
+                            context,
+                            parent_call,
+                            continuation,
+                            determinism,
+                            &mut accepted_results,
+                        )?;
+                        match outcome {
+                            ProgramOutcome::Pending(execution) => {
+                                *self = execution;
+                                Ok(ProgramAdvance::Pending { actions })
+                            }
+                            ProgramOutcome::Completed(completed) if actions.is_empty() => {
+                                Ok(ProgramAdvance::Completed { completed })
+                            }
+                            ProgramOutcome::Completed(_) => Err(CoreError::invariant(
+                                "completed program execution produced pending actions",
+                            )),
+                        }
+                    }
+                }
+            }
             ProgramInputTransition::AwaitPostHook {
                 action_id,
-                call,
                 hook_binding_ids,
                 result,
             } => {
-                let hook_action_id = hook_action_id(&call.action_id, HookPoint::PostToolCall);
-                let action = Action::hook(
-                    hook_action_id.clone(),
-                    context.turn_id(),
-                    hook_binding_ids.clone(),
-                    HookCall::PostToolCall {
-                        tool_call: (&call).into(),
-                        tool_result: result.clone(),
-                    },
-                )?;
-                self.await_post_hook(&action_id, hook_action_id, hook_binding_ids, result)?;
+                let action =
+                    self.await_post_hook(&action_id, hook_binding_ids, result, context.turn_id())?;
                 Ok(ProgramAdvance::Pending {
                     actions: vec![action],
                 })
@@ -1096,20 +1159,12 @@ impl ProgramExecution {
                 grant_key,
                 programmatic_name,
             } => {
-                let approval_action_id = action_id::approval(&effective_call.action_id);
-                let approval = Action::approval(
-                    approval_action_id.clone(),
-                    context.turn_id(),
-                    &grant_key,
-                    &effective_call,
-                    programmatic_name.display_name(),
-                );
-                self.await_approval_after_pre_hook(
+                let approval = self.await_approval_after_pre_hook(
                     &action_id,
                     effective_call,
-                    approval_action_id,
                     grant_key,
                     programmatic_name,
+                    context.turn_id(),
                 )?;
 
                 Ok(ProgramAdvance::Pending {
@@ -1121,64 +1176,20 @@ impl ProgramExecution {
                 effective_call,
                 sent_call,
             } => {
-                self.continue_after_pre_hook(&action_id, &effective_call, sent_call.clone())?;
+                let action = self.continue_after_pre_hook(
+                    &action_id,
+                    &effective_call,
+                    sent_call,
+                    context.turn_id(),
+                )?;
                 Ok(ProgramAdvance::Pending {
-                    actions: vec![Action::external_tool(&sent_call, context.turn_id())],
+                    actions: vec![action],
                 })
             }
-            ProgramInputTransition::ResumeHook { action_id, result } => self.resume(
-                context,
-                parent_call,
-                ProgramResume::Hook {
-                    action_id: &action_id,
-                },
-                result,
-                determinism,
-                &mut accepted_results,
-            ),
         }?;
         Ok(ProgramTransition {
             advance,
             accepted_results,
-        })
-    }
-
-    fn resume(
-        &mut self,
-        context: ProgramContext<'_>,
-        parent_call: &ToolCall,
-        resume: ProgramResume<'_>,
-        result: ToolResult,
-        determinism: DeterminismContext,
-        accepted_results: &mut Vec<AcceptedProgramResult>,
-    ) -> Result<ProgramAdvance, CoreError> {
-        let Some((outcome, actions)) = resume_program_execution(
-            context,
-            parent_call,
-            self,
-            resume,
-            result,
-            determinism,
-            accepted_results,
-        )?
-        else {
-            return Ok(ProgramAdvance::Pending {
-                actions: Vec::new(),
-            });
-        };
-        Ok(match outcome {
-            ProgramOutcome::Pending(execution) => {
-                *self = execution;
-                ProgramAdvance::Pending { actions }
-            }
-            ProgramOutcome::Completed(completed) => {
-                if !actions.is_empty() {
-                    return Err(CoreError::invariant(
-                        "completed program execution produced pending actions",
-                    ));
-                }
-                ProgramAdvance::Completed { completed }
-            }
         })
     }
 }
@@ -1256,36 +1267,6 @@ pub(super) fn serialized_len(value: &impl serde::Serialize) -> usize {
     counter.0
 }
 
-fn resume_program_execution(
-    context: ProgramContext<'_>,
-    parent_call: &ToolCall,
-    program: &mut ProgramExecution,
-    resume: ProgramResume<'_>,
-    result: ToolResult,
-    determinism: DeterminismContext,
-    accepted_results: &mut Vec<AcceptedProgramResult>,
-) -> Result<Option<(ProgramOutcome, Vec<Action>)>, CoreError> {
-    let continuation = match resume {
-        ProgramResume::Approval { action_id } => {
-            program.resolve_pending_approval(action_id, result)?
-        }
-        ProgramResume::Tool { action_id } => program.resolve_pending_tool(action_id, result)?,
-        ProgramResume::Hook { action_id } => program.resolve_pending_hook(action_id, result)?,
-    };
-    let Some(continuation) = continuation else {
-        return Ok(None);
-    };
-    let outcome = drive_program_execution(
-        context,
-        parent_call,
-        continuation,
-        determinism,
-        accepted_results,
-    )?;
-
-    Ok(Some(outcome))
-}
-
 /// A replay-stable identity for one TypeScript evaluation.
 ///
 /// Derived from the context length rather than a counter so that replaying the
@@ -1360,11 +1341,7 @@ mod tests {
         }
         tool_state.push(summary_call(7, "file_system.bash", CallStatus::Failed));
         for call in 8..=10 {
-            tool_state.push(summary_call(
-                call,
-                "file_system.search_replace",
-                CallStatus::Done,
-            ));
+            tool_state.push(summary_call(call, "file_system.edit", CallStatus::Done));
         }
         tool_state.push(summary_call(11, "file_system.read_file", CallStatus::Done));
         tool_state.push(summary_call(12, "file_system.bash", CallStatus::Running));
@@ -1383,13 +1360,65 @@ console.log 1
 tools.file_system.read_file 1-6: done
 tools.file_system.bash 7: failed, check effects
 console.log 2-3
-tools.file_system.search_replace 8-10: done
+tools.file_system.edit 8-10: done
 tools.file_system.read_file 11: done
 tools.file_system.bash 12: still running, check effects
 tools.file_system.write_file 13-15: never started
 Do not repeat done calls; continue with the rest."
         );
         assert_eq!(call_summary(&[], &[0]), None);
+    }
+
+    #[test]
+    fn a_call_rejected_for_invalid_arguments_never_started() {
+        let rejected = |name: &str, details: Value| ToolState::Rejected {
+            kind: ToolKind::External,
+            id: "operation-1".to_string(),
+            function: ToolFunction {
+                name: "self.sleep".to_string(),
+                arguments: json!({}),
+            },
+            error: json!({"name": name, "message": "rejected", "details": details}),
+            content: Vec::new(),
+        };
+        let invalid = rejected(
+            "invalid_arguments",
+            json!({"type": "jsonSchemaArgumentValidationError"}),
+        );
+        // A built-in tool's domain check, such as a spawn `turns` of `3.0`,
+        // gives no details; the Runtime's check gives its own.
+        let invalid_builtin = rejected("invalid_arguments", Value::Null);
+        let invalid_in_runtime = rejected(
+            "invalid_arguments",
+            json!({"tool": "self.sleep", "errors": []}),
+        );
+        let failed = rejected("tool_failed", json!({}));
+        let older_report = ToolState::Rejected {
+            kind: ToolKind::External,
+            id: "operation-1".to_string(),
+            function: ToolFunction {
+                name: "self.sleep".to_string(),
+                arguments: json!({}),
+            },
+            error: json!({"type": "jsonSchemaArgumentValidationError"}),
+            content: Vec::new(),
+        };
+
+        assert_eq!(
+            call_summary(&[invalid], &[]).unwrap(),
+            "Calls, in order:\ntools.self.sleep 1: never started"
+        );
+        for call in [invalid_builtin, invalid_in_runtime, older_report] {
+            assert_eq!(
+                call_summary(&[call], &[]).unwrap(),
+                "Calls, in order:\ntools.self.sleep 1: never started"
+            );
+        }
+        assert!(
+            call_summary(&[failed], &[])
+                .unwrap()
+                .ends_with("tools.self.sleep 1: failed, check effects")
+        );
     }
 
     #[test]

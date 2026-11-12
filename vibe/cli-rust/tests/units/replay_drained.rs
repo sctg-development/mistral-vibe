@@ -1,12 +1,14 @@
-//! Replay drain sentinels release the e2e idle marker per request.
+//! Replay drain sentinels release the e2e fence ack per request.
 
 use std::sync::Arc;
 
 use serde_json::json;
-use vibe_rs::app::{App, Status};
+use vibe_rs::app::Status;
 use vibe_rs::event_handler;
 use vibe_rs::server::{notification, Client, Notification};
 use vibe_rs::telemetry::{self, TelemetryEvent};
+
+use crate::support::with_status;
 
 fn drained(request_id: u64) -> Notification {
     Notification {
@@ -17,8 +19,7 @@ fn drained(request_id: u64) -> Notification {
 
 #[tokio::test]
 async fn a_request_owes_frames_until_its_drain_sentinel_lands() {
-    let mut app = App::default();
-    app.session.status = Status::Starting;
+    let mut app = with_status(Status::Starting);
     let (client, _frames) = Client::stub_answering();
     let client = Arc::new(client);
     assert!(!client.owes_replay_frames());
@@ -46,16 +47,6 @@ fn event() -> TelemetryEvent {
         name: "vibe.test",
         properties: Default::default(),
     }
-}
-
-#[tokio::test]
-async fn sent_telemetry_owes_frames_before_its_task_runs() {
-    let (client, _frames) = Client::stub_answering();
-    let client = Arc::new(client);
-
-    telemetry::send(&client, "session", event());
-
-    assert!(client.owes_replay_frames());
 }
 
 #[tokio::test]

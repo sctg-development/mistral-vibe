@@ -1,10 +1,11 @@
 """One reading of a failed model provider call.
 
 Provider clients report failures in their own exception types. The Mistral SDK
-raises ``MistralError`` for an error response. HTTPX raises ``HTTPStatusError``
+raises ``MistralError`` for an error response. HTTPX2 raises ``HTTPStatusError``
 for one, and its transport errors when the connection fails. A streamed API can
 also report an error as an event after its response has started, which the
-adapters raise as ``ProviderStreamError``.
+adapters raise as ``ProviderStreamError``, and the stream guard raises
+``StreamStalledError`` for a response that went silent.
 
 This module is the only place that inspects those types. The retry policy and
 the failure reported to the user both read the ``ProviderFailure`` it returns,
@@ -13,30 +14,36 @@ so they cannot disagree about what happened.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 import json
 import ssl
 
-import httpx
+import httpx2
 from mistralai.client.errors import MistralError
 
 from mistralai_vibe_local_harness.session_protocol import PublicRetryCategory
-from mistralai_vibe_local_harness.vibe.adapters._stream_idle import (
-    ProviderStreamStalled,
+from mistralai_vibe_local_harness.vibe.completion_profile import (
+    NO_USAGE_MESSAGE,
+    StreamStalledError,
+    is_context_overflow,
 )
 
 
 def read_provider_failure(error: BaseException) -> ProviderFailure:
     response = _error_response(error)
+    context_overflow = _is_context_overflow(error, response)
     return ProviderFailure(
-        retryable=_is_retryable(error, response),
-        stalled=isinstance(error, ProviderStreamStalled),
+        # The same prompt overflows the same window on every attempt.
+        retryable=not context_overflow and _is_retryable(error, response),
+        stalled=isinstance(error, StreamStalledError),
         unusable_tool_calls=isinstance(error, UnusableToolCalls),
+        context_overflow=context_overflow,
         category=_category(error, response),
         label=type(error).__name__ if response is None else f"HTTP {response.status}",
         message=_message(error),
+        explanation=_provider_explanation(error),
         response=response,
     )
 
@@ -48,7 +55,7 @@ class ProviderFailure:
     retryable: bool
     """Whether another attempt of the same request can succeed."""
     stalled: bool
-    """Whether the response went silent after the model started answering.
+    """Whether the response went silent past a limit of the stream guard.
 
     A silence can also be a long generation the provider does not stream, which
     another attempt would repeat, so the retry policy limits how often a stall
@@ -61,11 +68,18 @@ class ProviderFailure:
     resends the whole context, so the retry policy limits how often it is
     retried.
     """
+    context_overflow: bool
+    """Whether the provider rejected the prompt as over the model's context window.
+
+    The same prompt overflows again, so it is not retried; Core can shorten it.
+    """
     category: PublicRetryCategory
     label: str
     """A short name for the cause, such as ``HTTP 503`` or ``ConnectError``."""
     message: str
     """A sentence for the user that carries the provider's own explanation."""
+    explanation: str | None
+    """The message the provider put in its error response body, if any."""
     response: ProviderErrorResponse | None
     """The provider's error response, or ``None`` when it never answered."""
 
@@ -73,7 +87,7 @@ class ProviderFailure:
 @dataclass(frozen=True, slots=True)
 class ProviderErrorResponse:
     status: int
-    headers: httpx.Headers
+    headers: Mapping[str, str]
 
 
 class ProviderStreamError(RuntimeError):
@@ -122,14 +136,35 @@ class ProviderRefusal(RuntimeError):
         self.explanation = explanation
 
 
+class MissingTokenUsage(RuntimeError):
+    """A finished reply that did not say how many tokens it used.
+
+    Core sizes the next request from each reply's usage, so a reply without it
+    cannot be accepted. Another attempt reaches the same provider, which leaves
+    usage out the same way, so the failure is not retried. A stream cut before
+    its trailing usage fails on the transport error instead, which is retried.
+    """
+
+    def __init__(
+        self, message: str = f"The provider reply is unusable: {NO_USAGE_MESSAGE}."
+    ) -> None:
+        super().__init__(message)
+
+
+def is_read_timeout(error: BaseException) -> bool:
+    """Whether a stream read failed on the transport read timeout."""
+    return isinstance(error, httpx2.ReadTimeout)
+
+
 async def until_connection_lost[T](
     source: AsyncIterator[T], *, complete: Callable[[], bool]
 ) -> AsyncGenerator[T]:
     """Yield the items of ``source``; once ``complete()`` holds, a lost connection ends it.
 
-    A provider sends the finish reason before the stream's end marker and any
-    trailing usage. A connection lost in between leaves a complete answer, and
-    retrying it would pay for the whole generation again.
+    A provider sends the finish reason and the usage before the stream's end
+    marker. A connection lost or stalled after both leaves a complete answer,
+    and retrying it would pay for the whole generation again. One lost before
+    the usage arrives is retried: Core cannot accept a reply without it.
     """
     iterator = aiter(source)
     while True:
@@ -137,7 +172,7 @@ async def until_connection_lost[T](
             item = await anext(iterator)
         except StopAsyncIteration:
             return
-        except (httpx.TransportError, ssl.SSLError):
+        except (httpx2.TransportError, ssl.SSLError, StreamStalledError):
             if not complete():
                 raise
             return
@@ -146,30 +181,34 @@ async def until_connection_lost[T](
 
 # 520 is the status an edge proxy answers with when the origin returns
 # something it cannot relay; the next attempt usually succeeds.
+# Twin: mistralai.vibe.harness.runtime.completion.providers.utils.RETRYABLE_STATUS_CODES
+# holds the same statuses; a parity test keeps both equal.
 _RETRYABLE_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 520, 529})
-_RETRYABLE_TRANSPORT_ERRORS: tuple[type[httpx.TransportError], ...] = (
-    httpx.TimeoutException,
-    httpx.NetworkError,
-    httpx.RemoteProtocolError,
+_RETRYABLE_TRANSPORT_ERRORS: tuple[type[httpx2.TransportError], ...] = (
+    httpx2.TimeoutException,
+    httpx2.NetworkError,
+    httpx2.RemoteProtocolError,
 )
 
 
 def _error_response(error: BaseException) -> ProviderErrorResponse | None:
     if isinstance(error, MistralError):
         return ProviderErrorResponse(status=error.status_code, headers=error.headers)
-    if isinstance(error, httpx.HTTPStatusError):
+    if isinstance(error, httpx2.HTTPStatusError):
         return ProviderErrorResponse(
             status=error.response.status_code, headers=error.response.headers
         )
     if isinstance(error, ProviderStreamError) and error.status is not None:
-        return ProviderErrorResponse(status=error.status, headers=httpx.Headers())
+        return ProviderErrorResponse(status=error.status, headers={})
     return None
 
 
 def _is_retryable(error: BaseException, response: ProviderErrorResponse | None) -> bool:
     if response is not None:
         return response.status in _RETRYABLE_STATUSES
-    if isinstance(error, IncompleteProviderStream | UnusableToolCalls):
+    if isinstance(
+        error, StreamStalledError | IncompleteProviderStream | UnusableToolCalls
+    ):
         return True
     # A rejected certificate is the one deterministic TLS fault: every attempt
     # fails the same way. During the handshake the transport wraps it in a
@@ -177,10 +216,20 @@ def _is_retryable(error: BaseException, response: ProviderErrorResponse | None) 
     if _rejected_certificate(error):
         return False
     # A TLS fault while the response body streams arrives as a bare
-    # ``ssl.SSLError``, outside the HTTPX transport errors.
+    # ``ssl.SSLError``, outside the HTTPX2 transport errors.
     if isinstance(error, ssl.SSLError):
         return True
     return isinstance(error, _RETRYABLE_TRANSPORT_ERRORS)
+
+
+def _is_context_overflow(
+    error: BaseException, response: ProviderErrorResponse | None
+) -> bool:
+    if isinstance(error, ProviderStreamError):
+        return is_context_overflow(error.status, str(error))
+    if response is None:
+        return False
+    return is_context_overflow(response.status, _response_body(error))
 
 
 def _rejected_certificate(error: BaseException) -> bool:
@@ -199,7 +248,7 @@ def _category(
 ) -> PublicRetryCategory:
     if response is not None:
         return _status_category(response.status)
-    if isinstance(error, httpx.TimeoutException):
+    if isinstance(error, httpx2.TimeoutException | StreamStalledError):
         return "timed_out"
     if isinstance(error, _RETRYABLE_TRANSPORT_ERRORS + (ssl.SSLError,)):
         return "connection"
@@ -233,15 +282,15 @@ def _message(error: BaseException) -> str:
 def _unexplained_message(error: BaseException) -> str:
     """A sentence for an exception that renders as an empty string.
 
-    HTTPX raises its transport timeouts without a message, which would otherwise
+    HTTPX2 raises its transport timeouts without a message, which would otherwise
     reach the user as a blank error.
     """
     name = type(error).__name__
-    if isinstance(error, httpx.ReadTimeout):
+    if isinstance(error, httpx2.ReadTimeout):
         return f"Timed out waiting for the model to send its response ({name})."
-    if isinstance(error, httpx.ConnectTimeout):
+    if isinstance(error, httpx2.ConnectTimeout):
         return f"Timed out connecting to the model provider ({name})."
-    if isinstance(error, httpx.TimeoutException):
+    if isinstance(error, httpx2.TimeoutException):
         return f"The model request timed out ({name})."
     return f"The model request failed ({name})."
 
@@ -275,21 +324,23 @@ def _provider_explanation(error: BaseException) -> str | None:
 def _response_body(error: BaseException) -> str | None:
     if isinstance(error, MistralError):
         return error.body
-    if not isinstance(error, httpx.HTTPStatusError):
+    if not isinstance(error, httpx2.HTTPStatusError):
         return None
     try:
         return error.response.text
-    except httpx.ResponseNotRead:
+    except httpx2.ResponseNotRead:
         # Reading here would block on a connection the failure already abandoned.
         return None
 
 
 __all__ = [
     "IncompleteProviderStream",
+    "MissingTokenUsage",
     "ProviderErrorResponse",
     "ProviderFailure",
     "ProviderRefusal",
     "ProviderStreamError",
+    "is_read_timeout",
     "read_provider_failure",
     "until_connection_lost",
 ]

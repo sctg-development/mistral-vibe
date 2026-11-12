@@ -8,16 +8,10 @@ from e2e.app_server.events import (
     turn_started,
     user_msg,
 )
-from e2e.app_server.scenario import Timeline
+from e2e.app_server.scenario import Timeline, take_snapshot
 
-env = {"VIBE_REPLAY_SETTLE_BUSY": "1", "VIBE_TYPING_GRACE_PERIOD_MS": "0"}
+env = {"VIBE_TYPING_GRACE_PERIOD_MS": "0"}
 handshake = {"callback/result": {"accepted": True}}
-# The prompt frame races the handshake under `SETTLE_BUSY`; capture from the
-# released callback onward.
-capture_startup = False
-# The box only reaches the screen once the released callback has been drawn, so
-# capture the two frames that follow it.
-capture_steps = {2, 3}
 
 _DOWN = "\x1b[B"
 _UP = "\x1b[A"
@@ -55,6 +49,5 @@ timeline: Timeline = [
     {"release": 5},
     _DOWN,
     _UP,
+    take_snapshot(),
 ]
-
-settle_per_key = True

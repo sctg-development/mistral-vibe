@@ -18,15 +18,16 @@ pub(crate) use crate::core::action_id::{
 };
 pub(crate) use crate::core::capabilities::{HookBinding, HookSelector};
 pub(crate) use crate::core::config::{
-    ContextSettings, HarnessConfig, HarnessConfigUpdate, HarnessSettings, ImageDeliveryMode,
-    ImageDeliverySettings, ImageTokenCost, ProvidedToolDefinition, ProvidedToolExposure,
-    ToolGroupDefinition, ToolGroupMetadata, ToolSettings, TurnSettings,
+    ContextSettings, HarnessConfig, HarnessConfigUpdate, HarnessSettings, ImageCostRule,
+    ImageDeliveryMode, ImageDeliverySettings, InputModality, ModelFacts, ProvidedToolDefinition,
+    ProvidedToolExposure, ToolGroupDefinition, ToolGroupMetadata, ToolSettings, TurnSettings,
 };
 pub(crate) use crate::core::error::CoreError;
 pub(crate) use crate::core::features::background_processes::Mode as BackgroundProcessMode;
 pub(crate) use crate::core::features::compaction::{
-    CompactionBudget, CompactionFallback, CompactionPolicy, CompactionTrigger,
+    CompactionBudget, CompactionPolicy, CompactionTrigger,
 };
+pub(crate) use crate::core::features::file_system::BashTimeoutSettings;
 pub(crate) use crate::core::features::large_output::Policy as LargeOutputPolicy;
 pub(crate) use crate::core::features::notifications::{
     AsyncToolNotificationStatus, Notification, NotificationLevel, NotificationSource,
@@ -44,12 +45,12 @@ pub(crate) use crate::core::hooks::{
 pub(crate) use crate::core::hooks::{HookToolKey, HookToolTarget};
 pub(crate) use crate::core::model_context::ModelContext;
 pub(crate) use crate::core::state::{
-    ActivePhase, ActiveTurn, HarnessState, QueuedTurn, StateInspection, TurnState,
+    ActivePhase, ActiveTurn, HarnessState, StateInspection, TurnState,
 };
 use crate::core::step_protocol::DeterminismContext;
 pub(crate) use crate::core::step_protocol::{
     AcceptedToolResult, ActionAbandonedCause, CandidateDiscardCause, Observation, Outcome,
-    Transition, TurnCompletion,
+    Transition,
 };
 pub(crate) use crate::core::step_protocol::{
     Action, CompletionActionKind, CompletionPurpose, ModelInputUpdate, ModelMessageUpdate,
@@ -61,6 +62,9 @@ pub(crate) use crate::core::step_protocol::{
 };
 pub(crate) use crate::core::tools::command_environment::CommandEnvironment;
 pub(crate) use crate::core::tools::context::ToolContext;
+pub(crate) use crate::core::tools::execution::external_call::{
+    ExternalCallStage, PendingExternalCall,
+};
 pub(crate) use crate::core::tools::execution::{ToolBatch, ToolExecution, ToolExecutionState};
 pub(crate) use crate::core::tools::external::{
     ExternalTool, ExternalToolCall, HookToolCall, ProvidedToolCall, RuntimeBuiltinToolCall,
@@ -90,7 +94,6 @@ pub(crate) use crate::core::{advance_in_place, initial_state, reconfigure_in_pla
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Step {
     pub state: HarnessState,
-    pub completed: Option<TurnCompletion>,
     pub effect: Option<Action>,
     pub effects: Vec<Action>,
     pub accepted_tool_result: Option<AcceptedToolResult>,
@@ -121,7 +124,7 @@ pub(crate) fn advance(mut state: HarnessState, command: HarnessCommand) -> Resul
             };
             model_input.tool_catalog = ModelToolCatalogUpdate::Replace {
                 revision: 0,
-                tools: state.resolved_tools.top_level_tools().to_vec(),
+                tools: state.resolved_tools().top_level_tools().to_vec(),
             };
         }
     }
@@ -147,7 +150,6 @@ pub(crate) fn advance(mut state: HarnessState, command: HarnessCommand) -> Resul
     let effects = transition.effects;
     let effect = effects.first().cloned();
     Ok(Step {
-        completed: transition.completed,
         state,
         effect,
         effects,
@@ -159,16 +161,16 @@ impl Step {
     /// The output the finished turn produced, mirroring what the Runtime would
     /// report as a completed turn.
     pub(crate) fn output(&self) -> Option<Vec<ContentBlock>> {
-        match &self.completed.as_ref()?.outcome {
+        match turn_outcome(&self.state)? {
             TurnOutcome::Completed { output } => Some(output.clone()),
-            TurnOutcome::Rejected { .. } => Some(Vec::new()),
+            TurnOutcome::Rejected { reason } => Some(vec![ContentBlock::text(reason.clone())]),
             TurnOutcome::Failed { .. } | TurnOutcome::Interrupted { .. } => None,
         }
     }
 
     /// Why the turn produced no answer, for the paths that record a reason.
     pub(crate) fn rejection_reason(&self) -> Option<&str> {
-        match &self.completed.as_ref()?.outcome {
+        match turn_outcome(&self.state)? {
             TurnOutcome::Rejected { reason } => Some(reason),
             TurnOutcome::Interrupted { reason } => reason.as_deref(),
             TurnOutcome::Completed { .. } | TurnOutcome::Failed { .. } => None,
@@ -187,13 +189,6 @@ pub(crate) fn turn_outcome(state: &HarnessState) -> Option<&TurnOutcome> {
 /// How many completions the active turn has committed.
 pub(crate) fn iterations(state: &HarnessState) -> u32 {
     state.active().map_or(0, |active| active.iterations)
-}
-
-pub(crate) fn queued_messages(state: &HarnessState) -> &[StoredMessage] {
-    match state.active().map(|active| &active.queued) {
-        Some(QueuedTurn::Pending { messages, .. }) => messages,
-        Some(QueuedTurn::Empty) | None => &[],
-    }
 }
 
 pub(crate) fn reconfigure(
@@ -250,9 +245,9 @@ pub(crate) fn message_role(message: &Message) -> Role {
 
 pub(crate) fn message_content(message: &Message) -> Vec<ContentBlock> {
     match message {
-        Message::System { content } | Message::User { content } | Message::Tool { content, .. } => {
-            content.clone()
-        }
+        Message::System { content }
+        | Message::User { content, .. }
+        | Message::Tool { content, .. } => content.clone(),
         Message::Assistant { content } => content
             .iter()
             .filter_map(|part| match part {
@@ -260,6 +255,30 @@ pub(crate) fn message_content(message: &Message) -> Vec<ContentBlock> {
                 AssistantPart::Semantic(_) => None,
             })
             .collect(),
+    }
+}
+
+/// Facts of a 262,144-token model with image input, at the default threshold
+/// the hosts compile for that window.
+pub(crate) fn test_model_facts() -> ModelFacts {
+    ModelFacts {
+        context_window: 262_144,
+        compaction_threshold: 202_144,
+        compaction_threshold_max: 238_144,
+        input_modalities: vec![InputModality::Text, InputModality::Image],
+        image_cost: ImageCostRule::Fixed { tokens: 8_192 },
+    }
+}
+
+/// Usage of a small reply, far below any compaction threshold.
+pub(crate) fn test_usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: 100,
+        output_tokens: 20,
+        total_tokens: 120,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
     }
 }
 
@@ -274,14 +293,13 @@ pub(crate) fn config() -> HarnessConfig {
             },
             context: ContextSettings {
                 compaction: CompactionPolicy::Disabled,
-                compaction_fallback: CompactionFallback::Standalone,
-                image_delivery: ImageDeliverySettings::default(),
                 notifications: crate::core::features::notifications::Settings {
                     pending_count: 1000,
                     pending_bytes: 1024 * 1024,
                     recent_ids: 1000,
                 },
-                image_token_cost: ImageTokenCost::SerializedBytes,
+                model_facts: test_model_facts(),
+                compaction_model_input_modalities: None,
             },
             tools: ToolSettings {
                 max_wait_ms: 3_600_000,
@@ -300,6 +318,11 @@ pub(crate) fn config() -> HarnessConfig {
                 file_system: Default::default(),
                 skills: Default::default(),
                 command_environment: CommandEnvironment::Unix,
+                // A Host's timeouts, as the Vibe CLI and agents_sdk set them.
+                bash_timeout: Some(BashTimeoutSettings {
+                    default_seconds: 120,
+                    max_seconds: 300,
+                }),
                 permissions: None,
             },
             prompts: Default::default(),
@@ -348,9 +371,13 @@ pub(crate) fn tool_action_id(origin: &str, operation_id: &str) -> String {
     crate::core::action_id::tool(origin, operation_id)
 }
 
-pub(crate) fn rebuild_hook_binding_index(state: &mut HarnessState) {
-    state.hook_binding_index =
-        crate::core::capabilities::HookBindingIndex::from_config(&state.config);
+pub(crate) fn edit_config(state: &mut HarnessState, edit: impl FnOnce(&mut HarnessConfig)) {
+    let mut config = state.config().clone();
+    edit(&mut config);
+    state.compiled = std::sync::Arc::new(
+        crate::core::compiled_config::CompiledConfig::compile(config)
+            .expect("edited configuration compiles"),
+    );
 }
 
 pub(crate) fn assistant_tool(name: &str, arguments: Value) -> Message {
@@ -383,6 +410,7 @@ pub(crate) fn user_message_for(turn_id: &str, text: &str, mode: UserMessageMode)
         turn_id: turn_id.to_string(),
         content: vec![ContentBlock::text(text)],
         mode,
+        output_type: None,
     }
 }
 
@@ -398,14 +426,9 @@ pub(crate) fn awaiting_action_id(state: &HarnessState) -> String {
             .executions
             .iter()
             .find_map(|execution| match &execution.state {
-                ToolExecutionState::DirectAwaitingApproval {
-                    approval_action_id, ..
-                } => Some(approval_action_id.clone()),
-                ToolExecutionState::DirectAwaitingPreHook { hook_action_id, .. }
-                | ToolExecutionState::DirectAwaitingPostHook { hook_action_id, .. } => {
-                    Some(hook_action_id.clone())
+                ToolExecutionState::Direct(pending) => {
+                    Some(pending.action(&active.turn_id).action_id().to_string())
                 }
-                ToolExecutionState::DirectPending { call } => Some(call.action_id.clone()),
                 ToolExecutionState::ProgramPending { execution } => execution
                     .pending_actions(&active.turn_id)
                     .first()
@@ -470,7 +493,7 @@ pub(crate) fn advance_llm(state: HarnessState, message: Message) -> Step {
             result: CompletionResult {
                 parts,
                 finish_reason,
-                usage: None,
+                usage: test_usage(),
             },
         },
     )
@@ -481,8 +504,9 @@ pub(crate) fn advance_llm_retry(
     mut state: HarnessState,
     feedback: &str,
 ) -> Result<Step, CoreError> {
-    add_always_hook(&mut state.config, HookPoint::PostLlmCall);
-    rebuild_hook_binding_index(&mut state);
+    edit_config(&mut state, |config| {
+        add_always_hook(config, HookPoint::PostLlmCall)
+    });
     let action_id = awaiting_action_id(&state);
     let state = advance(
         state,
@@ -493,7 +517,7 @@ pub(crate) fn advance_llm_retry(
                     "rejected draft".to_string(),
                 ))],
                 finish_reason: CompletionFinishReason::Stop,
-                usage: None,
+                usage: test_usage(),
             },
         },
     )?
@@ -549,6 +573,72 @@ pub(crate) fn advance_tool(
     advance(state, command).unwrap()
 }
 
+/// Core's uncorrected estimate of the agent request the checkpointed session
+/// makes next, tools included.
+pub(crate) fn agent_request_estimate(checkpoint: &Value, config: HarnessConfig) -> u64 {
+    let state = crate::core::checkpoint::decode_checkpoint(&checkpoint.to_string())
+        .and_then(|checkpoint| checkpoint.restore(config))
+        .expect("checkpoint restores");
+    crate::core::features::compaction::estimate_agent_request_tokens(&state)
+        .expect("request estimates")
+}
+
+pub(crate) fn summary_request_estimate(checkpoint: &Value, config: HarnessConfig) -> u64 {
+    let state = crate::core::checkpoint::decode_checkpoint(&checkpoint.to_string())
+        .and_then(|checkpoint| checkpoint.restore(config))
+        .expect("checkpoint restores");
+    crate::core::features::compaction::estimate_summary_request_tokens(&state)
+        .expect("request estimates")
+}
+
+/// The default config with automatic compaction at `token_threshold`.
+pub(crate) fn with_threshold(token_threshold: u64) -> HarnessConfig {
+    let mut config = config();
+    set_threshold(&mut config.settings, token_threshold);
+    config
+}
+
+/// Turns automatic compaction on at `token_threshold`, widening the
+/// window facts when the threshold is above them.
+pub(crate) fn set_threshold(settings: &mut HarnessSettings, token_threshold: u64) {
+    settings.context.compaction = CompactionPolicy::Automatic;
+    let facts = &mut settings.context.model_facts;
+    facts.compaction_threshold = token_threshold;
+    facts.compaction_threshold_max = facts.compaction_threshold_max.max(token_threshold);
+    facts.context_window = facts.context_window.max(token_threshold + 1);
+}
+
+/// Answers the awaited agent request with a reply reporting `input_tokens`.
+pub(crate) fn reply_with_input_tokens(state: HarnessState, input_tokens: u64) -> HarnessState {
+    let action_id = awaiting_action_id(&state);
+    let usage = TokenUsage {
+        input_tokens,
+        output_tokens: 7,
+        total_tokens: input_tokens + 7,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+    };
+    advance(
+        state,
+        HarnessCommand::CompletionSucceeded {
+            action_id,
+            result: CompletionResult {
+                parts: vec![CompletionResultPart::Content(ContentBlock::text("done"))],
+                finish_reason: CompletionFinishReason::Stop,
+                usage,
+            },
+        },
+    )
+    .unwrap()
+    .state
+}
+
+pub(crate) fn correction(factor: f64) -> crate::core::features::compaction::EstimateCorrection {
+    crate::core::features::compaction::EstimateCorrection::restore(factor)
+        .expect("valid correction")
+}
+
 pub(crate) fn started() -> HarnessState {
     started_with(config())
 }
@@ -556,6 +646,17 @@ pub(crate) fn started() -> HarnessState {
 pub(crate) fn started_with(config: HarnessConfig) -> HarnessState {
     let state = initial_state(config).unwrap();
     advance(state, user_message("work", UserMessageMode::Queue))
+        .unwrap()
+        .state
+}
+
+/// A started session whose request is long enough that a compaction threshold
+/// just above its estimate still fits the system prompt, tool catalog and
+/// compaction prompt.
+pub(crate) fn started_with_long_request() -> HarnessState {
+    let state = initial_state(config()).unwrap();
+    let request = "a long request ".repeat(4_000);
+    advance(state, user_message(&request, UserMessageMode::Queue))
         .unwrap()
         .state
 }

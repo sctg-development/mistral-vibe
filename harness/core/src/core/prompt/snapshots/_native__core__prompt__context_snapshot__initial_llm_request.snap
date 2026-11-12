@@ -33,7 +33,7 @@ expression: reviewable_snapshot(request)
                   "",
                   "## Using tool functions via run_typescript",
                   "",
-                  "The `run_typescript` tool executes TypeScript code in a sandbox environment. You can access external services via functions exposed under the `tools.<group>.<function>` namespace in the sandbox. Users might refer to these functions as \"tools\", \"integrations\", \"connectors\", or \"services\". `run_typescript` can also be used to perform data manipulation tasks such as counting, computing, filtering, grouping, aggregating, sorting, etc.",
+                  "The `run_typescript` tool executes TypeScript code in a sandbox environment. You can access external services via functions exposed under the `tools.<group>.<function>` namespace in the sandbox. A tool with no group is in the `client` group: call it as `tools.client.<function>`. Users might refer to these functions as \"tools\", \"integrations\", \"connectors\", or \"services\". `run_typescript` can also be used to perform data manipulation tasks such as counting, computing, filtering, grouping, aggregating, sorting, etc.",
                   "",
                   "Available tool functions can be discovered with the top-level `search_tool_functions` tool. For unfamiliar tool calls, use this sequence: `best_match` → `details` → `run_typescript`.",
                   "",
@@ -57,7 +57,7 @@ expression: reviewable_snapshot(request)
                   "",
                   "## Agents",
                   "",
-                  "Use the available functions in `tools.agents` through `run_typescript`. Before you delegate work to a child, or when a task needs tools you do not have, call `tools.agents.list_configs`. A named configuration can have instructions and tools that you do not have; when one fits the work, pass its name as `config_name`. Omit `config_name` only when none fits: the child then inherits your configuration. Each child has an independent Session and history. Spawn admits its first message without waiting for the answer. Child names are permanent single path segments below /root and cannot be reused. List shows admitted direct children, not provisional work. Agent operations are external effects.",
+                  "Use the available functions in `tools.agents` through `run_typescript`. Before you delegate work to a child, or when a task needs tools you do not have, call `tools.agents.list_configs`. Specialized agent configs may have tools you don't have. Use what is most relevant. If you omit `config_name`, the child is generic: it has your configuration but not your instructions, so give it `instructions` written for its task. At spawn, the child immediately receives your instruction at its first message: no need to call send_message again, unless you need to follow-up. You can make a child inherit some or all of your context, when relevant. Spawn does not wait for the answer: use wait for that. Each child's result arrives later as a message for you. If you need the answer of a child to perform your task, you must call 'wait' before your final answer. You can for instance perform other tasks, then use wait when you have nothing to do, but wait. Use an appropriate timeout. Do not poll `tools.agents.list`. A result that arrives after your final answer, does not wake you. It will reach you only in your next turn when the user messages you again. Each agent is identified by a path: '/root' is the first ('main') agent, and '/root/researcher' is its child named researcher. These are not files or folders. Child names are permanent and cannot be reused. But a child can be re-used, keeping its context, in later turn. List shows admitted direct children, not provisional work. Agent operations are external effects.",
                   "",
                   "## Available Skills",
                   "",
@@ -65,11 +65,13 @@ expression: reviewable_snapshot(request)
                   "",
                   "Call `skill` only with a name listed in `<available-skills>`. Connector names and unlisted names in skill instructions are not skills.",
                   "",
-                  "Do not read a root `SKILL.md` path with `read_file` after loading a skill. Use `read_file` only for support or reference files mentioned by the loaded skill.",
+                  "Load a skill only with `skill`, never by reading its root `SKILL.md` path with `read_file`. A listed skill's files may not exist until `skill` loads it. After loading, use `read_file` only for support or reference files mentioned by the loaded skill.",
                   "",
                   "## Current time",
                   "",
-                  "For requests that depend on now, use `run_typescript` to read `new Date().toISOString()` before time-sensitive search, calendar, schedule, or service calls. Treat that timestamp as the source of truth for \"now\". Use a user timezone supplied in context for user-facing times; otherwise use UTC or ask for the timezone only when local time materially affects the result.",
+                  "\"Now\" is the current date or time the user states. If the user states none, call `run_typescript` to read `new Date().toISOString()` before answering or acting on anything that depends on the date; make the call right away instead of announcing it. Dates in documents, emails, logs, records, and tool results describe those items, not today, even when they are the only dates in view. Use a user timezone supplied in context for user-facing times; otherwise use UTC, or ask for the timezone only when local time materially affects the result.",
+                  "",
+                  "## Use-case instructions",
                   "",
                   "You are operating in the canonical Unified Harness snapshot environment.",
                   "",
@@ -84,16 +86,16 @@ expression: reviewable_snapshot(request)
                   "- process",
                   "- acmeCalendar",
                   "",
+                  "Here are tools that are NOT available in `run_typescript` and `search_tool_functions`, call them directly: `askUser`, `skill`",
+                  "",
                   "<available-skills>",
                   "  <skill>",
                   "    <name>code-review</name>",
                   "    <description>Review code for correctness, maintainability, and regressions.</description>",
-                  "    <path>/workspace/.agents/skills/code-review/SKILL.md</path>",
                   "  </skill>",
                   "  <skill>",
                   "    <name>acme_tools:prepare-report</name>",
                   "    <description>Prepare an Acme report using approved data sources.</description>",
-                  "    <path>/plugins/acme.tools/skills/prepare-report/SKILL.md</path>",
                   "  </skill>",
                   "</available-skills>",
                   "",
@@ -155,6 +157,87 @@ expression: reviewable_snapshot(request)
       "type": "replace",
       "revision": 0,
       "tools": [
+        {
+          "name": "askUser",
+          "description": "Ask the user to choose one of a bounded set of options.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "question": {
+                "type": "string",
+                "minLength": 1
+              },
+              "options": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 5,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "label": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "label"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "question",
+              "options"
+            ],
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "createEvent",
+          "description": "Create a calendar event and return its stable identity.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "calendarId": {
+                "type": "string",
+                "minLength": 1
+              },
+              "title": {
+                "type": "string",
+                "minLength": 1
+              },
+              "startsAt": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "durationMinutes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "attendees": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "format": "email"
+                },
+                "default": []
+              }
+            },
+            "required": [
+              "calendarId",
+              "title",
+              "startsAt",
+              "durationMinutes"
+            ],
+            "additionalProperties": false
+          }
+        },
         {
           "name": "search_tool_functions",
           "description": {
@@ -236,7 +319,7 @@ expression: reviewable_snapshot(request)
               "### Sandbox capabilities and durability model",
               "",
               "- The sandbox is a replayable TypeScript workflow environment, not a general-purpose Node.js runtime. Use it for orchestration, tool-call wiring, and local data transformation.",
-              "- It supports standard JavaScript/TypeScript computation such as async/await, Promises, JSON, Array/Object/Map/Set operations, RegExp, URL parsing, TextEncoder/TextDecoder, and console output for debugging.",
+              "- It supports standard JavaScript/TypeScript computation such as async/await, Promises, JSON, Array/Object/Map/Set operations, RegExp, and console output for debugging.",
               "- It does not provide ambient filesystem access, Node.js packages, browser APIs, DOM APIs, or direct network I/O. Reach external systems only through the provided `tools.<group>.<function>` functions.",
               "- Execution may pause while tool calls are pending and later replay from the beginning. Local code can therefore run more than once; keep it to pure orchestration, pure data transforms, and tool-call wiring.",
               "- Time, randomness, and promise-selection APIs are recorded automatically and replay deterministically. This includes `Date()`, `new Date()`, `Date.now()`, `performance.now()`, `Math.random()`, `crypto.randomUUID()`, `crypto.getRandomValues()`, `Promise.race()`, and `Promise.any()`.",
@@ -249,7 +332,15 @@ expression: reviewable_snapshot(request)
               "- You MUST NOT call `main()` yourself - the sandbox calls it automatically",
               "- The result of the `main` function will be visible as a { type: \"success\", value } object.",
               "- The input must contain inline `code`.",
-              "- Tool calls may throw. Use `try/catch` or `.catch(...)` to recover or keep partial results; otherwise let errors propagate to the tool result.",
+              "- A failed tool call throws a `ToolError`, a subclass of `Error`: `name` is `\"ToolError\"`, `message` explains the failure, `code` is a stable error code, `tool` names the called function (`tools.<group>.<function>`), and `details` or `structuredContent` hold extra data when the tool gives it, such as a failed command's output. Codes include:",
+              "  - `invalid_arguments`: the arguments are invalid; the call did not run.",
+              "  - `permission_denied`, `tool_denied` or `policy_rejected`: a policy, the user or the file system refused the call.",
+              "  - `approval_failed`: nobody answered the approval request in time.",
+              "  - `tool_skipped`: a hook skipped the call.",
+              "  - `subagent_not_found`: no agent at that `agent_path` (for `interrupt`, no direct child there).",
+              "  - `ProgramBudgetExceeded`: the program's time budget ran out.",
+              "  - Any other code: the tool itself failed; `message` says why.",
+              "- Use `try/catch` or `.catch(...)` and branch on `error.code` to recover or keep partial results; otherwise let errors propagate to the tool result.",
               "- AVOID using console.log or console.error to read the output of functions. Rely on the main function's returned value instead. Only use console for debugging.",
               "- For independent calls, prefer `Promise.allSettled(...)`. Use `Promise.all(...)` only when all must succeed; avoid sequential awaits when calls can run concurrently.",
               "- You MUST NOT use `fetch()`, `setInterval()`, `atob()`, `btoa()`, `DOMParser`, `Buffer`, `require()`, `import()`, or `export` — they do not exist. Tool functions are already available under the `tools` namespace.",
@@ -259,7 +350,7 @@ expression: reviewable_snapshot(request)
               "",
               "### Available tool functions",
               "",
-              "Tool functions are available under `tools.<group>.<function>`; no imports needed.",
+              "Tool functions are available under `tools.<group>.<function>`; no imports needed. A tool that declares no group lives in the `client` group, so it is called as `tools.client.<function>`.",
               "",
               "Before calling an unfamiliar tool function, use `search_tool_functions` to load details for the exact function name. Use only documented function paths and argument shapes.",
               "",
@@ -327,7 +418,7 @@ expression: reviewable_snapshot(request)
         },
         {
           "name": "write_file",
-          "description": "Create or overwrite a UTF-8 file.",
+          "description": "Create or overwrite a UTF-8 file. Line breaks in `content` can be `\\n`, `\\r\\n` or `\\r`: the file keeps the line endings of the file it replaces, and a new file uses the repository's line endings when they can be found, or the platform default otherwise. To change a file's line endings, run a command such as `unix2dos` or `dos2unix`.",
           "parameters": {
             "type": "object",
             "additionalProperties": false,
@@ -351,7 +442,7 @@ expression: reviewable_snapshot(request)
             "$multiline": [
               "Exact string replacement in a file.",
               "",
-              "Read the current file first. `old_string` must match exactly, including whitespace, indentation, and line endings. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.",
+              "Read the current file first. `old_string` must match exactly, including whitespace and indentation. Line endings don't need to match: the file keeps its own. With `replace_all=false` (the default), `old_string` must occur exactly once; set `replace_all=true` only to replace every occurrence. If an edit fails, re-read the file before retrying.",
               "",
               "Example:",
               "{\"file_path\":\"src/config.ts\",\"old_string\":\"const mode = \\\"old\\\";\",\"new_string\":\"const mode = \\\"new\\\";\",\"replace_all\":false}"
@@ -367,7 +458,7 @@ expression: reviewable_snapshot(request)
               },
               "old_string": {
                 "type": "string",
-                "description": "Exact text to find, including whitespace, indentation, and line endings. It must occur exactly once unless `replace_all` is true.",
+                "description": "Exact text to find, including whitespace and indentation. It must occur exactly once unless `replace_all` is true.",
                 "minLength": 1
               },
               "new_string": {
@@ -389,7 +480,13 @@ expression: reviewable_snapshot(request)
         },
         {
           "name": "bash",
-          "description": "Run a shell command and capture stdout, stderr, and its return code.",
+          "description": {
+            "$multiline": [
+              "Run a shell command and capture stdout, stderr, and its return code.",
+              "",
+              "The call blocks until the command exits, and a command still running after `timeout_seconds` is stopped. Start long-running commands, such as servers and long builds, with `tools.process.start` and read their output with `tools.process.output`."
+            ]
+          },
           "parameters": {
             "type": "object",
             "additionalProperties": false,
@@ -400,7 +497,7 @@ expression: reviewable_snapshot(request)
               "timeout_seconds": {
                 "type": "integer",
                 "default": 120,
-                "description": "Seconds the command may run: 120 by default, at most 300. A command that runs longer is stopped, and the result keeps the output it wrote so far with `timed_out` set.",
+                "description": "Seconds the command may run: 120 by default, at most 300. A command that runs longer is stopped, and the result keeps the output it wrote so far with `timed_out` set. For longer work, use `tools.process.start` instead.",
                 "minimum": 1,
                 "maximum": 300
               }
@@ -426,87 +523,6 @@ expression: reviewable_snapshot(request)
             "required": [
               "name"
             ]
-          }
-        },
-        {
-          "name": "askUser",
-          "description": "Ask the user to choose one of a bounded set of options.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "question": {
-                "type": "string",
-                "minLength": 1
-              },
-              "options": {
-                "type": "array",
-                "minItems": 2,
-                "maxItems": 5,
-                "items": {
-                  "type": "object",
-                  "properties": {
-                    "id": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "label": {
-                      "type": "string",
-                      "minLength": 1
-                    }
-                  },
-                  "required": [
-                    "id",
-                    "label"
-                  ],
-                  "additionalProperties": false
-                }
-              }
-            },
-            "required": [
-              "question",
-              "options"
-            ],
-            "additionalProperties": false
-          }
-        },
-        {
-          "name": "createEvent",
-          "description": "Create a calendar event and return its stable identity.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "calendarId": {
-                "type": "string",
-                "minLength": 1
-              },
-              "title": {
-                "type": "string",
-                "minLength": 1
-              },
-              "startsAt": {
-                "type": "string",
-                "format": "date-time"
-              },
-              "durationMinutes": {
-                "type": "integer",
-                "minimum": 1
-              },
-              "attendees": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "format": "email"
-                },
-                "default": []
-              }
-            },
-            "required": [
-              "calendarId",
-              "title",
-              "startsAt",
-              "durationMinutes"
-            ],
-            "additionalProperties": false
           }
         }
       ]

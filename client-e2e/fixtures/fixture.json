@@ -56,8 +56,10 @@
         "theme": "ansi-dark",
         "logLevel": null,
         "disableWelcomeBannerAnimation": true,
+        "cursorBlink": false,
         "showGreeting": true,
         "autocopyToClipboard": true,
+        "enableFileAutocomplete": true,
         "fileWatcherForAutocomplete": false,
         "askConfirmationOnExit": true,
         "voiceModeEnabled": true,
@@ -68,6 +70,7 @@
         "enableUpdateChecks": true,
         "enableNotifications": true,
         "experimentalEnableTabStatus": true,
+        "enablePrMonitoring": true,
         "vibeCodeEnabled": true,
         "models": [
           {
@@ -193,8 +196,7 @@
         }
       ],
       "nextCursor": null,
-      "previousCursor": null,
-      "continueSessionId": "00000000-0000-4000-8000-000000000003"
+      "previousCursor": null
     },
     "session/delete": {},
     "session/read": {
@@ -283,8 +285,10 @@
           "theme": "ansi-dark",
           "logLevel": null,
           "disableWelcomeBannerAnimation": true,
+          "cursorBlink": false,
           "showGreeting": true,
           "autocopyToClipboard": true,
+          "enableFileAutocomplete": true,
           "fileWatcherForAutocomplete": false,
           "askConfirmationOnExit": true,
           "voiceModeEnabled": true,
@@ -295,6 +299,7 @@
           "enableUpdateChecks": true,
           "enableNotifications": true,
           "experimentalEnableTabStatus": true,
+          "enablePrMonitoring": true,
           "vibeCodeEnabled": true,
           "models": [
             {
@@ -394,48 +399,37 @@
         "skills": [],
         "tools": [
           {
-            "name": "skill",
-            "isCustom": false
+            "name": "skill"
           },
           {
-            "name": "task",
-            "isCustom": false
+            "name": "task"
           },
           {
-            "name": "web_fetch",
-            "isCustom": false
+            "name": "web_fetch"
           },
           {
-            "name": "bash",
-            "isCustom": false
+            "name": "bash"
           },
           {
-            "name": "edit",
-            "isCustom": false
+            "name": "edit"
           },
           {
-            "name": "grep",
-            "isCustom": false
+            "name": "grep"
           },
           {
-            "name": "ask_user_question",
-            "isCustom": false
+            "name": "ask_user_question"
           },
           {
-            "name": "read_file",
-            "isCustom": false
+            "name": "read_file"
           },
           {
-            "name": "web_search",
-            "isCustom": false
+            "name": "web_search"
           },
           {
-            "name": "todo",
-            "isCustom": false
+            "name": "todo"
           },
           {
-            "name": "write_file",
-            "isCustom": false
+            "name": "write_file"
           }
         ],
         "stats": {
@@ -487,12 +481,7 @@
         "status": "unavailable",
         "plan": null,
         "planOffer": null,
-        "rateLimitAction": null,
-        "teleportEligible": false,
-        "teleportAction": {
-          "kind": "upgrade_to_pro",
-          "url": "https://chat.mistral.ai/code/extensions?focus=key"
-        }
+        "rateLimitAction": null
       }
     },
     "identity/read": {
@@ -903,22 +892,6 @@
           ]
         },
         {
-          "name": "tool_paths",
-          "kind": "list",
-          "description": "Additional directories or files to explore for custom tools. Paths may be absolute or relative to the current working directory. Directories are shallow-searched for tool definition files, while files are loaded directly if valid.",
-          "value": [],
-          "path": "/tool_paths",
-          "popular": false,
-          "enumChoices": [],
-          "valueLabels": {},
-          "layerValues": [
-            {
-              "layer": "default",
-              "value": []
-            }
-          ]
-        },
-        {
           "name": "enabled_tools",
           "kind": "list",
           "description": "An explicit list of tool names/patterns to enable. If set, only these tools will be active. Supports glob patterns (e.g., 'serena_*') and regex with 're:' prefix (e.g., 're:^serena_.*').",
@@ -1133,7 +1106,7 @@
         {
           "name": "experimental_enable_registry_skills",
           "kind": "bool",
-          "description": "Experimental: pull workspace skills from the Mistral AI Registry (api.mistral.ai) and make them available alongside local skills. Requires a Mistral provider and API key. Local and builtin skills take precedence on name collision.",
+          "description": "Experimental: pull shared workspace skills from Mistral (api.mistral.ai) and make them available alongside local skills. Requires a Mistral provider and API key. On a name collision the project's skills win over global ones, skill_paths included, and within a scope a local skill wins over a shared one. Builtin skills are named vibe:<name>, so they never collide.",
           "value": false,
           "path": "/experimental_enable_registry_skills",
           "popular": false,
@@ -1339,6 +1312,22 @@
           ]
         },
         {
+          "name": "enable_file_autocomplete",
+          "kind": "bool",
+          "description": "Offer @ file mentions with repository file completion. Disable to skip building the file index and watching the filesystem for it.",
+          "value": true,
+          "path": "/enable_file_autocomplete",
+          "popular": false,
+          "enumChoices": [],
+          "valueLabels": {},
+          "layerValues": [
+            {
+              "layer": "default",
+              "value": true
+            }
+          ]
+        },
+        {
           "name": "file_watcher_for_autocomplete",
           "kind": "bool",
           "description": "",
@@ -1367,38 +1356,6 @@
             {
               "layer": "default",
               "value": true
-            }
-          ]
-        },
-        {
-          "name": "displayed_workdir",
-          "kind": "str",
-          "description": "",
-          "value": "",
-          "path": "/displayed_workdir",
-          "popular": false,
-          "enumChoices": [],
-          "valueLabels": {},
-          "layerValues": [
-            {
-              "layer": "default",
-              "value": ""
-            }
-          ]
-        },
-        {
-          "name": "context_warnings",
-          "kind": "bool",
-          "description": "",
-          "value": false,
-          "path": "/context_warnings",
-          "popular": false,
-          "enumChoices": [],
-          "valueLabels": {},
-          "layerValues": [
-            {
-              "layer": "default",
-              "value": false
             }
           ]
         },
@@ -1454,7 +1411,7 @@
             },
             {
               "layer": "default",
-              "value": false
+              "value": true
             }
           ]
         },
@@ -1465,22 +1422,6 @@
           "value": false,
           "path": "/bypass_tool_permissions",
           "popular": true,
-          "enumChoices": [],
-          "valueLabels": {},
-          "layerValues": [
-            {
-              "layer": "default",
-              "value": false
-            }
-          ]
-        },
-        {
-          "name": "raise_on_compaction_failure",
-          "kind": "bool",
-          "description": "",
-          "value": false,
-          "path": "/raise_on_compaction_failure",
-          "popular": false,
           "enumChoices": [],
           "valueLabels": {},
           "layerValues": [
@@ -1555,43 +1496,11 @@
           ]
         },
         {
-          "name": "include_model_info",
-          "kind": "bool",
-          "description": "",
-          "value": true,
-          "path": "/include_model_info",
-          "popular": false,
-          "enumChoices": [],
-          "valueLabels": {},
-          "layerValues": [
-            {
-              "layer": "default",
-              "value": true
-            }
-          ]
-        },
-        {
           "name": "include_project_context",
           "kind": "bool",
           "description": "",
           "value": true,
           "path": "/include_project_context",
-          "popular": false,
-          "enumChoices": [],
-          "valueLabels": {},
-          "layerValues": [
-            {
-              "layer": "default",
-              "value": true
-            }
-          ]
-        },
-        {
-          "name": "include_prompt_detail",
-          "kind": "bool",
-          "description": "",
-          "value": true,
-          "path": "/include_prompt_detail",
           "popular": false,
           "enumChoices": [],
           "valueLabels": {},
@@ -1906,8 +1815,10 @@
           "theme": "gruvbox",
           "logLevel": null,
           "disableWelcomeBannerAnimation": true,
+          "cursorBlink": false,
           "showGreeting": true,
           "autocopyToClipboard": true,
+          "enableFileAutocomplete": true,
           "fileWatcherForAutocomplete": false,
           "askConfirmationOnExit": true,
           "voiceModeEnabled": true,
@@ -1918,6 +1829,7 @@
           "enableUpdateChecks": true,
           "enableNotifications": true,
           "experimentalEnableTabStatus": true,
+          "enablePrMonitoring": true,
           "vibeCodeEnabled": true,
           "models": [
             {
@@ -2017,48 +1929,37 @@
         "skills": [],
         "tools": [
           {
-            "name": "skill",
-            "isCustom": false
+            "name": "skill"
           },
           {
-            "name": "task",
-            "isCustom": false
+            "name": "task"
           },
           {
-            "name": "web_fetch",
-            "isCustom": false
+            "name": "web_fetch"
           },
           {
-            "name": "bash",
-            "isCustom": false
+            "name": "bash"
           },
           {
-            "name": "edit",
-            "isCustom": false
+            "name": "edit"
           },
           {
-            "name": "grep",
-            "isCustom": false
+            "name": "grep"
           },
           {
-            "name": "ask_user_question",
-            "isCustom": false
+            "name": "ask_user_question"
           },
           {
-            "name": "read_file",
-            "isCustom": false
+            "name": "read_file"
           },
           {
-            "name": "web_search",
-            "isCustom": false
+            "name": "web_search"
           },
           {
-            "name": "todo",
-            "isCustom": false
+            "name": "todo"
           },
           {
-            "name": "write_file",
-            "isCustom": false
+            "name": "write_file"
           }
         ],
         "stats": {

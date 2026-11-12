@@ -1,7 +1,9 @@
 //! Bounded composer checkpoints, with time- and size-batched edits.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::UiInstant;
 
 use crate::app::ChatInput;
 use crate::input_modes::InputMode;
@@ -93,15 +95,18 @@ pub struct EditHistory {
     undo: VecDeque<Batch>,
     redo: Vec<Batch>,
     generation: u64,
-    last_edit: Option<Instant>,
+    last_edit: Option<UiInstant>,
     characters: usize,
     replaced: bool,
+    /// The undo length when the open group began.
+    group: Option<usize>,
 }
 
 impl EditHistory {
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.group = None;
         self.generation = self.generation.wrapping_add(1);
         self.checkpoint();
     }
@@ -110,7 +115,27 @@ impl EditHistory {
         self.last_edit = None;
     }
 
-    pub fn record(&mut self, before: Snapshot, after: Snapshot, isolated: bool, now: Instant) {
+    /// Open a group of edits that `end_group` folds into one undo step, unless one is open.
+    pub fn begin_group(&mut self) {
+        self.group.get_or_insert(self.undo.len());
+    }
+
+    pub fn end_group(&mut self) {
+        let Some(start) = self.group.take() else {
+            return;
+        };
+        if self.undo.len() < start + 2 {
+            return;
+        }
+        let mut grouped = self.undo.split_off(start);
+        let last = grouped.pop_back().unwrap();
+        let mut first = grouped.pop_front().unwrap();
+        first.after = last.after;
+        self.undo.push_back(first);
+        self.checkpoint();
+    }
+
+    pub fn record(&mut self, before: Snapshot, after: Snapshot, isolated: bool, now: UiInstant) {
         if before.generation != self.generation || before.same_text(&after) {
             return;
         }
@@ -125,7 +150,7 @@ impl EditHistory {
         let merge = !isolated
             && self
                 .last_edit
-                .is_some_and(|last| now.saturating_duration_since(last) <= CHECKPOINT_TIMER)
+                .is_some_and(|last| now.duration_since(last) <= CHECKPOINT_TIMER)
             && self.replaced == replaced
             && self.characters + characters <= MAX_BATCH_CHARACTERS
             && self.undo.back().is_some_and(|batch| batch.after == before);
@@ -142,11 +167,14 @@ impl EditHistory {
         // Evict oldest checkpoints; an oversized edit becomes a non-undoable baseline.
         while self.undo.len() > MAX_CHECKPOINTS || history_bytes(&self.undo) > MAX_HISTORY_BYTES {
             self.undo.pop_front();
+            self.group = self.group.map(|start| start.saturating_sub(1));
         }
     }
 
     pub fn restore(&mut self, current: &Snapshot, redo: bool) -> Option<Snapshot> {
         self.checkpoint();
+        // The next Insert key reopens a group at the restored length.
+        self.group = None;
         let batch = if redo {
             self.redo.last()?
         } else {
@@ -194,7 +222,7 @@ fn changed_text<'a>(before: &'a str, after: &'a str) -> (&'a str, &'a str) {
 }
 
 impl ChatInput {
-    pub fn record_edit(&mut self, before: Snapshot, isolated: bool, now: Instant) {
+    pub fn record_edit(&mut self, before: Snapshot, isolated: bool, now: UiInstant) {
         let after = Snapshot::capture(self);
         self.edit_history.record(before, after, isolated, now);
     }

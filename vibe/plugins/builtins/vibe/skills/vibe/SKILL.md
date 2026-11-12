@@ -37,7 +37,7 @@ agents, prompts, logs, and session data live here.
   agents/              # Custom agent profiles (*.toml)
   prompts/             # Custom prompts (*.md)
   skills/              # User-level skills (each skill is a subdirectory with SKILL.md)
-  tools/               # Custom tools (<name>.py); descriptions in tools/prompts/<name>.md
+  tools/               # Former custom Python tools, no longer loaded (see below)
   logs/
     vibe.log           # Main log file
     session/           # Session log files
@@ -52,14 +52,17 @@ When in a trusted folder, Vibe also looks for project-local configuration:
 - `.vibe/config.toml` - Project-specific config (overrides user config)
 - `.vibe/hooks.toml` - Project-specific hooks (requires trusted folder)
 - `.vibe/skills/` - Project-specific skills
-- `.vibe/tools/` - Project-specific tools (`<name>.py`); a `prompts/<name>.md` beside them describes the custom tool `<name>`. Same `tools/*.py` + `tools/prompts/*.md` layout as the builtins.
+- `.vibe/tools/` - Former project-specific custom Python tools, no longer loaded (see below)
 - `.vibe/agents/` - Project-specific agents
 - `.vibe/prompts/` - Project-specific prompts
 - `.agents/skills/` - Standard agent skills directory
 
-Custom Python tools will be deprecated in a future release. Recommend skills
-for new extensions. When a user asks for migration help, inspect the custom
-tool's behavior and replace it with an equivalent skill.
+Custom Python tools are no longer supported: Vibe does not load the `.py` files
+in `~/.vibe/tools/` or `.vibe/tools/`, and reports each one as a config issue.
+At startup Vibe also removes the former `tool_paths` setting from
+`config.toml`; the folders it listed stay on disk. Recommend skills for new
+extensions. When a user asks for migration help, inspect the custom tool's
+behavior and replace it with an equivalent skill.
 
 ### AGENTS.md Discovery
 
@@ -81,13 +84,23 @@ is present. Set `ask_confirmation_on_exit = false` to make `Ctrl+D` quit on the
 first press (also toggleable in `/config`); `Ctrl+C` always requires a second
 press. `Ctrl+Z` suspends on POSIX (resume with `fg`).
 
+### Prompt History
+
+`Up`/`Down` recall previous prompts (stored in `~/.vibe/vibehistory`, newest 100
+kept). `Ctrl+R` opens a `reverse-i-search:` field in the bottom bar: the input
+previews the newest prompt containing the query (case-insensitive), `Up`/`Ctrl+R`
+move to older matches and `Down`/`Ctrl+S` to newer ones, `Enter` keeps the match
+in the input without sending it (`Ctrl+Z` undoes), `Esc`/`Ctrl+C` restore the draft.
+
 ### Update
 
 Vibe never updates silently. With `enable_update_checks = true` (default), it
 checks for a newer `mistral-vibe` daily and prompts on the next launch when
 one exists. uv tool installs ask `uv tool list --outdated`, so uv settings such
-as `exclude-newer` apply; other installs poll PyPI. Accepting runs
-`uv tool upgrade mistral-vibe`, then `brew upgrade mistral-vibe` as a fallback. Disable via `enable_update_checks
+as `exclude-newer` apply; other installs, and uv older than 0.10.10, poll PyPI. Accepting runs
+`uv tool upgrade mistral-vibe`, then `brew upgrade mistral-vibe` as a fallback. On
+Windows, accepting prints the upgrade command to run after closing every Vibe
+session instead, since a running Vibe locks its own files. Disable via `enable_update_checks
 = false`. Run `vibe update` (equivalent to `vibe --check-upgrade`) to check
 immediately, prompt to install a newer version if one exists, and exit. Initial
 install: `uv tool install mistral-vibe`.
@@ -98,8 +111,12 @@ install: `uv tool install mistral-vibe`.
 
 ### Resume
 
-- `vibe -c` / `--continue`: most recent session in this terminal (TTY-scoped;
-  falls back to latest in cwd).
+- `vibe -c` / `--continue`: the last session used in this terminal in the
+  current folder (it moves on a new session's first message, or when a saved
+  session is reopened); otherwise the folder's most recent session. Works with
+  `-p` too. The terminal is the tty device on macOS/Linux, the console window
+  or `WT_SESSION` on Windows; `VIBE_TERMINAL_KEY` overrides it, and an empty
+  value means "no terminal" (folder rule only).
 - `vibe --resume [SESSION_ID]`: specific session; without an id, opens a picker.
 - In-session: `/resume` (alias `/continue`).
 
@@ -163,6 +180,22 @@ prefix (e.g., `VIBE_ACTIVE_MODEL=my-local-model`).
 Custom prompt IDs are resolved from project-local `.vibe/prompts/` first, then
 from `~/.vibe/prompts/`, and finally from the built-in bundled prompts.
 
+### Settings Vibe does not use
+
+Vibe checks `~/.vibe/config.toml`, the trusted project `.vibe/config.toml` and
+the active agent profile for settings it does not use: a misspelt key (with the
+closest setting name), a retired setting such as `include_model_info`, or a
+setting with no effect such as `[tools.grep]`. Each one is a warning at startup,
+and `vibe -p` prints it on stderr.
+
+To refuse a config with such settings instead, set `strict_config = true` in
+`config.toml` or `VIBE_STRICT_CONFIG=1` in the environment; Vibe then stops with
+the list. `VIBE_STRICT_CONFIG` takes a boolean: `1`, `true`, `yes` or `on` to
+refuse, `0`, `false`, `no` or `off` to warn; any other value is refused too.
+
+`vibe config schema` prints a JSON schema of every setting, including each
+built-in tool's settings, for an editor to validate `config.toml` against.
+
 ### Key Settings
 
 ```toml
@@ -173,8 +206,12 @@ active_model = "mistral-medium-3.5"  # Model alias to pin; omit or set "" to fol
 theme = "auto"  # Follow terminal background, then OS light/dark preference
 disable_welcome_banner_animation = false
 cursor_blink = true  # Blink the input cursor; false keeps it steady
+vim_keybindings = false  # Vim Normal and Insert modes in the prompt input
 autocopy_to_clipboard = true  # Enable automatic copying of selected text to clipboard
-file_watcher_for_autocomplete = true  # Refresh @ suggestions after workspace changes
+enable_mouse_capture = true  # Capture the mouse for scrolling, clicks and selection; false keeps the terminal's native selection
+enable_sticky_prompt = true  # Pin the prompt of the section at the top of the transcript while scrolling
+enable_file_autocomplete = true  # Offer @ file completion; off skips the file index entirely
+file_watcher_for_autocomplete = true  # Refresh @ suggestions and pick up skill changes after workspace changes
 ask_confirmation_on_exit = true  # Require a second Ctrl+D to quit (Ctrl+C always confirms)
 show_greeting = true  # Show "Hello {name}" greeting below the banner at startup (Mistral providers, once per 24h)
 log_level = "WARNING"  # Optional. DEBUG | INFO | WARNING | ERROR | CRITICAL — log level for ~/.vibe/logs/vibe.log
@@ -183,14 +220,44 @@ log_level = "WARNING"  # Optional. DEBUG | INFO | WARNING | ERROR | CRITICAL —
 `cursor_blink` controls the main input cursor. Change it through `/config`, or
 edit `config.toml` and run `/reload`; no restart is needed.
 
+`enable_sticky_prompt` pins the prompt of the conversation section at the top of
+the transcript once it scrolls off; the next section's prompt pushes it out. It
+shows at most three rows, the last one cut with `…`, and turns off below 15
+transcript rows. A prompt a scheduled loop sent pins as its folded title
+(`⏵ title`), without its instructions or `loop` line. Clicking it
+scrolls the transcript back to that prompt. Set it to `false` through `/config`,
+or edit `config.toml` and run `/reload`; no restart is needed.
+
+`vim_keybindings` adds a subset of vim to the prompt input. It starts in Insert
+mode, labelled `INSERT` on its bottom border with a bar caret; `Esc` enters Normal
+mode, unlabelled with a block caret.
+In Normal mode `Esc` interrupts a running turn and `Esc Esc` on an empty prompt
+opens rewind; it never clears the draft. Normal mode supports
+`h l w b e 0 ^ $ gg G j k`, `i a I A o O`, `x X D C dd cc`, `d`/`c` with
+`w e b 0 ^ $` (`Esc` or `Enter` cancels a pending `d`/`c`), `u` and `Ctrl+R` (redo, not history search); `/` or `!` on an empty prompt opens that mode.
+In Insert mode `Esc` enters Normal mode, so `Ctrl+C` interrupts a running turn.
+Other shortcuts (`Ctrl+A`, `Ctrl+G`, ...) work in both modes. There is no visual
+mode, yank/paste, count or `:` command.
+
 ### Copy and Text Selection
 
-- **Copy shortcuts**: `Ctrl+Y` and `Ctrl+Shift+C` both copy the current selection to the clipboard. When autocopy is enabled (default), releasing the mouse over a selection also copies automatically. Each successful copy flashes a brief inline "Copied to clipboard" notice.
-- **Multi-click selection**: Double-click selects a word, triple-click selects the current paragraph; dragging extends the selection at the same granularity.
+- **Copy shortcuts**: `Ctrl+Y` and `Ctrl+Shift+C` both copy the current selection to the clipboard. On macOS and Linux, with nothing selected, `Ctrl+Y` yanks (pastes back) the text the last `Ctrl+K`, `Ctrl+Shift+K`, `Ctrl+U`, `Ctrl+W`, `Alt+D` or word delete removed from the input box. Each kill replaces the previous one. When autocopy is enabled (default), releasing the mouse over a selection also copies automatically, as does a drag that ends without a release (the terminal losing focus, or a key other than `Esc`, which aborts the drag without copying). Each successful copy flashes a brief inline "Copied to clipboard" notice.
+- **Multi-click selection**: Double-click selects a word, triple-click selects the current paragraph; dragging extends the selection at the same granularity. Clicking a collapsible transcript entry (tool group, tool call, reasoning) toggles it on every click; drag to select its text.
+- **Terminal-native selection**: `enable_mouse_capture = false` (or `VIBE_ENABLE_MOUSE_CAPTURE=false`) turns mouse capture off, so the terminal's own selection and copy work instead of in-app selection; depending on the terminal, some other mouse interactions such as clicks are disabled too. It applies live from `/config` or `/reload`. Inside a tmux session whose `mouse` option is off (the default before tmux 3.8), Vibe behaves as if this setting were `false`, re-reading the option at startup and when resuming from suspend or an external editor. Native selection only covers the visible screen; `Shift+Up/Down` always scrolls the transcript. In some terminals the mouse wheel then sends Up/Down keys, which recall prompt history in the input box.
+- **Warnings**: Config issues, config validation warnings, and the warnings the
+  app server reports before the first turn (an MCP server or connector that
+  failed to load, a model catalogue problem) are listed together in one
+  `Warnings` box at the top of a new conversation (below the history of a
+  resumed one). Once a turn has started, each new warning appears as its own
+  `⚠` line in the conversation. Errors always appear as their own `✗` line.
+- **Clipboard tools**: Copies use `pbcopy` on macOS and `clip` on Windows; on Linux they try `wl-copy`, then `xclip`, then `xsel`. Vibe always also sends the text through OSC 52, and over SSH it relies on OSC 52 alone. Inside tmux, it instead runs `tmux load-buffer -w` to fill a tmux paste buffer and forward the text to the attached terminal's clipboard. If tmux's `set-clipboard` is `off`, or the terminal lacks the `Ms` capability, it falls back to OSC 52 passthrough. When no native copy succeeds, the notice reads `Copied · <hint>` instead (auth URL copies read `Auth URL copied · <hint>`). On local Linux the hint is `if paste fails, Shift+select or install xclip`; elsewhere, including over SSH, it is `if paste fails, Shift+select (Option in iTerm2, Fn in Terminal.app)`. Shift+select uses the terminal's native selection.
 
 ```toml
 # Behavior
 bypass_tool_permissions = false    # Skip tool approval prompts
+outside_workdir = "ask"            # Outside-workdir file/shell access: "ask" prompts, "deny" refuses with a tool error
+worktree_copy_on_write = true      # macOS: clone new worktrees of a trusted repo from a template checkout; sets extensions.worktreeConfig in the repo
+enable_pr_monitoring = true        # Track the session's PRs/MRs (gh/glab): detect created ones, find existing ones for the branch, keep their status fresh
 system_prompt_id = "cli"          # System prompt: "cli", "lean", or custom .md filename
 compaction_prompt_id = "compact"  # Compaction prompt: built-in "compact" or custom .md filename
 enable_telemetry = true
@@ -199,21 +266,18 @@ enable_notifications = true
 enable_system_trust_store = false  # Use OS trust store for outbound HTTPS
 api_timeout = 720.0               # API request timeout in seconds
 api_retry_max_elapsed_time = 300.0  # Retry budget for retryable API failures in seconds
-api_stream_idle_timeout = 0.0     # Silence after the model starts answering that counts as a stall, in seconds; 0 disables
-auto_compact_threshold = 200000   # Fallback for models without their own threshold
-compaction_max_output_tokens = 80000     # Output cap for compaction requests; 0: same cap as other requests
-# compaction_thinking = "low"            # Thinking for the first compaction request; unset keeps the compaction model's level
-compaction_reasoning_limit_tokens = 32000  # Reasoning after which compaction falls back to a request without tools or reasoning; 0 disables
+api_stream_idle_timeout = 300.0   # Silence after the model starts answering that counts as a stall, in seconds; 0 allows api_timeout
+# auto_compact_threshold = 200000 # optional fallback for models without their own threshold; unset: derived from each model's context window
+compaction_reasoning_limit_tokens = 32000  # Reasoning after which a compaction summary is stopped and asked for once more, briefly, without tools and with reasoning off or lowest; 0 disables
 output_limit_retries = 6          # Answers cut off at the output limit that a turn retries with feedback; 0 ends the turn on the first
-output_token_reserve = 4096       # Tokens kept free when the output cap is clipped to a model's max_context_length
+agent_max_output_tokens = 0       # Output cap sent as max_tokens on every agent and subagent request, on any provider, held to the model's max output and to the window's room above the compaction threshold; 0 sends one only where the provider requires one (the model's max_output_tokens)
+compaction_max_output_tokens = 0  # Output cap sent as max_tokens on every compaction request, on any provider, held the same way; 0 sends one only where the provider requires one
 
 # Git commit behavior
 include_commit_signature = true   # Add "Co-Authored-By" to commits
 
 # System prompt composition
-include_model_info = true         # Include model name in system prompt
 include_project_context = true    # Include project context (git info, cwd) in system prompt
-include_prompt_detail = true      # Include OS info, tool prompts, skills, and agents in system prompt
 
 # Voice features
 voice_mode_enabled = false
@@ -267,7 +331,11 @@ emits_finish_reason = false  # set false for OpenAI-compatible endpoints that en
 
 ```toml
 # Restrict selectable models by their canonical API names, not their aliases.
-# Glob patterns and regular expressions prefixed with "re:" are supported.
+# Glob and "re:" patterns, matched in full. The only way to hide server-routed
+# models; a hidden routed default falls back to the catalog recommendation,
+# then Mistral Medium 3.5, then the first allowed model. Keep one pattern per
+# model: a pattern matching
+# nothing warns — the drift signal; do not merge them to silence it.
 allowed_models = ["mistral-vibe-cli-*"]
 
 [[models]]
@@ -278,8 +346,9 @@ temperature = 1.0
 input_price = 1.5
 output_price = 7.5
 cached_input_price = 0.15         # per million cached input tokens; omit to bill at input_price
-thinking = "high"                 # "off", "low", "medium", "high", "max"
-auto_compact_threshold = 200000
+thinking = "high"                 # "off", "low", "medium", "high", "xhigh", "max", or a level `thinking_levels` lists; sent to the provider as written. Any other word still loads and is sent, with a config warning; pick another level to fix it
+# thinking_levels = ["off", "high"] # levels /thinking offers, lowest first (plus `thinking` when outside them); any word the provider takes, e.g. ["low", "turbo"], sent as written (on a Mistral provider, the Mistral SDK leaves out a level its own list lacks, such as "turbo", and the config warns). Wins over the provider's catalogue and the known-model table, which still say whether the model takes an effort or a token budget (a budget model has budgets for the standard levels only; another word sends no thinking, with a warning). Omit to offer the model's known levels (else the default five) plus `thinking`, [] for off only. Including "off" claims the model accepts a no-reasoning request (mistral provider)
+# auto_compact_threshold = 200000 # optional; unset: derived from the context window; a value outside the range the window allows is moved into it, with a warning
 supports_images = true            # vision-capable; allows @-mentioned images
 
 [[models]]
@@ -314,9 +383,6 @@ smart_approve = "active"
 ### Tool Configuration
 
 ```toml
-# Additional tool search paths
-tool_paths = ["/path/to/custom/tools"]
-
 # Enable only specific tools (glob and regex supported)
 enabled_tools = ["bash", "read_file", "grep"]
 
@@ -336,6 +402,18 @@ permission = "ask"
 shell = "powershell.exe"
 ```
 
+Two tool settings have no effect, and Vibe reports each as a config issue (in
+the startup Warnings box in the TUI, a warning in the `-p` export):
+
+- `[tools.grep]` (for example `exclude_patterns`): there is no `grep` tool. The
+  agent searches through the shell, so `rg` and `grep` commands follow the shell
+  tool's settings (`[tools.bash]` on POSIX).
+- A `prompts/task.md` in a tool directory (`.vibe/tools/prompts/task.md`): it
+  overrode the description of the former `task` tool. Subagents are started
+  with the built-in `agents.spawn` tool, whose description cannot be
+  overridden; put delegation guidance in `AGENTS.md` or in the agent's
+  instructions instead.
+
 The built-in shell surface is controlled by the `managed_shell_tools_enabled` config
 field and the `vibe_cli_managed_shell_tools` GrowthBook experiment. The default variant
 keeps the legacy one-shot `bash` tool, including its existing Windows behavior.
@@ -352,6 +430,10 @@ more output, and a log path under `~/.vibe/shell-tool/sessions/`. Long-running
 commands can be left alive with `background = true`, and interactive commands can
 be driven with the matching stdin tool.
 
+Commands Vibe runs on the host (shell tools, background processes and `!`
+commands) get `VIBE_SESSION=1` in their environment, so a script can tell it
+runs under Vibe. Commands in a sandbox use the sandbox's own environment.
+
 POSIX `bash` reads permissions, allowlists, and denylists from `[tools.bash]`.
 Native Windows `git_bash` reads them from `[tools.git_bash]`; native Windows
 `powershell` reads them from `[tools.powershell]`. Neither Windows tool reads
@@ -367,6 +449,12 @@ Output polling uses byte offset cursors
 Vibe detects `-exec`, `-execdir`, `-ok`, and `-okdir` predicates and will
 prompt for user permission before running the command.
 
+**Outside paths:** a shell command naming a path outside the working directory
+(`cat /etc/hosts`, `ls ../other`, or a workdir symlink pointing out such as
+`cat link`) asks for that path, even when the command is allowlisted or the
+shell is `permission = "always"`; `outside_workdir = "deny"` refuses it instead.
+`/dev/null` and the standard streams do not count.
+
 #### File Tool Permission Resolution
 
 File-based tools (`read`, `grep`, `write_file`, `edit`) resolve
@@ -376,12 +464,39 @@ permissions in this order (first match wins):
 2. **denylist** glob match → always denied
 3. **allowlist** glob match → always allowed
 4. **sensitive_patterns** match → requires approval
-5. **Outside workdir** → requires approval (or denied if `permission = "never"`)
+5. **Outside workdir** → requires approval, or denied if `permission = "never"`
+   or `outside_workdir = "deny"`
 6. **Default** → uses the tool's `permission` setting
 
 The **denylist** is checked before the allowlist — a path matching both lists
 is denied. Both are checked before the outside-workdir boundary, so the
 allowlist can still auto-approve access to directories outside the project.
+
+#### Outside-Workdir Access
+
+`outside_workdir` covers file and shell calls reaching outside the working
+directory and its `--add-dir` directories: `"ask"` (default) prompts, `"deny"`
+refuses with a tool error and the turn continues. Set it globally or per tool:
+
+```toml
+outside_workdir = "deny"
+
+[tools.read_file]
+outside_workdir = "ask"  # per-tool override
+allowlist = ["vibe-path:directory_recursive:/abs/path/to/shared"]  # stays allowed
+```
+
+- Allowlisted paths, `--add-dir` directories and the scratchpad are never
+  refused. `permission = "always"` does not bypass the check.
+- Shells only check paths they can read statically, such as the arguments of
+  `cat`, `cp` or `ls`. Anything else (interpreter code, dynamic paths, relative
+  paths after a `cd` in the same command, such as `cd sub && cat link` with
+  `link` pointing out) follows the shell's normal permission, so a shell that
+  must stay inside should not be `always`.
+- On Windows a call is refused if any shell tool denies it: override both
+  `git_bash` and `powershell`. PowerShell treats `/dev/null` as a path; use
+  `$null`.
+- Auto-approve skips the check, like the denylists.
 
 ### Skill Configuration
 
@@ -518,6 +633,10 @@ HTTP MCP servers can use either static auth or OAuth:
 - For SSH/remote browser callbacks, forward the loopback port:
   `ssh -L 47823:127.0.0.1:47823 <host>`.
 
+MCP sampling is disabled by default. It requires an explicit per-server opt-in
+and a host-provided sampling completion. Vibe's app server does not currently
+provide that completion, so it does not advertise or service sampling requests.
+
 ### Connectors
 
 Mistral connectors are auto-discovered when the active provider is Mistral
@@ -584,12 +703,32 @@ browser_auth_api_base_url = "https://connector.internal.example:443/api"
 browser_auth_allow_origin_rewrite = true
 ```
 
+The same split-horizon setups often reach the API through a proxy whose URL
+differs from the tenant's public API host that `/whoami` advertises. By
+default, sign-in and the runtime config self-heal adopt the whoami-advertised
+`api_base`. Set `preserve_api_base = true` on the provider to keep the
+configured `api_base` verbatim across sign-in and `/reload`; the chat URL
+(`vibe_base_url`) adoption is unaffected:
+
+```toml
+[[providers]]
+api_base = "https://connector.internal.example:443/v1"
+preserve_api_base = true
+```
+
 Self-hosted deployments can point Vibe CLI upgrade and API-key links to their
-Le Chat web deployment, where the Vibe API key is managed:
+Le Chat web deployment, where the Vibe API key is managed. The same URL serves
+the admin-managed config:
 
 ```toml
 vibe_base_url = "https://chat.mistral.ai"
 ```
+
+When no config layer sets `vibe_base_url` and the Mistral provider's `api_base`
+is `https://api.<domain>/...`, Vibe uses `https://chat.<domain>` instead of
+the default. For example, `api_base = "https://api.example.com/v1"` gives
+`https://chat.example.com`. Any other `api_base`, including Mistral's regional
+`api.eu.mistral.ai` and `api.us.mistral.ai`, keeps the default.
 
 Interactive setup can target a Mistral-compatible deployment instead of the
 default `console.mistral.ai` / `api.mistral.ai`. The final credential is always a
@@ -620,6 +759,13 @@ this order:
    trusted.
 2. `~/.vibe/hooks.toml` — loaded second.
 
+Hooks shipped by native Vibe plugins (`ai.mistral.vibe/hooks.toml`) run too.
+For one event, hooks run in this order: project `hooks.toml`, project plugins,
+`~/.vibe/hooks.toml`, then user plugins. A plugin hook runs in the session's
+read-only copy of its plugin with `PLUGIN_ROOT` and `PLUGIN_DATA` set, like the
+plugin's MCP servers; its payload's `cwd` is still the session folder. Hooks imported from Claude Code or Kimi plugins do
+not run yet: Vibe reports them as a config issue.
+
 A duplicate `name` across the two files is reported as a config issue and the
 project entry wins. Config-load errors (invalid TOML, missing required
 fields) surface in the TUI as warnings and the offending hook is skipped.
@@ -627,38 +773,103 @@ fields) surface in the TUI as warnings and the offending hook is skipped.
 ```toml
 [[hooks]]
 name = "lint"                       # Required: unique within the file.
-type = "post_agent"                 # Required: post_agent | pre_tool | post_tool.
+type = "post_agent"                 # Required: see the table below.
 command = "eslint --quiet ."        # Required: shell command run in cwd.
 timeout = 60.0                      # Default: 60s for all hooks.
 description = "Run ESLint"          # Optional.
 
 [[hooks]]
+name = "build-after-reviewer"
+type = "post_agent"
+match = "reviewer"                  # Agent matcher on post_agent (default "*").
+command = "make check"
+
+[[hooks]]
 name = "deny-rm-rf"
 type = "pre_tool"
-match = "bash"                      # Tool-name matcher (tool hooks only, default "*").
-strict = true                       # Tool hooks only: escalate any failure to deny/clear.
+match = "re:bash|process_start"     # Tool-name matcher on tool hooks (default "*").
+strict = true                       # pre_tool, post_tool, pre_agent: escalate any failure to block.
 command = "uv run python /path/to/guard-bash"
+
+[[hooks]]
+name = "add-branch"
+type = "pre_agent"
+match = "main"                      # Agent matcher, as on post_agent.
+command = "~/.vibe/hooks/add-branch.sh"
+
+[[hooks]]
+name = "notify-me"
+type = "notification"
+match = "re:approval_requested|turn_completed"  # Notification-type matcher.
+command = "~/.vibe/hooks/notify.sh"
+
+[[hooks]]
+name = "load-context"
+type = "session_start"
+match = "startup"                   # Source matcher: startup | resume | clear | fork.
+command = "jq -Rs '{hook_specific_output: {additional_context: .}}' .vibe/context.md"
+
+[[hooks]]
+name = "export-transcript"
+type = "session_end"
+match = "exit"                      # Reason matcher: exit | clear | other.
+command = "~/.vibe/hooks/export.sh"
 ```
 
 | Type | When it runs |
 |---|---|
+| `pre_agent` | Once per turn, after the user sends a message and before the model reads it. |
 | `post_agent` | Once per turn, after the agent finishes responding (no pending tool calls). |
 | `pre_tool` | Per tool call, before the user permission prompt. |
-| `post_tool` | Per tool call, **iff the tool body actually ran**. `tool_status` is `success`, `failure`, or `cancelled`. Does not fire when the tool never executed (`pre_tool` denial, user denial at the approval prompt, permission `NEVER`, or cancellation before the body started). |
+| `post_tool` | Per tool call, **iff the tool body actually ran**. `tool_status` is `success` or `failure`; a shell command that exits non-zero is still `success` (read `tool_output.returncode`). Does not fire when the tool never executed (`pre_tool` denial, user denial at the approval prompt, permission `NEVER`, or cancellation before the body started). |
+| `notification` | When Vibe needs the user or a turn ends: `approval_requested` (a tool call from any agent waits for approval), `question_asked`, `turn_completed` (the main agent's turn ended, including when a hook stopped it; with queued messages, only once the queue is empty), `turn_failed`. Never on an interrupt, nor when a turn ends while an approval or a question is still open. Runs in the background: Vibe never waits for it, its output is ignored, and it cannot approve anything. |
+| `session_start` | When a main session opens. `source`: `startup` (a new session; a session Vibe opened ahead of time counts once its first message is sent), `resume`, `clear` (after `/clear`), `fork` (including a rewind). It runs once the replaced session's `session_end` hooks are done. The user can type at once; the first message waits for the hooks before it reaches the model. Never for subagents. |
+| `session_end` | When a main session closes. `reason`: `exit` (Vibe quits, or Vibe Desktop releases the session), `clear` (`/clear`), `other` (another session replaced it, or it was deleted). Runs in the background, output ignored, after the session's own `session_start` hooks are stopped if they still run. Not after a crash or a kill. |
+
+**Closing.** When Vibe quits (`/exit`, end of a `vibe -p` run, Vibe Desktop
+quitting), it stops the `session_start` hooks still running at once (their
+session is over), then waits for the `session_end` and `notification` hooks
+still running, 5 s at most in all, then stops them. Vibe Desktop may close a
+session's process sooner. Switching session (`/new`,
+`/resume`, a rewind) does not stop the running hooks; the new session's first
+message waits for the old session's `session_end` hooks.
 
 **Matcher syntax** (same as `enabled_tools`): fnmatch glob by default
 (`"bash"`, `"read_*"`, case-insensitive), or a regex full-match when the
-pattern starts with `re:` (`"re:(read_file|grep)"`). `match` is forbidden on
-`post_agent`.
+pattern starts with `re:` (`"re:(read_file|write_file)"`).
+
+**Agent matching on `post_agent`.** `post_agent` fires after the main agent's
+turns and after every subagent's turns. Its `match` selects the agent that
+finished its turn, by agent configuration name: the main session's current
+agent (`accept-edits`, `ask`, a custom agent file name), a subagent's
+`config_name` (e.g. `reviewer`, or `<plugin-name>:<name>` for a plugin agent), or,
+for a subagent spawned without one, its parent's agent. The reserved alias `main`
+matches the main session (root or fork) whatever its agent, and never a
+subagent; no agent may be named `main`. A mode name also matches the subagents
+that inherit it, so use `match = "main"` to run only after the main agent.
+Without `match` (or with `"*"`), a `post_agent` hook runs for every agent. A
+hook that does not match is skipped silently. `pre_agent` matches agents the
+same way, for the agent whose turn starts.
 
 **Tool name conventions** for matchers:
-- Built-in tools use their bare name (`bash`, `read_file`, …); see the Tools
-  section above for the full list.
-- MCP tools: `{server-name}_{raw-tool-name}` (e.g. `linear_create-issue`).
+- `match` accepts a tool's short name (`bash`, `read_file`, `process_start`, …)
+  or its qualified name (`file_system.bash`). The `tool_name` field in the
+  payload is always the qualified name (`file_system.bash`, `mcp_<server>.<tool>`
+  for MCP tools), so scripts that read it must expect that form.
+- Commands the agent starts in the background go through `process_start`,
+  which `match = "bash"` does not catch. Shell guards should use
+  `match = "re:bash|process_start"`.
+- MCP tools: `mcp_{server}.{tool}`, with characters other than letters,
+  digits, `_` and `$` replaced by `_` in both parts (e.g. `mcp_linear.create_issue`
+  for the `create-issue` tool of the `linear` server). Match it as
+  `mcp_linear.create_issue`, `mcp_linear_create_issue`, the bare `create_issue`,
+  or a glob such as `mcp_linear.*`.
 - Connector tools: `connector_{normalized-name}_{remote-tool-name}` (e.g.
   `connector_Google_Drive_search_files`).
-- Subagents all route through `task`. Match with `match = "task"` and read
-  `tool_input.agent` to discriminate by subagent.
+- There is no `task` tool. Subagents are spawned through `agents_spawn`
+  (`agents.spawn` in the payload). Match with `match = "agents_spawn"` and read
+  `tool_input.config_name` (absent for a generic subagent) to discriminate by
+  subagent.
 
 Subagent invocations inherit the parent's hook config. Their hook events are
 logged to the subagent's session log and don't propagate to the parent's UI.
@@ -669,26 +880,53 @@ Every hook is spawned in `cwd` and receives a JSON object on **stdin**
 discriminated by `hook_event_name`:
 
 ```json
+// pre_agent
+{"hook_event_name": "pre_agent", "session_id": "...",
+ "parent_session_id": null, "transcript_path": "...", "cwd": "...",
+ "agent_name": "accept-edits", "turn_id": "turn-...",
+ "prompt": "fix the bug"}          // the text the user typed; attachments are not included
+
 // post_agent
 {"hook_event_name": "post_agent", "session_id": "...",
- "parent_session_id": null, "transcript_path": "...", "cwd": "..."}
+ "parent_session_id": null, "transcript_path": "...", "cwd": "...",
+ "agent_name": "accept-edits"}    // agent configuration name; null when unknown
+
+// notification
+{"hook_event_name": "notification", "session_id": "...",
+ "parent_session_id": null, "transcript_path": "...", "cwd": "...",
+ "notification_type": "approval_requested",  // | question_asked | turn_completed | turn_failed
+ "message": "Vibe needs your approval to run file_system.bash",
+ "agent_name": "accept-edits",
+ "tool_name": "file_system.bash"}  // approval_requested only
+
+// session_start
+{"hook_event_name": "session_start", "session_id": "...",
+ "parent_session_id": null, "transcript_path": "...", "cwd": "...",
+ "source": "startup",              // | resume | clear | fork
+ "agent_name": "accept-edits", "model": "mistral-medium-3-5"}  // active model alias
+
+// session_end
+{"hook_event_name": "session_end", "session_id": "...",
+ "parent_session_id": null, "transcript_path": "...", "cwd": "...",
+ "reason": "exit"}                 // | clear | other
 
 // pre_tool
 {"hook_event_name": "pre_tool", "session_id": "...", "parent_session_id": null,
  "transcript_path": "...", "cwd": "...",
- "tool_name": "bash", "tool_call_id": "call_42",
+ "tool_name": "file_system.bash", "tool_call_id": "call_42",
  "tool_input": {"command": "ls"}}
 
 // post_tool
 {"hook_event_name": "post_tool", "session_id": "...", "parent_session_id": null,
  "transcript_path": "...", "cwd": "...",
- "tool_name": "bash", "tool_call_id": "call_42",
+ "tool_name": "file_system.bash", "tool_call_id": "call_42",
  "tool_input": {"command": "ls"},
- "tool_status": "success",         // success | failure | cancelled
- "tool_output": {"output": "..."},  // the tool's serialized result (success/cancelled); null otherwise
+ "tool_status": "success",         // success | failure; a non-zero exit code is still success
+ "tool_output": {"command": "ls", "stdout": "...", "stderr": "", "returncode": 0,
+                 "was_truncated": false, "timed_out": false},  // structured result on success; null on failure
  "tool_output_text": "...",         // current text the LLM will see; mutable by prior hooks
- "tool_error": null,                // populated on failure/skipped
- "duration_ms": 42.5}
+ "tool_error": null,                // populated on failure
+ "duration_ms": 0}                  // not reported yet: always 0
 ```
 
 `parent_session_id` is set when running inside a subagent. Exceeding
@@ -713,10 +951,22 @@ Structured-response schema:
   "system_message": "string",             // optional UI note
   "hook_specific_output": {
     "tool_input": { ... },                // pre_tool only
-    "additional_context": "string"        // post_tool only
+    "prompt": "string",                   // pre_agent only
+    "additional_context": "string"        // post_tool, pre_agent and session_start only
   }
 }
 ```
+
+`notification` and `session_end` hooks' stdout is ignored. A `session_start`
+hook reads only `additional_context` and `system_message`: it cannot block the
+session.
+
+- `hook_specific_output.additional_context` (`session_start`): text added, out
+  of the user's sight, to the session's next user message, for the model. With
+  several `session_start` hooks, their texts are joined in run order. If a
+  `pre_agent` hook blocks that message, the text waits for the next one.
+- `system_message` (`session_start`): shown as the hook's line in the
+  conversation (`✓ [hook-name] message`), not among the startup warnings.
 
 Unknown fields are tolerated at every level. Fields that aren't meaningful
 for the current hook type are silently ignored.
@@ -731,9 +981,10 @@ will produce ``hook 'guard': guard: refused...`` downstream.
 
 | Hook | Effect of `decision: "deny"` |
 |---|---|
+| `pre_agent` | Block the message: the turn ends, the model never sees it, and the hook's line shows `Blocked the message: <reason>` (or the hook's `system_message`). First deny short-circuits the remaining `pre_agent` hooks. |
 | `pre_tool` | Deny the tool call; `reason` is the tool error returned to the LLM. First deny short-circuits the remaining `pre_tool` hooks for this call. |
 | `post_tool` | Replace `tool_output_text` with `reason`. Pipeline continues; subsequent hooks see the replacement. |
-| `post_agent` | Inject `reason` as a retry user message. Capped at 3 retries per hook per user turn. |
+| `post_agent` | Inject `reason` as a retry user message. First deny short-circuits the remaining `post_agent` hooks. Capped at 3 retries per turn across all `post_agent` hooks; past the cap, the answer is accepted. |
 
 Event-specific payloads:
 
@@ -747,17 +998,35 @@ Event-specific payloads:
 `) to the current `tool_output_text`. Composes with a same-hook
   `decision: "deny"`: deny replaces first, then `additional_context` is
   appended to the replacement.
+- `hook_specific_output.prompt` (`pre_agent`): replaces the text the user
+  typed; attachments are kept. The model sees the new text; the user's
+  transcript still shows what they typed. Rewrites compose: hook N receives
+  the `prompt` as rewritten by hooks 1..N-1.
+- `hook_specific_output.additional_context` (`pre_agent`): text added after
+  the user's message, for the model only. It stays in the conversation for
+  the following turns. With `prompt` in the same response, the text is
+  replaced first, then the context is added.
+
+When a `pre_agent` hook rewrites the message or adds context, its line in the
+transcript previews what the model gets instead (one line, cut at 80
+characters), unless the hook returns its own `system_message`. The session
+title is generated from what the model got as well: rewritten-away text and
+blocked messages never reach the title model. A message steered into the turn
+while its `pre_agent` hooks run waits for them to finish.
 
 **Failure path.** Any failure (non-zero exit, timeout, spawn failure,
 non-conforming stdout) emits a UI warning and lets the gated action proceed
-(fail open). With `strict = true` on a tool hook:
+(fail open). With `strict = true`:
 
 | Hook | Strict failure escalates to |
 |---|---|
+| `pre_agent` | Block the message. |
 | `pre_tool` | Deny the tool call with the failure reason. |
 | `post_tool` | Clear `tool_output_text` (replace with empty). |
 
-`strict` is forbidden on `post_agent`.
+`strict` is forbidden on `post_agent`, `notification`, `session_start` and
+`session_end`. A failing `session_start` hook shows a warning and the session
+goes on without its context.
 
 #### Execution semantics
 
@@ -765,8 +1034,14 @@ non-conforming stdout) emits a UI warning and lets the gated action proceed
   macOS and Linux it runs in `/bin/sh`. On native Windows it runs in the same
   shell as the `bash` tool: Git Bash when it is installed, otherwise
   PowerShell. Write Windows hooks in that shell's syntax.
+- On macOS and Linux, what a hook starts in the background (`cmd &`) is killed
+  when the hook exits. A hook that must leave work running has to move it to a
+  new session itself: `setsid cmd &` on Linux; macOS has no `setsid` command,
+  so use `perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' cmd &`.
 - Hooks of the same type fire sequentially in load order (project file first,
-  then user file; declaration order within each file).
+  then user file; declaration order within each file). `notification` and
+  `session_end` hooks are the exception: they start together, in the
+  background.
 - Tool calls within a single LLM turn run **concurrently**; each call's hook
   chain runs serially but the chains run in parallel across calls. Hooks
   that touch shared state (filesystem, env) must coordinate themselves.
@@ -786,28 +1061,37 @@ Tool, skill, and agent names support three matching modes:
 
 ```
 vibe [PROMPT]                       # Start interactive session with optional prompt
-vibe -p TEXT / --prompt TEXT         # Programmatic mode using `default_agent`, one-shot, exit
+vibe -p TEXT / --prompt TEXT         # Programmatic mode using `default_agent`, one-shot, exit. Calls needing approval are denied, so an agent's `[tools.bash] allowlist` limits the shell to those commands
 vibe -p TEXT --auto-approve          # Programmatic mode with all tool calls approved
 vibe -p TEXT --agent lean --yolo      # Lean mode with all tool calls approved
 vibe --agent NAME                   # Select agent profile (falls back to `default_agent` config)
-vibe --auto-approve / --yolo         # Approve all tool calls for the selected agent
+vibe --auto-approve / --yolo         # Approve all tool calls. New session on ask/accept-edits/smart-approve: starts the auto-approve agent. Custom agent or resumed session: keeps its agent, every call approved
 vibe --workdir DIR                  # Change working directory
 vibe --worktree NAME                # Create/reuse a git worktree under $VIBE_HOME/worktrees on branch NAME and run inside it. Auto-cleanup only for worktrees Vibe created this run and only after a session started; reused worktrees and attached (pre-existing) branches are kept unless confirmed. -p sessions keep worktrees. Ignored with --setup/--check-upgrade.
 vibe --worktree                     # Same, but Vibe picks an unused name from the prompt (a random slug when there is no prompt) on a vibe/<name> branch, and never reuses an existing worktree. The prompt must precede the flag or follow a `--`, since --worktree otherwise reads it as NAME.
 vibe --add-dir DIR                  # Extra working dir loaded for context (repeatable). Implicitly trusted.
 vibe --trust                        # Trust cwd for this invocation only (not persisted). Skips the trust prompt.
-vibe -c / --continue                # Continue most recent session in this terminal (TTY-scoped, falls back to latest in cwd)
+vibe -c / --continue                # Continue this terminal's last session in cwd, else the latest in cwd
 vibe --resume [SESSION_ID]          # Resume a specific session
 vibe -v / --version                 # Show version
 vibe --setup                        # Run onboarding/setup
 vibe update / vibe --check-upgrade  # Check for a Vibe update now, prompt to install it, and exit
 vibe --max-turns N                  # Max assistant turns (programmatic mode)
-vibe --max-price DOLLARS            # Max cost limit (programmatic mode)
-vibe --max-tokens N                 # Max total session tokens (programmatic mode)
+vibe --max-price DOLLARS            # Max cumulative run cost, root + subagents; models priced 0 are free (programmatic mode)
+vibe --max-tokens N                 # Max cumulative run tokens, root + subagents (programmatic mode)
+vibe --system-prompt-file PATH      # Replace Vibe's own system prompt instructions with PATH's text (programmatic mode)
+vibe --model ALIAS                  # Model alias for this run, not saved (programmatic mode)
 vibe --enabled-tools TOOL           # Enable specific tools (repeatable)
 vibe --disabled-tools TOOL          # Disable specific tools (repeatable)
 vibe --output text|json|streaming   # Output format (programmatic mode)
 ```
+
+Programmatic mode never prompts for approval: a tool call that needs it is
+denied unless the run approves calls without a prompt. `--auto-approve` (or
+`--agent auto-approve`) approves them, and `--smart-approve` lets a classifier
+approve the ones it judges safe. Each denied call is printed on stderr as
+`Tool call denied: <tool> (<reason>)` and listed in the export's `warnings`.
+A text run whose agent finishes without an answer says so on stderr.
 
 ## Built-in Agents
 
@@ -831,16 +1115,51 @@ There are two kinds of agents:
 - **explore**: Read-only codebase exploration subagent with grep, file reading,
   and skill loading. Spawned by the model, not selectable by the user.
 
-Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
+Custom agents are TOML files in `~/.vibe/agents/NAME.toml`. One with
+`agent_type = "subagent"` is a custom subagent the model can spawn. It can load
+every skill the parent session has, unless its file sets `enabled_skills` or
+`disabled_skills`; these accept the same patterns as in `config.toml`.
+
+A custom subagent (`agent_type = "subagent"`) runs with the session's hooks.
+Each of its tool calls must pass both the session's rules and its own
+`[tools.NAME]` rules (`permission`, `allowlist`, `denylist`): a profile can
+refuse or prompt for what the session allows, never allow what the session
+refuses or prompts for. `enabled_tools`/`disabled_tools` likewise only narrow
+the session's tools. Approvals given to a subagent's prompts apply to the whole
+session. Under `--auto-approve`, a subagent's calls run without consulting
+allowlists or denylists, like the main agent's; a tool its profile sets to
+`never` stays refused.
+To use a custom subagent, the model must spawn it by its agent type
+(`config_name`); a subagent spawned with only a name inherits the main agent's
+configuration.
+
+A subagent's instructions (`instructions`, or the prompt `system_prompt_id`
+names) are limited to 65,536 characters; the primary agent's prompt has no such
+limit. An agent file that cannot be used (invalid TOML, an unknown `safety` or
+`agent_type`, an invalid setting, a missing prompt, instructions over the limit,
+no `description`) is not offered to the model. Vibe reports it as a config issue
+naming the file and the failing field: in the startup Warnings box in the TUI,
+a stderr line and an export warning with `-p`. Spawning that type fails with
+`subagent_type_rejected` and the same reason.
+
+A custom subagent runs on the session's model unless its file sets
+`active_model` to an alias from `[[models]]`; its children then run on that
+model (name, temperature, thinking, provider, and the model's context window,
+compaction threshold and image support). The provider's endpoint and
+credentials always come from the session's `[[providers]]`: a provider the
+agent file redefines is ignored for routing. An alias that is unknown, excluded
+by `allowed_models`, or served by a provider the session does not define
+rejects the agent file like the cases above; Vibe never falls back to the
+session's model.
 
 ## Built-in Slash Commands
 
 - `/help` - Show help message
 - `/config` - Full-screen settings browser. Fields show their value and origin layer (default / TOML / env / override). Type to filter, arrows to move, Enter to edit; booleans toggle, closed-set fields (theme, models) pick from a list, scalars edit inline, complex fields open a JSON editor. The edit modal shows an inspector of the layers setting the field; edits persist to the user config (`~/.vibe/config.toml`) by default, `Tab` cycles the save target through the project config (`.vibe/config.toml`, when the project layer is active) and the ephemeral session override (until restart), and `Ctrl+R` clears the field one writable layer at a time toward the default. The `tools` field opens a grouped tool list with a per-tool config editor (permission, allow/deny lists, `Ctrl+E` for raw JSON). Enabling/disabling whole MCP servers or connectors stays in `/mcp`.
-- `/model` - Select active model
+- `/model` - Select active model. The footer shows the active model and its thinking level (`Name[level]`) before the context gauge; clicking it opens `/model` and keeps the prompt being typed (only while idle, like the typed command).
 - `/thinking` - Select thinking level
-- `/theme` - Select UI theme; `auto` follows terminal/OS appearance (persisted in config)
-- `/reload` - Reload configuration, agent instructions, and skills from disk
+- `/theme` - Select UI theme; `auto` follows terminal/OS appearance, `mistral-dark` and `mistral-light` use the Mistral brand palette (persisted in config)
+- `/reload` - Reload configuration, agent instructions, and skills from disk (skills added or edited on disk are also picked up on their own while `file_watcher_for_autocomplete` is on, except in sandboxed sessions)
 - `/clear`, `/new` - Start a new conversation. Optionally pass a prompt to seed it
 - `/log` - Show path to current interaction log file
 - `/log-level` - Show or set the log level. `/log-level` prints the full chain
@@ -855,16 +1174,32 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
 - `/rename <title>` - Set a manual session title. Persists to `meta.json`
   (`title_source=manual`), updates the terminal tab title, and is never
   overwritten by automatic title generation.
-- `/retry [additional instructions]` - Continue a model response interrupted by
-  a backend error without repeating text already shown. Optional instructions
-  are passed to the model for the continuation. Relevant error messages also
-  hint at this command.
+- `/retry [additional instructions]` - Run again a model response that failed
+  with a backend error or was interrupted with Esc. The new reply replaces the
+  unfinished one and its error or interrupt row. Optional instructions are
+  passed to the model for the retry. Relevant error messages also hint at this
+  command; with nothing to retry, it says so.
+- `/pr` - List the session's pull requests and merge requests (needs
+  `enable_pr_monitoring`, on by default). Opening it refreshes their status.
+  Enter opens the highlighted one, `c` its first failing CI check, `f` drafts a
+  prompt asking the agent to fix what blocks it (shown only when it needs action).
 - `/status` - Display agent statistics
+- `/context` - Show what fills the context window: a full-width gauge of the
+  window split by category (system prompt, tool definitions including MCP and
+  connector tools, skills, conversation), then free space and the
+  auto-compaction buffer (marked where compaction triggers), with a legend of
+  each category's share and estimated tokens.
+  The total comes from the model API's last call; the repartition is estimated
+  from each category's share of the characters that call actually sent. The
+  footer's token counter opens the same view when clicked (also while a turn
+  runs); a subagent shows its own window. Estimates appear only once the
+  conversation has started (at least one model call); a resumed session shows
+  its total alone until its next model call.
 - `/whoami` - Display the Mistral signed-in user, workspace, and plan
 - `/copy` - Copy the last agent message to the clipboard
 - `/paste-image` - Paste an image from the OS clipboard into the prompt.
   **macOS only** — the command is not registered on Linux or Windows.
-- `/voice` - Configure voice settings
+- `/voice` - Configure voice settings. With voice mode on, `Ctrl+T` starts or stops recording
 - `/mcp` (or `/connectors`) - Display MCP servers and connector status. The
   browser opens on the first item; press Up or Left to move into the fuzzy-search
   bar, and Up again to wrap to the last item. Pass a server or connector name to
@@ -889,8 +1224,12 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
   clears it instead. In the rewind panel: `↑/↓` pick option, `Shift+↑/↓`
   scroll, `←`/`Esc` edit previous message, `→` edit next message, `Enter`
   accept, `q` quit.
-- `/branch` - Fork the current conversation into a new resumable session,
-  leaving this session unchanged. Resume the copy with `vibe --resume <id>`.
+- `/branch` (alias `/fork`) - Fork the current conversation into a new resumable
+  session, leaving this session unchanged. A panel in place of the input shows
+  the `vibe --resume <id>` command that resumes the copy; `Esc` or `Enter`
+  closes it. While the agent is working, the copy stops before the running
+  turn, so during the first turn it is empty. After an automatic compaction
+  during the turn, `/branch` is refused until the turn ends.
 - `/loop [schedule] [prompt]` - With the Unified Harness, ask the model to
   schedule a recurring prompt, e.g. `/loop every two minutes check the build`
   or `/loop weekdays at 9am review CI`.
@@ -901,7 +1240,16 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
     cron in the machine's local timezone. Maximum 50 schedules per session.
   - Prompts run only while the session is live and idle, without catch-up bursts.
     Schedules persist in `scheduled-loops.json` beside the Unified session and
-    are restored on resume. They do not run while Vibe is closed.
+    are restored on resume. They do not run while Vibe is closed. `/clear`
+    starts a conversation with no schedules; the cleared session keeps its own
+    and runs them again when resumed. `/branch` copies them.
+  - Each agent has its own schedules: a subagent calling `cron` schedules,
+    lists, cancels, and clears only its own prompts, never its parent's or a
+    sibling's. A subagent's prompt fires as a message to that subagent once it
+    is idle, and its result reaches the parent like any other subagent result,
+    without starting a parent turn. Its schedules persist beside the subagent's
+    session and stop with it. `/loop` and the `loops/*` client methods still
+    show and manage only the main session's schedules.
 - `/proxy-setup` - Configure proxy and SSL certificate settings
 - `/leanstall` - Install the Lean 4 agent (leanstral)
 - `/unleanstall` - Uninstall the Lean 4 agent
@@ -911,10 +1259,57 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
 - `/reload-plugins` - Re-pin this session's plugins and report what changed
   (Unified Harness only). Re-discovers plugins from disk, re-pins the
   snapshot, and prints a diff of added, removed, and updated plugins.
+- `/skills` - Browse and manage skills. My Skills shows one row per installed
+  skill, the one its name resolves to: enabled (`●`) or disabled (`○`), Scope,
+  Source (Local, Shared or Plugin) and, for shared skills, the pinned version,
+  with `● New vN` when a number-pinned shared skill has a newer version. A
+  locked skill (from a plugin, or fixed by `enabled_skills` or a
+  `disabled_skills` pattern) shows its marker in the warning color and cannot be
+  toggled. Narrow terminals drop the Version, Source and Scope columns, in that
+  order, and on Shared the Version and Sharing columns. `/` searches names and
+  descriptions; `Space` turns the highlighted skill on or off for every scope
+  (written to `disabled_skills`) when its name loads that skill; the highlighted
+  skill's body shows under the list, or beside it from 140 columns, and `Enter`
+  opens its page with its description and the body of the highlighted scope's
+  pin under or beside the rows, which PageUp and PageDown scroll. With
+  `experimental_enable_registry_skills`, My Skills and Shared are tabs switched
+  with `Tab`, Shared listing the shared skills you can still add, `d` then `d`
+  again on the My Skills row of a shared skill removes it from every scope, and
+  a shared skill's page has a row per scope (Global, and Project inside a
+  project): `vN pinned`, `alias → vN tracking`, or `not pinned`, marked
+  `(shadowed)` when the name loads another pin. Enter on a scope opens its
+  picker of aliases and versions on the choice in effect, else on the other
+  scope's, previewing the highlighted version's body: picking one pins that
+  scope at once, and `Unpin from <scope>` drops just that pin (not the last one,
+  which is what Remove is for). Enabled, on the page of the skill its name
+  loads, switches the skill in every scope, and Remove, pressed twice, unpins it
+  from every scope. A shared skill not added yet starts out tracking latest in
+  Global, or in Project when another shared skill of its name holds Global,
+  since a scope pins one skill per name and pinning over another is refused;
+  each scope takes its own choice, `Don't pin here` drops one, and nothing is
+  written until Add to My Skills. Each new version of a pinned skill is
+  announced once, when a session starts. A session fetches the pinned skill
+  bodies missing from this machine and moves alias pins to their current version
+  when it starts, and again when its project changes. A sandboxed session copies
+  the versions it loads into its sandbox, and keeps its older copy of a skill
+  that tracks an alias when it cannot copy the new one. When the session's fetch
+  succeeds, at most once a day per machine, it deletes stored versions no
+  session has used for 30 days, if the registry still serves them, so a later
+  sync can fetch them again. It keeps each skill's newest stored version, every
+  version pinned globally, in this project or in another project a session read,
+  the version each alias pin last resolved to, and every version a running
+  session loads. The 30 days count from when a session last stored or used the
+  version, or else from the first cleanup that saw it. Vibe releases from before
+  this cleanup do not record what they load, so a version only they load through
+  a project pin on its number can still be deleted. The command shadows a user
+  skill named `skills`.
 - `/data-retention` - Show data retention information
-- `/teleport` - Teleport session to Vibe Code Web (only available when Vibe Code is enabled)
-- `/remote-project` - Select the Vibe Code Web project for this repository (only
-  available when Vibe Code is enabled)
+- `/release-notes` (alias `/whatsnew`) - Browse the release notes of every Vibe
+  version, newest first, in a full-screen, searchable pager. When a new
+  session starts after an upgrade (not on resume), Vibe shows the notes of
+  every release since the last one seen
+  (the newest five, then a pointer to `/release-notes`); the last seen version is
+  `seen_whats_new_version` in `~/.vibe/cache.toml`.
 - `/exit` - Exit the application
 
 ## File Mentions (`@`)
@@ -942,8 +1337,8 @@ Image attachments:
 
 - Require `supports_images = true` on the active model in `config.toml`.
   The legacy loop rejects an image its model cannot read; under
-  the Unified Harness the send always goes through, and the agent is
-  shown a description of the image or, failing that, a link to the file.
+  the Unified Harness the agent is shown a description of the image
+  instead, and with no describer reachable the CLI refuses a pasted image.
 - The describer is picked automatically: any `supports_images` model on
   the active model's **own** provider, no config needed. Same provider
   means same key and same endpoint, so no image goes anywhere the session
@@ -955,12 +1350,14 @@ Image attachments:
   for, and the description is reused for the rest of the session. The
   describer never reasons, whatever its `thinking` says: the trace is
   charged against the description budget and buys nothing on a
-  transcription.
+  transcription. Claude models that can't turn thinking off (Opus 5.5,
+  Sonnet 5.5, Fable 5) reason at their lowest level instead.
 - A describe that fails does not fail the turn. The agent gets a
   placeholder saying the image could not be read, and a warning names the
   image and the provider's reason.
-- With no describer reachable the image is left alone, and the harness
-  hands the model a `file://` link to it instead of the pixels.
+- With no describer reachable the image is left alone, and a model that
+  cannot read images gets `[Image]` and, for an image from a file, a
+  `file://` link to it.
 - Snapshotted into `<session_dir>/attachments/<sha1>.<ext>` so that
   resumed sessions stay reproducible even if the source file is moved.
 - Capped at 10 MiB per image and 8 images per message.
@@ -989,6 +1386,19 @@ Image attachments:
   per image, linking each attachment to its snapshot. Clicking opens the
   file with the OS default image viewer.
 
+## Footer
+
+The bottom row of the CLI reads, left to right:
+
+- The working directory, elided from the start (`…/vibe/cli-rust`) so the project name stays visible. Once shortened, it is followed by `⧉`: clicking it copies the whole path.
+- The session's PR/MR, with `enable_pr_monitoring` (on by default): `● PR #123 mergeable`. The dot's color gives its state (green mergeable, red action needed or closed, purple merged, grey draft or waiting); the status names the cause when known (`CI failing`, `changes requested`, `conflicts`, `CI running`, `review required`). Merged and closed PRs/MRs give way to the open one; several open ones show `PRs (2)`. A bold label means a new PR/MR or a status change not seen in `/pr` yet. Clicking the link opens the `/pr` list and refreshes the statuses; clicking it again closes the list. PRs/MRs are found when the session starts, after turns (at most once a minute), and when a `gh pr create`/`glab mr create` runs; statuses refresh about every minute.
+- On the right, with a Vibe key (chat plan) and a Mistral model, the monthly Vibe Code usage gauge `usage ██▍    40%`: the organization's spend against its allowance, re-read after each turn (at most once a minute), right after a rate limit and when the model changes. Without pay-as-you-go its fill turns yellow from 75% and red from 90% (Vibe Code stops at 100%); with pay-as-you-go it keeps its color and reads `· PAYG`, since usage past the allowance is billed. It is absent for API and Codestral keys, non-Mistral models, members without permission to see the organization's usage, and platforms without the billing API.
+- Then the context gauge `ctx ▍      23k/600k`.
+
+On narrow terminals the footer first turns the context then usage gauges into one-cell levels (`ctx ▁ 4%`), then drops the PR status, then shortens the working directory to its last folder (`…/cli-rust ⧉`), then drops the gauges' numbers and shortens the PR link (`● #123`), and finally hides the link. The working directory, its copy icon and the gauges stay.
+
+The input box's top border names the active model with its thinking level (`mistral-medium-3.5[medium]`, the level muted) before the mode label, which is colored by the agent's safety; the borders themselves are neutral. Clicking the model opens `/model` while the session is idle. On narrow terminals the border drops the thinking level, then elides and hides the model; the mode stays whole.
+
 ## Input Queue
 
 Prompts submitted while the agent is running are accepted by the app server
@@ -996,22 +1406,25 @@ and merged into a single follow-up turn, so everything queued during one
 generation is delivered to the agent together (not one turn per prompt) once
 it finishes. Each queued prompt keeps its own message so it stays individually
 editable and removable. This includes plain prompts, `/skill ...`
-prompts, and prompts with `@` mentions. `!bash`, non-side-channel slash
-commands, and `&teleport` require an idle session and are rejected with a toast
-while busy. **Ctrl+C** removes the newest queued prompt (LIFO); **Esc**
+prompts, and prompts with `@` mentions. `!bash` and non-side-channel slash
+commands require an idle session and are rejected while busy
+with a notice above the input that stays until the next key. **Ctrl+C** removes the newest queued prompt (LIFO); **Esc**
 interrupts the active turn and pauses the remaining queue; pressing Enter
 (empty or not) on a paused queue resumes it.
 
 Allowlisted slash commands (`side_channel=True`) run immediately via a
-side channel while the agent or bash is busy. Only one side-channel command
-runs at a time. Commands that persist config changes (theme, model, thinking,
-voice, proxy) require idle, then write through the app server directly after
-the user confirms the picker.
+side channel while the agent or bash is busy, or while prompts are queued.
+Only one side-channel command runs at a time. Besides read-only commands
+(`/help`, `/status`, `/copy`, ...), this includes settings a running turn
+never reads (`/theme`, `/log-level`, `/voice`, `/proxy-setup`), whose changes
+are saved at once, and `/branch`, which forks the conversation as it was before
+the running turn. These still wait for a compaction or agent install to finish.
 
-Commands not on the side-channel allowlist (e.g. `/clear`, `/compact`,
-`/rewind`, `/resume`, `/reload`, `/leanstall`, `/unleanstall`, `/teleport`,
-`/remote-project`, `/retry`, `/plugins`, `/reload-plugins`) are rejected while busy and can be retried when
-the session is idle.
+Commands that change what a turn reads (e.g. `/config`, `/model`,
+`/thinking`, `/clear`, `/compact`, `/rewind`, `/resume`,
+`/reload`, `/leanstall`, `/unleanstall`, `/retry`, `/mcp`,
+`/connectors`, `/plugins`, `/reload-plugins`, `/skills`) are rejected while
+busy and can be retried when the session is idle.
 
 While the queue is non-empty and the agent is busy, pressing **Up**
 enters queue selection mode: the last queued item is highlighted and
@@ -1033,6 +1446,13 @@ discovered from two locations:
   user scope on name collisions)
 
 Each subdirectory inside a plugins directory is a single plugin root.
+
+To turn a plugin off without uninstalling it, list its manifest `name` in
+`disabled_plugins` in `config.toml` (e.g. `disabled_plugins = ["my-plugin"]`).
+A plugin whose `ai.mistral.vibe` extension sets `"defaultEnabled": false` is
+off until its name is in `enabled_plugins`. Both lists add up across config
+layers, `disabled_plugins` wins, and an off plugin contributes nothing to
+sessions.
 
 ### Plugin Manifest (`plugin.json`)
 
@@ -1070,6 +1490,10 @@ TypeScript-identifier-safe string used to prefix all component names
 `displayName` is an optional title of 1 to 100 characters; the plugin `name`
 stays its identity.
 
+An unknown top-level `plugin.json` field, or an unknown key in the extension, is
+ignored with a warning and the rest loads. An invalid value for a known
+extension key drops the whole extension.
+
 Reserved namespaces (rejected): `file_system`, `self`, `process`, `skill`,
 `subagent`, `vibe`.
 
@@ -1088,7 +1512,8 @@ A plugin tree may contain any combination of:
 | Connectors | `connectors.json` | Connector tool mappings |
 
 Environment variables `PLUGIN_ROOT` and `PLUGIN_DATA` are injected
-automatically into MCP server processes and are reserved.
+automatically into MCP server and hook processes and are reserved. Plugin
+hooks run in the plugin directory.
 
 ### Foreign Plugin Formats
 
@@ -1163,6 +1588,15 @@ Detailed instructions for the model...
 4. `~/.vibe/skills/` (user global)
 5. `~/.agents/skills/` (user global, Agent Skills standard)
 
+With `experimental_enable_registry_skills`, the nearest scope wins instead, and
+within a scope a skill file wins over a registry pin: the project's skill files,
+then the skills pinned in its `.vibe/skills.toml`, then the global skill files
+(`skill_paths`, `~/.vibe/skills/`, `~/.agents/skills/`), then the skills pinned in
+`~/.vibe/skills.toml`. A registry pin goes by the name its manifest entry gives
+it; when two pins load the same stored version under different names, the one
+ranked first loads it. A skill that loses its name is logged as shadowed: once
+per process as a warning under this rule, and at debug level otherwise.
+
 ### Invoking Skills
 
 Two entry points:
@@ -1183,8 +1617,15 @@ using OpenAI's `agents/openai.yaml` convention can set
 `policy.allow_implicit_invocation: false` for the same provider-independent behavior.
 
 A `/` at the very start of the input opens the slash menu (commands and skills).
+A skill row's description starts with its scope in the theme's primary color,
+whether it is a local, plugin or registry skill: `project · …` (this project
+only), `user · …` (the user's, in every project), `vibe · …` (shipped with
+Vibe), or `skill · …` when an older server does not say; a plugin skill also
+shows its plugin in its `plugin:name`. Rows without one are built-in commands.
+A built-in command wins over a skill with the same name, so such a skill is
+left out of the slash menu; it can still be mentioned mid-prompt.
 A `/word` typed mid-prompt (not the first word) instead opens a completion popup
-of matching user-invocable skills.
+of matching user-invocable skills, with the same scope prefix.
 
 ## Environment Variables
 

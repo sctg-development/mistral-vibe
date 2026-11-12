@@ -14,6 +14,8 @@ from typing import Literal, Protocol
 
 from pydantic import JsonValue
 
+from mistralai_vibe_local_harness.vibe._tool_schemas import ToolsLeftOutSignal
+
 type JsonObject = dict[str, JsonValue]
 type JsonSchema = bool | JsonObject
 type MCPTransportKind = Literal["http", "streamable-http", "stdio"]
@@ -79,7 +81,7 @@ class ResolvedMCPServerConfig:
     prompt: str | None = None
     startup_timeout_s: float = 30.0
     tool_timeout_s: float = 300.0
-    sampling_enabled: bool = True
+    sampling_enabled: bool = False
     disabled: bool = False
     disabled_tools: frozenset[str] = frozenset()
 
@@ -162,6 +164,9 @@ class MCPRemoteToolDescriptor:
 @dataclass(frozen=True, slots=True)
 class MCPDescriptorCachePolicy:
     ttl_s: float = 86_400.0
+    # A cached-only open still routes descriptors this old, and leaves them
+    # for ``discover_pending`` to refresh. None never refreshes them early.
+    refresh_after_s: float | None = None
     max_tools_per_record: int = 1_000
     max_record_bytes: int = 2 * 1024 * 1024
     max_files: int = 512
@@ -219,6 +224,10 @@ class MCPToolGroup:
     tools: tuple[MCPToolDescriptor, ...]
 
 
+# The source error of a server a cached-only reconfigure did not contact.
+MCP_DISCOVERY_PENDING = "mcp_discovery_pending"
+
+
 @dataclass(frozen=True, slots=True)
 class MCPSourceState:
     name: str
@@ -254,7 +263,7 @@ class MCPAuthorizationRequiredSignal:
 
 
 type MCPRuntimeEventSink = Callable[
-    [MCPAuthorizationRequiredSignal], Awaitable[None] | None
+    [MCPAuthorizationRequiredSignal | ToolsLeftOutSignal], Awaitable[None] | None
 ]
 
 
@@ -332,6 +341,7 @@ class MCPTransportFactory(Protocol):
 
 
 __all__ = [
+    "MCP_DISCOVERY_PENDING",
     "JsonObject",
     "JsonSchema",
     "MCPAuthorizationProvider",

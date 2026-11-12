@@ -1,4 +1,5 @@
-//! Bottom bar: working directory + PID on the left, token budget on the right.
+//! Bottom bar: cwd (with a copy icon once shortened) and PR/MR link on the left; usage and context gauges on the right.
+//! The PR/MR link (one active artifact, or a count) opens the artifacts modal.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -7,16 +8,31 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use super::bottom_bar_parts::{link_input, spans};
+use super::footer_fit::{self, Tone, COPY_ICON, GAP, GAUGE_SEP};
 use super::theme;
 use crate::app::App;
 use crate::selection::{cells, Granularity};
 use crate::utils::paths::collapse_home;
-use crate::utils::text::{ellipsize, format_compact_count};
 use unicode_width::UnicodeWidthStr;
+
+/// What a click on a painted bar link does.
+#[derive(Clone)]
+pub enum BarLinkAction {
+    /// Open the artifacts modal.
+    ListArtifacts,
+    /// Copy the whole working directory.
+    CopyPath(String),
+}
+
+/// A link painted in the bar this frame, for mouse click routing.
+pub struct BarLink {
+    pub area: Rect,
+    pub action: BarLinkAction,
+}
 
 pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
     crate::mouse::register_region(app, area, crate::mouse::MouseTarget::BottomBar);
-    // Working directory from `App`; `-` if unresolved.
     let cwd = crate::replay::footer_cwd(
         app.session
             .cwd
@@ -24,14 +40,9 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             .map(collapse_home)
             .unwrap_or_else(|| "-".into()),
     );
-    // While a quit is pending the path is replaced by the confirm hint.
-    let pid = crate::replay::footer_pid_label(format!(" [PID {}]", std::process::id()));
     let muted = theme::muted_style();
-    // Token budget, empty until the first `session/statsUpdated` stats arrive.
-    let right = Line::from(Span::styled(format_context(app.session.tokens), muted));
-    // The cwd yields its tail to keep the PID, a one-cell spacer, and the counter.
-    let cwd_width = (area.width as usize).saturating_sub(right.width() + 1 + pid.width());
-    let left = if let Some(pending) = app.quit.active() {
+    // While a quit is pending the left side is replaced by the confirm hint.
+    let quit = app.quit.active().map(|pending| {
         let extra = if pending.extra.is_empty() {
             String::new()
         } else {
@@ -41,20 +52,79 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             Span::styled("Press ", muted),
             Span::styled(pending.key.label(), Style::default().fg(theme::primary())),
             Span::styled(format!(" again to quit{extra}"), muted),
-            Span::styled(pid, muted),
         ])
-    } else {
-        let cwd = ellipsize(&cwd, cwd_width);
-        Line::from(Span::styled(format!("{cwd}{pid}"), muted))
-    };
-    // `#spacer` `width: 1fr`: the right context sits at the edge.
+    });
+    // The history search line takes the quit hint's slot.
+    let quit = quit.or_else(|| super::reverse_search::line(app));
+    let link = link_input(app);
+    let path = app.session.cwd.clone().map(crate::replay::footer_cwd);
+    let fitted = footer_fit::fit(footer_fit::Inputs {
+        width: area.width as usize,
+        cwd: &cwd,
+        copy_icon: path.is_some(),
+        quit: quit.as_ref().map(Line::width),
+        link,
+        tokens: app.session.tokens,
+        usage: crate::usage_gauge::footer_usage(app),
+    });
+    let mut left = quit.map_or_else(Vec::new, |line| line.spans);
+    // Each link's span range in `left` and its click action.
+    let mut links = Vec::new();
+    if !fitted.cwd.is_empty() {
+        left.push(Span::styled(fitted.cwd, muted));
+    }
+    if let Some(path) = path.filter(|_| fitted.copy_icon) {
+        left.push(Span::raw(" "));
+        let start = left.len();
+        left.extend(spans(vec![(COPY_ICON.to_owned(), Tone::Text)]));
+        links.push((start, left.len(), BarLinkAction::CopyPath(path)));
+    }
+    if !fitted.link.is_empty() {
+        if !left.is_empty() {
+            left.push(Span::raw(GAP));
+        }
+        let start = left.len();
+        left.extend(spans(fitted.link));
+        links.push((start, left.len(), BarLinkAction::ListArtifacts));
+    }
+    let mut right = Vec::new();
+    let context_width = fitted
+        .context
+        .iter()
+        .map(|(text, _)| text.width())
+        .sum::<usize>() as u16;
+    for gauge in [fitted.usage, fitted.context] {
+        if gauge.is_empty() {
+            continue;
+        }
+        if !right.is_empty() {
+            right.push(Span::styled(GAUGE_SEP, muted));
+        }
+        right.extend(spans(gauge));
+    }
+    let left = Line::from(left);
+    let right_width = right.iter().map(Span::width).sum::<usize>() as u16;
+    let right = Line::from(right);
     let left_width = (left.width() as u16).min(area.width);
-    // The `1fr` spacer never collapses below one cell.
+    // The spacer never collapses below one cell.
     let spaced = (area.x + left_width + 1).min(area.right());
-    let right_x = area
-        .right()
-        .saturating_sub(right.width() as u16)
-        .max(spaced);
+    let right_x = area.right().saturating_sub(right_width).max(spaced);
+    app.view.bottom_bar_links = links
+        .into_iter()
+        .map(|(from, to, action)| {
+            let x = area.x + left.spans[..from].iter().map(Span::width).sum::<usize>() as u16;
+            let width = left.spans[from..to].iter().map(Span::width).sum::<usize>() as u16;
+            BarLink {
+                area: Rect {
+                    x,
+                    width: width.min(area.right().saturating_sub(x)),
+                    height: 1,
+                    ..area
+                },
+                action,
+            }
+        })
+        .collect();
     f.render_widget(
         Paragraph::new(left),
         Rect {
@@ -70,7 +140,59 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
             ..area
         },
     );
+    // The context gauge ends the right side; a click on it opens `/context`.
+    app.view.footer_tokens_area = if context_width == 0 {
+        Rect::default()
+    } else {
+        Rect {
+            x: right_x + right_width.saturating_sub(context_width),
+            width: context_width.min(area.right() - right_x),
+            height: 1,
+            ..area
+        }
+    };
+    if app.view.mouse_position.is_some_and(|at| tokens_at(app, at)) {
+        super::list_hover::paint_button(f.buffer_mut(), app.view.footer_tokens_area);
+    }
+    // The copy icon keeps its look under the pointer; only the hand says it is clickable.
+    let hovered = app.view.mouse_position.and_then(|at| link_at(app, at));
+    if let Some(link) = hovered.filter(|link| !matches!(link.action, BarLinkAction::CopyPath(_))) {
+        super::list_hover::paint_button(f.buffer_mut(), link.area);
+    }
+    super::reverse_search::draw_caret(app, f, area);
     paint_selection(app, f, area);
+}
+
+/// Whether `at` is on the footer's context gauge; a click there toggles `/context`, a side-channel read that also runs while a turn generates.
+pub fn tokens_at(app: &App, at: (u16, u16)) -> bool {
+    use crate::focus::Focus;
+    matches!(app.focus(), Focus::Composer | Focus::ContextApp)
+        && !app.view.footer_tokens_area.is_empty()
+        && app.view.footer_tokens_area.contains(at.into())
+}
+
+/// Whether a click at `at` acts on the footer (the context gauge or a painted link) instead of selecting text.
+pub fn clickable_at(app: &App, at: (u16, u16)) -> bool {
+    tokens_at(app, at) || link_at(app, at).is_some()
+}
+
+/// The painted link at `at` (the cwd's copy icon or the PR/MR link), unless an overlay drawn over the footer blocks it.
+pub fn link_at(app: &App, at: (u16, u16)) -> Option<&BarLink> {
+    use crate::focus::Focus;
+    let focus = app.focus();
+    if matches!(focus, Focus::Config | Focus::ReleaseNotes) {
+        return None;
+    }
+    // The PR list would open under any panel that has focus over it.
+    let lists = matches!(
+        focus,
+        Focus::ArtifactsModal | Focus::SubagentList | Focus::Composer
+    );
+    app.view
+        .bottom_bar_links
+        .iter()
+        .filter(|link| lists || !matches!(link.action, BarLinkAction::ListArtifacts))
+        .find(|link| link.area.contains(at.into()))
 }
 
 /// Highlight the bottom-bar selection and, on a pending release, copy its text.
@@ -156,18 +278,4 @@ fn read_row(buf: &Buffer, y: u16, x0: u16, x1: u16) -> String {
         .filter_map(|x| buf.cell((x, y)).map(|cell| cell.symbol()))
         .collect();
     row.trim_end().to_string()
-}
-
-/// Render the context budget `(current, max)`; empty while `max == 0`.
-fn format_context((current, max): (u64, u64)) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let ratio = (current as f64 / max as f64).min(1.0);
-    let pct = (ratio * 100.0).round() as u64;
-    format!(
-        "{}/{} tokens ({pct}%)",
-        format_compact_count(current),
-        format_compact_count(max),
-    )
 }

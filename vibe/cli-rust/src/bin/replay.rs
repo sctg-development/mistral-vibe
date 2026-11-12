@@ -10,6 +10,9 @@ use std::thread;
 
 use serde_json::{json, Map, Value};
 
+#[path = "replay/jitter.rs"]
+mod jitter;
+
 const TURN_ENQUEUE: &str = "session/turn/enqueue";
 const TURN_START: &str = "turn/start";
 const TURN_QUEUE_REPLACE: &str = "session/turn/queue/replace";
@@ -41,16 +44,24 @@ fn drained_frame(request_id: &Value) -> Value {
     json!({"jsonrpc": "2.0", "method": "replay/drained", "params": {"requestId": request_id}})
 }
 
-/// Methods answered with another method's canned result (reconnect reuses start).
+/// A harness fence: the client acks it once the gated event before it has settled.
+fn fence_frame() -> Value {
+    json!({"jsonrpc": "2.0", "method": "replay/fence", "params": {}})
+}
+
+/// Methods answered with another method's canned result: resume reuses start, continue the saved session.
 fn resolve_response(handshake: &mut Map<String, Value>, method: &str) -> Option<Value> {
     if let Some(entry) = handshake.get_mut(method) {
         return canned(entry);
     }
-    let alias = match method {
-        "session/resume" | "session/continue" => "session/start",
+    let aliases: &[&str] = match method {
+        "session/resume" => &["session/start"],
+        "session/continue" => &["session/resume", "session/start"],
         _ => return None,
     };
-    handshake.get_mut(alias).and_then(canned)
+    aliases
+        .iter()
+        .find_map(|alias| handshake.get_mut(*alias).and_then(canned))
 }
 
 /// A list entry answers its requests in order, repeating the last one; a
@@ -167,8 +178,12 @@ fn agent_update_response(handshake: &Map<String, Value>, params: Option<&Value>)
     Some(json!({ "runtime": runtime }))
 }
 
-/// Rewrite the first user message entry's id to the turn's client id.
-fn stamp_user_message_id(batch: &mut [Value], client_message_id: &str) {
+/// Rewrite the first user message entry's id to the turn's client id, remembering the rename.
+fn stamp_user_message_id(
+    batch: &mut [Value],
+    client_message_id: &str,
+    renamed: &mut HashMap<String, String>,
+) {
     for event in batch.iter_mut() {
         if event.get("method").and_then(Value::as_str) != Some("history/entryAdded") {
             continue;
@@ -179,22 +194,41 @@ fn stamp_user_message_id(batch: &mut [Value], client_message_id: &str) {
         let is_user = entry.get("type").and_then(Value::as_str) == Some("message")
             && entry.get("role").and_then(Value::as_str) == Some("user");
         if is_user {
+            if let Some(scripted) = entry.get("id").and_then(Value::as_str) {
+                renamed.insert(scripted.to_owned(), client_message_id.to_owned());
+            }
             entry["id"] = json!(client_message_id);
             return;
         }
     }
 }
 
-/// Bind `$operationId` placeholders (shell entry ids, teleport events) to the request's id.
+/// Give snapshot history the client ids the live user messages were renamed to.
+fn stamp_snapshot_ids(batch: &mut [Value], renamed: &HashMap<String, String>) {
+    for event in batch.iter_mut() {
+        let Some(history) = event
+            .pointer_mut("/params/state/history")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for entry in history.iter_mut() {
+            let client_id = entry["id"].as_str().and_then(|id| renamed.get(id));
+            if let Some(client_id) = client_id {
+                entry["id"] = json!(client_id);
+            }
+        }
+    }
+}
+
+/// Bind `$operationId` shell entry id placeholders to the request's id.
 fn stamp_operation_id(events: &mut [Value], operation_id: &str) {
     for event in events {
-        for pointer in ["/params/entry/id", "/params/event/operationId"] {
-            if let Some(slot) = event
-                .pointer_mut(pointer)
-                .filter(|slot| slot.as_str() == Some("$operationId"))
-            {
-                *slot = json!(operation_id);
-            }
+        if let Some(slot) = event
+            .pointer_mut("/params/entry/id")
+            .filter(|slot| slot.as_str() == Some("$operationId"))
+        {
+            *slot = json!(operation_id);
         }
     }
 }
@@ -329,6 +363,7 @@ fn send_event(writer: &Writer, event_id: &AtomicU64, event: &Value) {
 fn run_emitter(rx: std::sync::mpsc::Receiver<Emit>, writer: Writer, event_id: Arc<AtomicU64>) {
     let mut step = std::env::var_os(STEP_FIFO_ENV)
         .and_then(|path| OpenOptions::new().read(true).write(true).open(path).ok());
+    let mut renamed = HashMap::new();
     while let Ok(emit) = rx.recv() {
         let (client_message_id, queue_item_id, mut batch) = match emit {
             Emit::Batch(batch) => batch,
@@ -338,14 +373,18 @@ fn run_emitter(rx: std::sync::mpsc::Receiver<Emit>, writer: Writer, event_id: Ar
             }
         };
         if let Some(id) = client_message_id.as_deref() {
-            stamp_user_message_id(&mut batch, id);
+            stamp_user_message_id(&mut batch, id, &mut renamed);
         }
+        stamp_snapshot_ids(&mut batch, &renamed);
         if let Some(id) = queue_item_id.as_deref() {
             stamp_queue_item_id(&mut batch, id);
         }
         for event in batch {
             await_step(&mut step);
             send_event(&writer, &event_id, &event);
+            if step.is_some() {
+                send(&writer, fence_frame());
+            }
         }
     }
 }
@@ -427,7 +466,11 @@ fn main() {
     let writer = thread::spawn(move || {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        let mut jitter = jitter::Jitter::from_env();
         while let Ok(Some(line)) = writer_rx.recv() {
+            if let Some(jitter) = jitter.as_mut() {
+                jitter.delay();
+            }
             if out.write_all(line.as_bytes()).is_err() || out.write_all(b"\n").is_err() {
                 break;
             }

@@ -3,7 +3,9 @@
 //! events in `wizard::sign_in`, so this module knows nothing about the
 //! wizard.
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::work::Work;
 
 use super::sign_in_flow::{run_sign_in, SignInEvent};
 use super::sign_in_gateway::SignInGateway;
@@ -13,7 +15,9 @@ use super::sign_in_gateway::SignInGateway;
 /// open a browser long after its receiver was replaced.
 pub struct SignInHandle {
     rx: mpsc::Receiver<SignInEvent>,
-    abort: tokio::task::AbortHandle,
+    abort: Option<tokio::task::AbortHandle>,
+    /// Carries a guard so the flow's cleanup counts as work until it has sent its cancel.
+    cancel: Option<oneshot::Sender<Work>>,
 }
 
 impl SignInHandle {
@@ -22,9 +26,37 @@ impl SignInHandle {
         self.rx.recv().await
     }
 
+    /// Whether every event sent so far has been received.
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
+    }
+
     /// Stop the background flow.
-    pub fn abort(&self) {
-        self.abort.abort();
+    pub fn abort(mut self) {
+        self.stop();
+    }
+
+    pub(super) fn oidc(rx: mpsc::Receiver<SignInEvent>, cancel: oneshot::Sender<Work>) -> Self {
+        Self {
+            rx,
+            abort: None,
+            cancel: Some(cancel),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(Work::start());
+        }
+        if let Some(abort) = self.abort.take() {
+            abort.abort();
+        }
+    }
+}
+
+impl Drop for SignInHandle {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -39,6 +71,8 @@ pub fn spawn(
 ) -> SignInHandle {
     let (tx, rx) = mpsc::channel::<SignInEvent>(16);
     let task_tx = tx.clone();
+    // Busy from the spawn until the flow ends: under replay it is one scripted burst.
+    let busy = Work::start();
     // The gateway build can fail (e.g. a system trust store with no CA
     // certificates): fold it into the flow's own Failed event instead of
     // panicking inside the wizard.
@@ -48,7 +82,7 @@ pub fn spawn(
         allow_origin_rewrite,
         enable_system_trust_store,
     ) {
-        Ok(gateway) => tokio::spawn(async move {
+        Ok(gateway) => crate::work::spawn_daemon(async move {
             if let Err(error) = run_sign_in(gateway, task_tx.clone()).await {
                 let _ = task_tx
                     .send(SignInEvent::Failed {
@@ -56,17 +90,20 @@ pub fn spawn(
                     })
                     .await;
             }
+            drop(busy);
         }),
-        Err(error) => tokio::spawn(async move {
+        Err(error) => crate::work::spawn_daemon(async move {
             let _ = task_tx
                 .send(SignInEvent::Failed {
                     message: error.message,
                 })
                 .await;
+            drop(busy);
         }),
     };
     SignInHandle {
         rx,
-        abort: task.abort_handle(),
+        abort: Some(task.abort_handle()),
+        cancel: None,
     }
 }

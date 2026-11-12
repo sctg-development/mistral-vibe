@@ -4,12 +4,14 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+import hashlib
 import logging
 from pathlib import Path
 import secrets
 import tempfile
 import time
 
+from mistralai_vibe_local_harness._native import process_tools_timeout_advice
 from mistralai_vibe_local_harness.protocol import (
     RustAcceptCandidate,
     RustAction,
@@ -71,6 +73,7 @@ from mistralai_vibe_local_harness.vibe._permissions import ALWAYS_ASK, Permissio
 from mistralai_vibe_local_harness.vibe._projection import (
     APPROVAL_META_KEY,
     APPROVAL_NOTE_META_KEY,
+    SMART_APPROVE_META_KEY,
     public_notice_entry,
 )
 from mistralai_vibe_local_harness.vibe._protected_paths import protected_target
@@ -180,6 +183,17 @@ type ApprovalNoteRecorder = Callable[[str, str], None]
 
 
 @dataclass(frozen=True, slots=True)
+class HookAgentIdentity:
+    """The agent a turn hook action runs for, captured once per action."""
+
+    # The agent configuration name (``LocalRuntimeAdapterConfig.active_agent``);
+    # ``None`` when the embedder does not set it.
+    name: str | None
+    # A session the user drives (a root session or a fork), as opposed to a subagent.
+    main: bool
+
+
+@dataclass(frozen=True, slots=True)
 class HookContext:
     """The Runtime-owned handle passed to a hook body."""
 
@@ -194,6 +208,11 @@ class HookContext:
     request_approval: HookApprovalCallback | None = None
     emit_hook_notice: HookNoticeEmitter | None = None
     record_approval_note: ApprovalNoteRecorder | None = None
+    # Set for turn hooks (pre_agent_turn, post_agent_turn): the identity their
+    # handlers were selected for, so the payload names the same agent the selection
+    # saw, and the turn the action belongs to.
+    agent: HookAgentIdentity | None = None
+    turn_id: str | None = None
 
 
 # On a ``pre_tool_call`` ``continue``, ``effective_arguments`` is the full replacement the
@@ -213,6 +232,10 @@ type PostAgentTurnHookHandler = Callable[
 ]
 
 
+def _select_every_agent(_identity: HookAgentIdentity) -> bool:
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class AcceptOrRetryPostAgentHandler:
     """A post_agent_turn handler that only accepts the candidate unchanged or asks for
@@ -222,9 +245,15 @@ class AcceptOrRetryPostAgentHandler:
     ``streams_provisional_content``): nothing they return can replace text the user
     has already watched arrive. The promise is checked, not assumed: any other
     decision fails the hook rather than reaching the Core.
+
+    ``selects`` decides whether the handler runs for the agent that finished its turn.
+    The Core binds post_agent_turn hooks with an ``always`` selector, so the executor
+    applies it before the run starts, the way ``ToolScopedHook.selects`` scopes tool
+    hooks.
     """
 
     handler: PostAgentTurnHookHandler
+    selects: Callable[[HookAgentIdentity], bool] = _select_every_agent
 
     async def __call__(
         self, hook_input: RustCompletionHookInput, context: HookContext
@@ -240,6 +269,21 @@ class AcceptOrRetryPostAgentHandler:
             "an accept-or-retry post_agent handler may only accept the candidate "
             "unchanged or ask for a retry"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AgentScopedHook[I, R]:
+    """A turn hook that runs only for the agents its ``selects`` accepts.
+
+    The Core binds turn hooks with an ``always`` selector, so the executor applies
+    ``selects`` before the run starts, as for ``AcceptOrRetryPostAgentHandler``.
+    """
+
+    run: Callable[[I, HookContext], Awaitable[R]]
+    selects: Callable[[HookAgentIdentity], bool] = _select_every_agent
+
+    async def __call__(self, hook_input: I, context: HookContext) -> R:
+        return await self.run(hook_input, context)
 
 
 @dataclass(frozen=True, slots=True)
@@ -397,11 +441,13 @@ def build_local_action_executor(  # noqa: PLR0913 - explicit executor dependenci
     hook_handlers: HookHandlers | None = None,
     session_id: str = "",
     parent_session_id: str | None = None,
+    main_session: bool = True,
     notice_sink: PublicHistoryEntrySink | None = None,
     foreign_binding_ids: frozenset[str] = frozenset(),
     classifier_factory: ClassifierFactory | None = None,
     classify_model: str = DEFAULT_SMART_APPROVE_MODEL,
     provided_tool_modes: Mapping[str, ProvidedToolApproval] | None = None,
+    background_processes: bool = False,
 ) -> ActionExecutor:
     state = _LocalActionState(
         config,
@@ -411,11 +457,13 @@ def build_local_action_executor(  # noqa: PLR0913 - explicit executor dependenci
         session_id,
         filesystem_root=filesystem_root,
         parent_session_id=parent_session_id,
+        main_session=main_session,
         foreign_binding_ids=foreign_binding_ids,
         classifier_factory=classifier_factory,
         classify_model=classify_model,
         provided_tool_modes=provided_tool_modes,
     )
+    state.configure_background_processes(lambda: background_processes)
     if notice_sink is not None:
         state.bind_notice_sink(notice_sink)
     return state.execute
@@ -453,6 +501,7 @@ class _LocalActionState:
         *,
         filesystem_root: Path | None = None,
         parent_session_id: str | None = None,
+        main_session: bool = True,
         foreign_binding_ids: frozenset[str] = frozenset(),
         classifier_factory: ClassifierFactory | None = None,
         classify_model: str = DEFAULT_SMART_APPROVE_MODEL,
@@ -470,7 +519,12 @@ class _LocalActionState:
         self._session_id = session_id
         # The shell's login profile runs once per session, not per command.
         self._shell_session = ShellSession(session_id or secrets.token_hex(8))
+        # Whether background processes run in this Session now; see
+        # ``configure_background_processes``.
+        self._runs_background_processes: Callable[[], bool] = lambda: False
         self._parent_session_id = parent_session_id
+        # A root or fork session, as opposed to a subagent; fixed for the session.
+        self._main_session = main_session
         self._filesystem_root = (
             filesystem_root.expanduser().resolve()
             if filesystem_root is not None
@@ -495,6 +549,7 @@ class _LocalActionState:
         # its result _meta to the UI).
         self._approval_notes: dict[str, str] = {}
         self._approval_meta: dict[str, tuple[str, str, str]] = {}
+        self._classifications: dict[str, JsonObject] = {}
         # Smart-approve ("classify" tool mode) state, per session.
         self._classifier_factory = classifier_factory
         self._classify_model = classify_model
@@ -523,6 +578,27 @@ class _LocalActionState:
         self._project_roots_for: tuple[Path, ...] | None = None
         self._project_roots: list[str] = []
         self._refresh_project_roots()
+        self._before_model_step: Callable[[], Awaitable[None]] | None = None
+
+    def bind_before_model_step(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Run ``hook`` before each agent completion, once the previous step ended.
+
+        Core asks for the next completion only after every result of the step
+        before it is applied, so nothing of that step runs while the hook does.
+        Compaction completions are skipped: they are not a step of the agent's,
+        and a compaction already holds the Session's lifecycle lock.
+        """
+        self._before_model_step = hook
+
+    def configure_background_processes(self, runs: Callable[[], bool]) -> None:
+        """Say how to tell whether background processes run in this Session.
+
+        Only then does a timed-out command's note advise starting long
+        work as a background process, as the Core bash description does. Asked
+        at each timeout, so the note follows a reconfigure, such as `/reload`,
+        that turns them off or on.
+        """
+        self._runs_background_processes = runs
 
     def configure(self, config: LocalRuntimeAdapterConfig) -> None:
         if config.sandbox is not self._config.sandbox:
@@ -683,6 +759,8 @@ class _LocalActionState:
 
     async def _execute(self, action: RustAction) -> RustEvent:  # noqa: PLR0911 - one return per action kind
         if isinstance(action, RustLLMCallAction):
+            if self._before_model_step is not None and action.purpose == "agent":
+                await self._before_model_step()
             self._apply_model_input(action)
             return await execute_completion(
                 action,
@@ -713,7 +791,7 @@ class _LocalActionState:
             if action.call.name in {
                 "file_system.read_file",
                 "file_system.write_file",
-                "file_system.search_replace",
+                "file_system.edit",
             }:
                 additional_read_roots = (
                     (self._filesystem_root / "attachments",)
@@ -735,7 +813,13 @@ class _LocalActionState:
             if action.call.name == "file_system.bash":
                 return self._with_approval_note(
                     await execute_shell_tool(
-                        action, self._config, session=self._shell_session
+                        action,
+                        self._config,
+                        session=self._shell_session,
+                        timeout_advice=process_tools_timeout_advice(
+                            background_processes=self._runs_background_processes(),
+                            command_environment=self._config.command_environment,
+                        ),
                     ),
                     action.action_id,
                 )
@@ -771,6 +855,7 @@ class _LocalActionState:
                     "filesystem write path must resolve under tool-results"
                 )
             # The record stays with the Session, and an export copies it.
+            destination = _content_addressed(destination, action.operation.content)
             await asyncio.to_thread(
                 _replace_text_file, destination, action.operation.content
             )
@@ -854,11 +939,27 @@ class _LocalActionState:
     async def _execute_pre_agent_turn_hook(
         self, action: RustPreAgentTurnHookAction
     ) -> RustEvent:
+        # Handlers chain: each sees the content the previous one returned, and the
+        # first skip wins.
         try:
-            context = self._hook_context()
-            handlers = _resolve_hooks(
-                action.hook_binding_ids, self._hook_handlers.pre_agent_turn
+            agent = HookAgentIdentity(
+                name=self._config.active_agent, main=self._main_session
             )
+            handlers = _select_for_agent(
+                _resolve_hooks(
+                    action.hook_binding_ids, self._hook_handlers.pre_agent_turn
+                ),
+                agent,
+            )
+        except Exception as error:
+            return _hook_pipeline_failed(action, error)
+        emit_run = self._emits_run_notices([bid for bid, _ in handlers])
+        if emit_run:
+            await self._emit_notice(
+                HookNoticeData(kind="hook_run_started", scope="pre_agent")
+            )
+        try:
+            context = self._hook_context(agent=agent, turn_id=action.turn_id)
             user_content = action.input.user_content
             for _, handler in handlers:
                 result = await handler(
@@ -873,6 +974,11 @@ class _LocalActionState:
                 user_content = output.user_content
         except Exception as error:
             return _hook_pipeline_failed(action, error)
+        finally:
+            if emit_run:
+                await self._emit_notice(
+                    HookNoticeData(kind="hook_run_completed", scope="pre_agent")
+                )
         return RustHookCompletedEvent(
             action_id=action.action_id,
             result=RustPreAgentTurnHookResult(
@@ -940,16 +1046,28 @@ class _LocalActionState:
     ) -> RustEvent:
         # The first non-accept decision (retry or reject) is the turn's outcome and
         # short-circuits the rest; among accepts, a later content replacement wins.
-        emit_run = self._emits_run_notices(action.hook_binding_ids)
+        try:
+            # Captured once so a config swap during an earlier hook cannot select a
+            # handler under one agent name and hand it another in its payload.
+            agent = HookAgentIdentity(
+                name=self._config.active_agent, main=self._main_session
+            )
+            handlers = _select_for_agent(
+                _resolve_hooks(
+                    action.hook_binding_ids, self._hook_handlers.post_agent_turn
+                ),
+                agent,
+            )
+        except Exception as error:
+            self._post_agent_retries.pop(action.turn_id, None)
+            return _hook_pipeline_failed(action, error)
+        emit_run = self._emits_run_notices([bid for bid, _ in handlers])
         if emit_run:
             await self._emit_notice(
                 HookNoticeData(kind="hook_run_started", scope="post_agent")
             )
         try:
-            context = self._hook_context()
-            handlers = _resolve_hooks(
-                action.hook_binding_ids, self._hook_handlers.post_agent_turn
-            )
+            context = self._hook_context(agent=agent, turn_id=action.turn_id)
             candidate = action.input.candidate
             replacement: list[RustContentBlock] | None = None
             # Each hook reviews the model's original completion, not a prior hook's
@@ -1020,7 +1138,9 @@ class _LocalActionState:
         self._post_agent_retries[turn_id] = count + 1
         return retry
 
-    def _hook_context(self) -> HookContext:
+    def _hook_context(
+        self, *, agent: HookAgentIdentity | None = None, turn_id: str | None = None
+    ) -> HookContext:
         # Turn-boundary and post hooks gate a whole turn or a completed call, not a single
         # pending tool call, so they are not offered a per-call approval transport.
         return HookContext(
@@ -1030,6 +1150,8 @@ class _LocalActionState:
             session_root=self._filesystem_root,
             parent_session_id=self._parent_session_id,
             emit_hook_notice=self._emit_notice,
+            agent=agent,
+            turn_id=turn_id,
         )
 
     def _pre_tool_call_context(self, turn_id: str) -> HookContext:
@@ -1111,7 +1233,8 @@ class _LocalActionState:
         """
         note = self._approval_notes.pop(action_id, None)
         approval_meta = self._approval_meta.pop(action_id, None)
-        if note is None and approval_meta is None:
+        classification = self._classifications.pop(action_id, None)
+        if note is None and approval_meta is None and classification is None:
             return event
         if not isinstance(event, (RustToolSucceededEvent, RustToolFailedEvent)):
             return event
@@ -1124,6 +1247,8 @@ class _LocalActionState:
                 "approvalType": approval_meta[1],
                 "approvalSource": approval_meta[2],
             }
+        if classification is not None:
+            meta[SMART_APPROVE_META_KEY] = classification
         return event.model_copy(
             update={"result": event.result.model_copy(update={"meta": meta})}
         )
@@ -1389,6 +1514,8 @@ class _LocalActionState:
             risk_level=result.risk_level,
             user_authorization=result.user_authorization,
             approval_grant=grant.value if grant is not None else None,
+            error=result.error,
+            error_type=result.error_type,
         )
 
     def _emit_classification(  # noqa: PLR0913 - explicit classification fields
@@ -1405,6 +1532,8 @@ class _LocalActionState:
         risk_level: str | None = None,
         user_authorization: str | None = None,
         approval_grant: str | None = None,
+        error: str | None = None,
+        error_type: str | None = None,
     ) -> None:
         """Publish one classification to the telemetry side-channel (best-effort).
 
@@ -1418,6 +1547,19 @@ class _LocalActionState:
         for the session" -- answering the gate versus switching it off. It is absent
         when no human was asked.
         """
+        self._classifications[action.action_id] = {
+            "verdict": verdict,
+            "outcome": outcome,
+            "reason": reason,
+            "error": error,
+            "risk_level": risk_level,
+            "user_authorization": user_authorization,
+            "approval_grant": approval_grant,
+            "tier": tier.value,
+            "classifier_model": model,
+            "classifier_prompt_version": CLASSIFIER_PROMPT_VERSION,
+            "latency_ms": round(latency_ms, 1),
+        }
         sink = self._classification_sink
         if sink is None:
             return
@@ -1426,7 +1568,8 @@ class _LocalActionState:
             "tool_name": tool_name,
             "verdict": verdict,
             "tier": tier.value,
-            "reason": reason[:200],
+            # An error's reason quotes the provider; analytics takes error_type only.
+            "reason": "" if verdict == ClassificationVerdict.ERROR else reason[:200],
             "outcome": outcome,
             "escalated": outcome.startswith("escalated"),
             "latency_ms": latency_ms,
@@ -1435,6 +1578,7 @@ class _LocalActionState:
             "risk_level": risk_level,
             "user_authorization": user_authorization,
             "approval_grant": approval_grant,
+            "error_type": error_type,
             "session_id": self._session_id,
             "turn_id": action.turn_id,
             "call_id": action.call_id,
@@ -1574,6 +1718,19 @@ def _select_for_tool[H](
     ]
 
 
+def _select_for_agent[H](
+    resolved: list[tuple[str, H]], agent: HookAgentIdentity
+) -> list[tuple[str, H]]:
+    # Filtering here rather than inside the handler body keeps a hook scoped to another
+    # agent from emitting a run notice at the end of every turn.
+    return [
+        (binding_id, handler)
+        for binding_id, handler in resolved
+        if not isinstance(handler, AcceptOrRetryPostAgentHandler | AgentScopedHook)
+        or handler.selects(agent)
+    ]
+
+
 def _hook_pipeline_failed(
     action: RustHookCallActionBase, error: object
 ) -> RustHookFailedEvent:
@@ -1608,6 +1765,18 @@ def _unsupported_action(action: RustAction) -> RustEvent:
     raise TypeError(f"Unsupported action type: {type(action).__name__}")
 
 
+def _content_addressed(path: Path, content: str) -> Path:
+    """``path`` with a digest of ``content`` in its name.
+
+    Core names a saved output after the tool and the model's call ID, which a
+    provider can reuse in a later turn while the earlier turn still points the
+    model at its file. A digest keeps a different output out of that file, and
+    a retried write of the same output lands on the same one.
+    """
+    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+    return path.with_name(f"{path.stem}-{digest}{path.suffix}")
+
+
 def _replace_text_file(path: Path, content: str) -> None:
     # Offloaded tool results hold raw model output, so the directory and the
     # file are created owner-only; existing paths keep their current mode.
@@ -1636,9 +1805,11 @@ def _failed_tool_action(
 __all__ = [
     "CLASSIFICATION_EVENT_TYPE",
     "AcceptOrRetryPostAgentHandler",
+    "AgentScopedHook",
     "ApprovalGrant",
     "ApprovalRequester",
     "ClassificationSink",
+    "HookAgentIdentity",
     "HookApprovalCallback",
     "HookContext",
     "HookHandlers",

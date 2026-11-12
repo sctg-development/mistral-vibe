@@ -17,16 +17,19 @@ from typing import TYPE_CHECKING, Any
 
 from vibe.core.experiments._constants import EVAL_CACHE_TTL_SECONDS
 from vibe.core.experiments.models import EvalResponse
-from vibe.core.paths import EXPERIMENT_EVAL_CACHE_FILE
+from vibe.core.paths import EXPERIMENT_EVAL_CACHE_FILE, EXPERIMENT_HELD_EVAL_CACHE_FILE
 from vibe.core.utils.keyed_json_cache import load_keyed_entry, store_keyed_entry
 from vibe.observability.logging import logger
 
 if TYPE_CHECKING:
     from vibe.core.config import VibeConfigSchema
+    from vibe.core.platform_auth import PlatformCredentialFactory
 
 
-def load_cached_eval_response(config: VibeConfigSchema) -> EvalResponse | None:
-    key = _cache_key(config)
+def load_cached_eval_response(
+    config: VibeConfigSchema, credentials: PlatformCredentialFactory | None = None
+) -> EvalResponse | None:
+    key = _cache_key(config, credentials)
     if key is None:
         return None
     return load_keyed_entry(
@@ -38,10 +41,17 @@ def load_cached_eval_response(config: VibeConfigSchema) -> EvalResponse | None:
 
 
 def store_cached_eval_response(
-    config: VibeConfigSchema, response: EvalResponse
+    config: VibeConfigSchema,
+    response: EvalResponse,
+    *,
+    fetched_for: str | None = None,
+    credentials: PlatformCredentialFactory | None = None,
 ) -> None:
-    key = _cache_key(config)
-    if key is None:
+    """Cache ``response`` for the user it was fetched for (see ``may_cache_under``)."""
+    from vibe.core.platform_auth._mistral import may_cache_under
+
+    key = _cache_key(config, credentials)
+    if key is None or not may_cache_under(key, fetched_for=fetched_for):
         return
     store_keyed_entry(
         EXPERIMENT_EVAL_CACHE_FILE.path, key, response.model_dump(mode="json")
@@ -49,10 +59,16 @@ def store_cached_eval_response(
 
 
 def clear_cached_eval_responses() -> None:
-    try:
-        EXPERIMENT_EVAL_CACHE_FILE.path.unlink(missing_ok=True)
-    except OSError:
-        logger.debug("Failed to delete experiment eval cache file", exc_info=True)
+    """Drop every eval Vibe keeps on disk: the variants session builds apply,
+    and the evals the app server serves sessions from.
+    """
+    for path in (EXPERIMENT_EVAL_CACHE_FILE.path, EXPERIMENT_HELD_EVAL_CACHE_FILE.path):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug(
+                "Failed to delete experiment eval cache %s", path, exc_info=True
+            )
 
 
 def _parse_eval_payload(payload: Any) -> EvalResponse | None:
@@ -64,10 +80,12 @@ def _parse_eval_payload(payload: Any) -> EvalResponse | None:
         return None
 
 
-def _cache_key(config: VibeConfigSchema) -> str | None:
+def _cache_key(
+    config: VibeConfigSchema, credentials: PlatformCredentialFactory | None = None
+) -> str | None:
     # The eval cache is telemetry-gated: no telemetry, no bucketing.
     if not config.enable_telemetry or not config.experiments.enable:
         return None
     from vibe.core.telemetry.send import mistral_credential_cache_key
 
-    return mistral_credential_cache_key(config)
+    return mistral_credential_cache_key(config, credentials)

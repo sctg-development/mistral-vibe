@@ -1,7 +1,7 @@
 # Fork customizations (sctg-development/mistral-vibe)
 
 What this fork changes on top of upstream, so a sync keeps it. Upstream base:
-`dd2c04ce` (v3.0.1). Re-check with `git diff <upstream-tag> --stat -- vibe`.
+`b20313e0` (v3.1.2). Re-check with `git diff <upstream-tag> --stat -- vibe`.
 Upstream remote: `upstream` = `https://github.com/mistralai/mistral-vibe.git`.
 
 ## Multi-account key pool (Vibe sign-in keys)
@@ -25,12 +25,10 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 ### Upstream files we touched (re-apply after a sync; keep the hunks small)
 | File | Change |
 |---|---|
-| `vibe/utils/api_keys.py` | `pool_env_var`, `pooled_keys`, `stored_pool_keys`, `add_pooled_key`; plural variable then keyring entry as fallback in `resolve_api_key_with_origin` |
-| `vibe/utils/http.py` | `transport_wrapper` argument on `VibeAsyncHTTPClient` |
-| `vibe/core/llm/backend/mistral.py` | builds the `KeyPool`, wraps the transport, records per-key usage (`_record_pool_usage`) |
+| `vibe/utils/api_keys.py` | `pool_env_var`, `pooled_keys`, `stored_pool_keys`, `add_pooled_key`; plural variable then keyring entry as fallback in `resolve_api_key_with_origin`; `uses_cli_oidc_credential` (upstream's OIDC switch) also accepts `VIBE_API_KEY` |
 | `vibe/setup/auth/api_key_persistence.py` | every sign-in is appended to the pool (`add_pooled_key`) |
 | `vibe/_experimental_harness.py`, `vibe/app_server/_runtime.py` | back to upstream: v3.0 removed the legacy harness and `--legacy-harness`, so the pool no longer selects an engine. rotation on the main loop now lives in `ProviderCredentialService` (next row) |
-| `vibe/app_server/_provider_credentials.py`, `_unified_harness_backend_adapter.py` | pool on the Unified path: `ProviderCredentialService._pooled_snapshot` takes the next account (`KeyPool.acquire`) at every model call, `reject` (401/403) parks the leased account (`report_failure`, found by revision); 429s are not reported by the harness so only spreading, no rate-limit failover. Also per-key usage attribution. Tests: `tests/app_server/test_provider_credentials_pool.py` |
+| `vibe/app_server/_provider_credentials.py`, `_unified_harness_backend_adapter.py` | pool on the Unified path: `ProviderCredentialService._pooled_snapshot` (called from `_current_snapshot`, after the platform-credential branch and never when the CLI OIDC session applies) takes the next account (`KeyPool.acquire`) at every model call, `reject` (401/403) parks the leased account (`report_failure`, found by revision); 429s are not reported by the harness so only spreading, no rate-limit failover. Also per-key usage attribution. Tests: `tests/app_server/test_provider_credentials_pool.py` |
 | `vibe/cli-rust/src/cli.rs` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` CLI flags |
 | `vibe/cli-rust/src/main.rs` | Key management flag handlers for Rust CLI |
 | `vibe/cli-rust/src/session_exit.rs`, `src/server/process.rs`, `tests/session_exit.rs` | Rust TUI exit summary prints per-key usage under the session total. The app-server child runs in another process, so `key_pool.py` mirrors its usage (masked keys) to `$VIBE_KEY_USAGE_FILE`; the client sets that to `<tmp>/vibe-key-usage-<client pid>.json` at spawn and reads/removes it on exit |

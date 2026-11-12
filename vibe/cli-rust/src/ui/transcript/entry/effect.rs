@@ -147,20 +147,47 @@ pub(super) fn push_effect(
     }
     // Rows after the first hang under the message column.
     let mut hanging = Vec::new();
+    // A running or expanded header ends with its suffix; a collapsed header's single row does.
+    let trailing = (in_progress || shown) && !message.is_empty() && !suffix.is_empty();
     if !message.is_empty() {
         spans.push(Span::raw(" "));
         let indent: usize = spans.iter().map(|span| span.content.width()).sum();
         let style = summary(message_color);
-        let mut rows = header_message(message, !in_progress, shown, width, indent).into_iter();
-        spans.push(Span::styled(rows.next().unwrap_or_default().0, style));
+        // A collapsed row keeps room for the suffix and its gap after the ellipsis.
+        let reserved = if trailing || suffix.is_empty() {
+            indent
+        } else {
+            indent + suffix.width() + 1
+        };
+        let mut rows = header_message(message, !in_progress, shown, width, reserved);
+        // The trailing suffix follows the last word, or opens its own row when that one is full.
+        let available = usize::from(width).saturating_sub(indent);
+        if trailing
+            && rows
+                .last()
+                .is_none_or(|(row, _)| row.width() + 1 + suffix.width() > available)
+        {
+            rows.push((String::new(), None));
+        }
+        let last = rows.len().saturating_sub(1);
+        let row_spans = |index: usize, row: String| {
+            let mut spans = vec![Span::styled(row, style)];
+            if trailing && index == last {
+                if !spans[0].content.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(suffix.to_string(), theme::muted_style()));
+            }
+            spans
+        };
+        let mut rows = rows.into_iter().enumerate();
+        spans.extend(row_spans(0, rows.next().unwrap_or_default().1 .0));
         hanging = rows
-            .enumerate()
             .map(|(index, (row, gap))| {
                 // The gutter cells are prefixed once the body below is known.
                 let hang = indent.saturating_sub(BORDER_WIDTH as usize);
-                let line = Line::from(vec![Span::raw(" ".repeat(hang)), Span::styled(row, style)]);
-                // The suffix ends the first row, so the message cannot fold across it.
-                let gap = gap.filter(|_| index > 0 || suffix.is_empty());
+                let mut line = Line::from(Span::raw(" ".repeat(hang)));
+                line.spans.extend(row_spans(index, row));
                 let hang = hang as u16;
                 (line, Fold::hung(gap, hang).or(Some(Fold::indented(hang))))
             })
@@ -168,7 +195,7 @@ pub(super) fn push_effect(
     }
     // The suffix widget sits right after the header text, one cell in, muted
     // like the rest of the chrome.
-    if !suffix.is_empty() {
+    if !suffix.is_empty() && !trailing {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(suffix.to_string(), theme::muted_style()));
     }
@@ -264,7 +291,7 @@ fn push_result(
     );
 }
 
-/// Collapsed settled headers flatten to one ellipsized row; expanded ones keep their newlines.
+/// Collapsed settled headers flatten to one ellipsized row; the others keep their newlines and wrap.
 fn header_message(
     message: &str,
     settled: bool,
@@ -273,13 +300,9 @@ fn header_message(
     indent: usize,
 ) -> Vec<(String, Option<u16>)> {
     let available = (width as usize).saturating_sub(indent);
-    if !settled {
-        return message
-            .lines()
-            .map(|line| (line.to_owned(), None))
-            .collect();
-    }
-    if !expanded {
+    let bounded = text::bounded_message(message);
+    let message = bounded.as_ref();
+    if settled && !expanded {
         return vec![(
             text::ellipsize(&text::single_line(message), available),
             None,
@@ -290,3 +313,6 @@ fn header_message(
         .flat_map(|line| fold::wrap_hard(line, available))
         .collect()
 }
+
+#[cfg(test)]
+mod tests;

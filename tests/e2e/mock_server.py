@@ -32,6 +32,8 @@ type StreamChunk = dict[str, object]
 type ChunkFactory = Callable[[int, ChatCompletionsRequestPayload], list[StreamChunk]]
 # The HTTP status for a request; anything but 200 is sent as a JSON error body.
 type StatusFactory = Callable[[int, ChatCompletionsRequestPayload], int]
+# The `message` of that error body, as the provider would word it.
+type ErrorMessageFactory = Callable[[int, ChatCompletionsRequestPayload], str]
 
 
 class StreamingMockServer:
@@ -192,6 +194,7 @@ class StreamingMockServer:
         *,
         chunk_factory: ChunkFactory | None = None,
         status_factory: StatusFactory | None = None,
+        error_message_factory: ErrorMessageFactory | None = None,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.requests: list[ChatCompletionsRequestPayload] = []
@@ -200,13 +203,19 @@ class StreamingMockServer:
         self._lock = threading.Lock()
         self._chunk_factory = chunk_factory
         self._status_factory = status_factory
+        self._error_message_factory = error_message_factory
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._build_handler())
         self._scheme = "https" if ssl_context is not None else "http"
         if ssl_context is not None:
             self._server.socket = ssl_context.wrap_socket(
                 self._server.socket, server_side=True
             )
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        # The default 0.5s poll makes every `stop()` wait up to that long.
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
 
     def _build_handler(self) -> type[BaseHTTPRequestHandler]:
         parent = self
@@ -238,9 +247,14 @@ class StreamingMockServer:
                     else 200
                 )
                 if status != 200:
+                    message = (
+                        parent._error_message_factory(request_index, payload)
+                        if parent._error_message_factory is not None
+                        else f"mock status {status}"
+                    )
                     error_body = json.dumps({
                         "object": "error",
-                        "message": f"mock status {status}",
+                        "message": message,
                         "type": "mock_error",
                     }).encode()
                     self.send_response(status)

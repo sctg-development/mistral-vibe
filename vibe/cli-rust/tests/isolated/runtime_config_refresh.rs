@@ -1,12 +1,15 @@
-//! Config changes reach the live UI: model window, caret blink and theme.
+//! Config changes reach the live UI: model window, input box model, caret blink, mouse capture and theme.
 
 use std::sync::{Arc, Mutex, MutexGuard, Once};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
+use ratatui::Terminal;
 use serde_json::{json, Value};
 use vibe_rs::app::App;
 use vibe_rs::server::Client;
-use vibe_rs::ui::theme;
+use vibe_rs::ui::{bottom_bar, composer_title, theme};
 use vibe_rs::{event_handler, input, model_picker, theme_picker};
 
 /// Guards the active theme, which is process-global across this binary's tests.
@@ -55,15 +58,28 @@ fn a_config_screen_write_turning_cursor_blink_off_steadies_the_caret() {
     app.view.cursor_on = false;
     assert!(!app.main_input_cursor_on());
 
-    app.commit_started();
     let written = runtime(json!({"cursorBlink": false}), 600_000);
     model_picker::apply_event(&mut app, model_picker::Event::Written(written));
 
     assert!(app.main_input_cursor_on());
-    app.commit_started();
     let written = runtime(json!({"cursorBlink": true}), 600_000);
     model_picker::apply_event(&mut app, model_picker::Event::Written(written));
     assert!(!app.main_input_cursor_on());
+}
+
+#[test]
+fn a_config_screen_write_toggles_mouse_capture() {
+    let _guard = isolated();
+    let mut app = App::default();
+    assert!(app.session.startup_config.enable_mouse_capture);
+
+    let written = runtime(json!({"enableMouseCapture": false}), 600_000);
+    model_picker::apply_event(&mut app, model_picker::Event::Written(written));
+    assert!(!app.session.startup_config.enable_mouse_capture);
+
+    let written = runtime(json!({"enableMouseCapture": true}), 600_000);
+    model_picker::apply_event(&mut app, model_picker::Event::Written(written));
+    assert!(app.session.startup_config.enable_mouse_capture);
 }
 
 #[test]
@@ -72,7 +88,6 @@ fn a_theme_changed_through_config_applies_live() {
     let mut app = App::default();
     theme::set_active("ansi-dark");
 
-    app.commit_started();
     let written = runtime(json!({"theme": "dracula"}), 600_000);
     model_picker::apply_event(&mut app, model_picker::Event::Written(written));
 
@@ -98,4 +113,34 @@ async fn a_picked_theme_is_applied_before_its_write_completes() {
 
     assert!(!app.theme_picker.open);
     assert_eq!(theme::active().name, picked);
+}
+
+#[test]
+fn a_model_switch_renames_the_model_and_resizes_the_context_gauge() {
+    let _guard = isolated();
+    let mut app = App::default();
+    event_handler::apply_runtime_value(&mut app, &runtime(json!({}), 600_000));
+    assert!(model_title(&app).starts_with(" Medium[off]"));
+    assert!(bottom_bar_row(&mut app).ends_with(" ctx        0/600k"));
+
+    let small =
+        json!({"activeModel": {"alias": "small", "displayName": "Small", "thinking": "high"}});
+    event_handler::apply_runtime_value(&mut app, &runtime(small, 128_000));
+
+    assert!(model_title(&app).starts_with(" Small[high]"));
+    assert!(bottom_bar_row(&mut app).ends_with(" ctx        0/128k"));
+}
+
+fn model_title(app: &App) -> String {
+    composer_title::title(app, 120).line.to_string()
+}
+
+fn bottom_bar_row(app: &mut App) -> String {
+    let width = 120;
+    let mut terminal = Terminal::new(TestBackend::new(width, 1)).expect("terminal");
+    terminal
+        .draw(|frame| bottom_bar::draw(app, frame, Rect::new(0, 0, width, 1)))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
 }

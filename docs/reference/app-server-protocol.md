@@ -68,7 +68,10 @@ agent (`agentConfig.agent`), title, model, reasoning effort and first turn,
 applied and pinned as the matching mid-session changes are: like
 `config/model/write`, the model and level also become the user's default unless
 `sessionOnly` is set. If a choice or the first turn fails, the server deletes
-the session it opened and fails the start. Resume loads saved state;
+the session it opened and fails the start. `project` (`{kind: "local" |
+"cloud", id}`) stamps the session's metadata with its project once; forks,
+rewinds and `/clear` replacements inherit their source's stamp. Without it the
+session stays unstamped, as CLI sessions are. Resume loads saved state;
 continue selects the latest eligible session. List, stored read and history
 are passive operations. Fork creates an independent session from a supported
 boundary; `session/stop` flushes and shuts down the attached session.
@@ -197,12 +200,45 @@ The callback lifecycle records an open public entry and blocked effect, sends
 then accepts the semantic answer through **`callback/result`**. Runtime validates
 correlation and resolves the pending execution request once. Identical semantic
 retries are no-ops; conflicting second responses fail. Still-open callbacks
-remain in `activeCallbacks` and are redelivered on live reconnect.
+remain in `activeCallbacks` and are redelivered on live reconnect. When
+`session/resume` or `session/continue` attaches a session whose turn is still
+running, such as a turn recovered after a restart, the server first sends that
+turn's `turn/started` again, so the client can follow and interrupt it.
 
 Client-hosted filesystem/terminal operations require advertised capability.
 The server routes them through its tool-I/O contract, validates responses and
 preserves Runtime permission enforcement and result ownership. Unsupported
 operations fail explicitly.
+
+Tool implementations share the Harness `ProvidedToolExecutor` contract:
+
+| Execution target | Executor | Implementation |
+| --- | --- | --- |
+| `client` | `ClientToolExecutor` | Connected client, over the existing JSON-RPC connection |
+| `mcpServer` | `McpToolExecutor` | Independent MCP server, over stdio or HTTP |
+
+Both reach the same provided-tool discovery, approval, hooks and history path.
+A local MCP subprocess is still an `mcpServer`, not a `client` tool.
+
+Desktop advertises `capabilities.clientTools: ["tools/call"]`,
+`capabilities.agentPlugins: [{name, root}]` and
+`capabilities.clientToolDefinitions: [{namespace, name, description, inputSchema, outputSchema}]`.
+The client supplies the tool definitions and implementation. Its bundled Plugins
+supply portable guidance and determine which tools belong to a pinned session;
+they do not declare client tools as MCP servers or carry a `tools.json` proxy.
+
+Client execution sends **`tools/call`** `{callId, name, input, toolCallId, caller}`.
+The client returns `{output?, annotations?, error?}`; `error` has
+`{message, code?, details?}`. Cancellation sends **`tools/cancel`** `{callId}`.
+The server allows a call only when its namespace names a Plugin declared by
+the client at initialization and that Plugin is enabled with built-in scope in
+the caller's live, pinned session. The advertised `root` remains required by the
+initialization contract and is checked for uniqueness; it is not compared with
+the session's installed root, checkout or data root and grants no permission.
+Disabling or releasing the Plugin revokes pending calls. Desktop dispatches on
+the `caller` sent with the call.
+Model arguments never select the caller or Code session.
+No HTTP listener, bridge token, MCP marker or capability file is used.
 
 A client that advertises `capabilities.sessionSpawn` in `initialize` hosts
 sessions the model starts: its sessions are offered Vibe's `start_session`
@@ -226,9 +262,177 @@ reports the outcome as unknown, and an answer arriving later is logged and
 dropped. Clients that do not advertise the capability never see the
 tool.
 
+A client that advertises `capabilities.sessionPeers` hosts the other sessions
+of a session's project: its sessions are offered `list_sessions`,
+`read_session`, `send_to_session` and `archive_sessions`, and also
+`restore_sessions` when it advertises `capabilities.sessionPeerRestore` and
+`mark_sessions_seen` when it advertises `capabilities.sessionPeerMarkSeen`. A
+client that predates `session/peer/restore` or `session/peer/markSeen` fails
+its whole connection on that request, so the server never sends it to a
+client that did not advertise the capability.
+Listing, reading and marking seen are allowed by default; sending, archiving
+and restoring ask, like `start_session`. Only listing and reading are
+callable from programs, so a model filters sessions on any field in code.
+Each call sends the client a request on the calling session's own
+connection, and the client answers for that session's project only:
+
+- **`session/peer/list`** `{sessionIds?, statuses?, limit, cursor?}`
+  answers `{sessions, nextCursor?, notFound}`: the given sessions in that
+  order, or the project's other sessions most recently active first, a page
+  at a time, archived ones only when `statuses` names them. Each is
+  `{sessionId, title?, status, statusDetail?, url?, updatedAt?, cwd?,
+  startedBySessionId?, queuedMessages?, isUnseen?, pullRequests?}`, a field
+  left out when it says nothing: `isUnseen` when the user has not seen its
+  latest activity, `pullRequests` its artifacts with their state, checks,
+  review and branches. `notFound` lists the asked ids that are not
+  sessions of the project.
+- **`session/peer/read`** `{targetSessionId, limit, cursor?,
+  includeToolCalls, maxMessageChars}` answers at once with `{sessionId, title?, status,
+  statusDetail?, url?, queuedMessages, isUnseen, messages: [{role, text}], nextCursor?}`:
+  a page of its user and assistant messages, oldest first, the latest page
+  unless `cursor` asks for the one before it, and with `includeToolCalls` a
+  `tool` line per tool call naming what it ran or touched. A message longer
+  than `maxMessageChars` is cut and says so. It never waits for the target.
+- **`session/peer/send`** `{targetSessionId, text, idempotencyKey, sender,
+  delivery, hops}` hands `text` to the target through `session/turn/enqueue`,
+  with `sender`, `delivery` and `hops` as they came, and answers `{sessionId,
+  title?, url?, queued}`, `queued` as the server's `waits` says.
+- **`session/peer/archive`** `{sessionIds}` archives those sessions, as the
+  user's archive action does, and answers `{archived: [{sessionId, title?}],
+  failed: [{sessionId, error}]}`; one that is not a session of the project, is
+  the caller itself, or is working, has queued messages or waits for the user,
+  fails alone.
+- **`session/peer/restore`** `{sessionIds}` unarchives those sessions, as the
+  user's restore action does, and answers `{restored: [{sessionId, title?}],
+  failed: [{sessionId, error}]}`; one that is not a session of the project
+  fails alone, and one that is not archived is left as it is.
+- **`session/peer/markSeen`** `{sessionIds}` clears those sessions' unread
+  mark, as the user opening them does, and answers `{marked: [{sessionId,
+  title?}], failed: [{sessionId, error}]}`; one that is not a session of the
+  project, is the caller itself, or is working or waits for the user, fails
+  alone. A marked session turns unread again when it next finishes a turn.
+
+Session ids are the client's: the `clientSessionId` a `session/spawn` answer
+carries, which `start_session` then returns to the model. The model may name a
+session by its id, a unique prefix of at least 8 characters of it, or its
+title (case ignored); the server resolves each name against
+`session/peer/list` before it asks the client, so a client only ever receives
+ids. A name that matches nothing, or
+more than one session, fails the tool call (one entry of `failed` for
+`archive_sessions`, `restore_sessions` and `mark_sessions_seen`) with the
+closest sessions' ids and titles, so the model can call again;
+`list_sessions` lists it in `not_found`. `send_to_session` without `session_id`
+goes to the session that started the caller. `status` is
+`working`, `idle`, `waiting_for_user` (an approval or question blocks it;
+`statusDetail` says which), `failed` or `archived`; a session another process
+holds (its lease, as `session/archive` with `requireIdle` sees it) is
+`working`, and one no process holds is `idle`. The client refuses a send to the calling session
+itself, and queues the message's own text on `session/turn/enqueue` with the
+request's `sender: {sessionId, title?}`: the calling session, named by the
+server, its id mapped to the client's. A server that names no sender predates
+`sender` here too and refuses it, so the client sends `sentBySession: true`
+instead, read as a message from an unnamed session. A repeated delivery with the same `idempotencyKey` is
+answered from the first one and never runs twice. The model reads the text as
+it was sent, after a `<session_message from_session_id="…" from_title="…"/>`
+block naming its sender; the server records
+`{type: "vibe.session_message", sessionId, title?}` as the message's
+`userDisplayContent`; public history, the queue and the session preview show
+the text alone, so a client renders the message as one the session received
+rather than one the user typed. Such a message never enters the queue the user
+edits: while a turn runs, it joins that turn as a steer does, waking a turn that
+waits for input; otherwise, with `delivery: "start_turn"` (the default) it
+starts a turn, and with `delivery: "queue"` it enters the model's context and
+public history without starting one, so the session's next turn reads it
+(`waits: true`). The server counts `hops`, the messages and starts between
+sessions in a row since a user wrote: each send and `session/spawn` carries one
+more than the turn sending it, a turn the user starts, queues or steers resets
+the count, and a message joining a turn raises it. Past `MAX_SESSION_HOPS` (32)
+the server refuses `send_to_session` and `start_session`. It also refuses
+`start_session` from a session another session started (read from the starter
+the session saved, so it holds across restarts), and past
+`MAX_TURN_STARTED_SESSIONS` (32) sessions started in one turn. Each refusal is a tool error whose `details.reason` is
+`session_depth`, `started_sessions` or `session_hops`. The task a session hands with `start_session` tells the model
+to report back that way when it is done, in a block public history leaves out,
+so the starter learns the outcome without reading the session over and over. A refusal or a
+malformed answer is a tool error the model reads; a disconnect during a send
+reports the outcome as unknown.
+
+The server, which holds each session's turns and queue, decides what a client
+could only race, and says why with `data.refusal` on a `conflict`.
+`session/turn/enqueue` from another session refuses `"archived"` once the
+session is archived (read from its saved metadata, so an archive by another
+process counts), `"paused"` while its queue is paused and no turn runs to join,
+and `"busy"` when no turn can be joined or started after a few seconds of
+retrying. `session/archive` with
+`requireIdle: true` first waits up to 10 seconds for the session to settle (a
+started session reports back from inside a turn that is about to end), then
+refuses `"busy"` while the session is still working: a turn runs,
+is reserved or waits in the queue, or work a turn started (a background
+process, a title) still runs. On a session this server has open, each check
+and its change are one step, and a scheduled loop does not fire on an archived
+session. For a session no process of this server has open, an archive holds
+the session's lease while it saves, so no process opens it from the metadata
+before it; a process that already holds the lease runs the session, which
+`requireIdle` refuses as `"busy"` and a plain archive saves over as before (the
+holder can then save its own metadata over the archive). A saved session no
+process holds has an empty queue: a queue lives only in the process that runs
+it.
+
+`session/archive` with `archived: true` and `includeStartedSessions: true`
+also archives the sessions the session started, and those they started in
+turn. Each is archived as with `requireIdle`, through whichever channel of this
+process has it open, so its own save does not undo the archive. A started
+session stays unarchived, with the sessions it started, when it is pinned
+(`"pinned"`), stamped with another project than the starter's
+(`"other_project"`), still working (`"busy"`), or its archive fails
+(`"failed"`). The answer adds `startedSessions: {archived: [sessionId],
+skipped: [{sessionId, reason}]}`; an answer that did not ask for it is
+unchanged. Unarchiving ignores the flag.
+
+A client that advertises `capabilities.agentWorktrees` lets its local
+sessions move into git worktrees of their own: those sessions are offered
+`enter_worktree`, and, when they start in the user's checkout, their system
+prompt has the model ask the user (through `ask_user_question`) before its
+first edit whether to work in a new worktree or in place. Other clients never
+see the tool.
+
 `initialize` ignores client capabilities the server does not know, so a client
 may declare one ahead of the servers that act on it. The rest of the handshake
 stays strict. Servers released before this rule reject unknown capabilities.
+
+`session/list` takes two optional params: `sessionIds` lists only those
+sessions, reading no other, and `include: ["pullRequests"]` adds
+`pullRequests: {[sessionId]: [artifact]}` for the page's sessions beside
+`items`. An answer that did not ask for them is unchanged. A client sends them
+only to an app server that asks it for `session/peer/*`, which is as recent.
+
+Every `PublicSession` carries its `project` stamp (`{kind, id}`), null while
+unstamped. With `experimental_enable_local_projects` on, a listing gives an
+unstamped session, or one stamped with a removed local project, the local
+project whose folder is the session's working folder or contains it, and saves
+that stamp. The deepest project folder wins. A session in a managed worktree
+matches only a project on exactly its folder. When several projects share the
+folder, it picks a single-folder project, then one whose primary folder it is,
+then the oldest, then the lowest id. A session another process holds gets the match in
+the answer only, and a later listing saves it; a legacy session is matched on
+every listing.
+
+`session/move` puts a root session in another project:
+`{sessionId, project: {kind: "local", id} | {kind: "none"}}`. It needs
+`experimental_enable_local_projects` and answers `{state}`. The session is
+stamped with the project and moved to its primary folder, as `session/relocate`
+moves it, without the same-repository rule. A session that leaves a managed
+worktree releases it; the worktree stays on disk. With `kind: "none"` the
+session keeps its folder. A working session, or one another connection or
+process holds, is refused as a `conflict` before anything moves; an unknown
+project is `not_found`. A session only the
+legacy store has is refused as `invalid_params` until it is opened.
+
+`session/start` takes an optional `startedBySessionId`: the session that started
+this one to hand it `firstTurn`, and `hops`, the `session/spawn` request's. The session keeps it, `/clear` included, and
+every `PublicSession` of it (listed, read, or updated) returns it as
+`startedBySessionId`; a session nobody started leaves it out. App servers before
+it accept the param but do not save it, so they report no starter.
 
 ## Product resources and child sessions
 

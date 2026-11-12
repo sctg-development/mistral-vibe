@@ -1,6 +1,5 @@
 //! Client-owned startup banners.
 
-use ratatui::style::Color;
 use ratatui::text::{Line, Span};
 
 use crate::selection::{fold, Fold};
@@ -18,17 +17,41 @@ pub(super) fn push_warning(lines: &mut LinkedLines, text: &str, width: u16) {
     }
 }
 
-/// What's new: the markdown body under a heavy `$mistral_orange`
-/// left border, one blank above it when history widgets existed at mount time.
-pub(super) fn push_whats_new(lines: &mut LinkedLines, text: &str, width: u16, after_history: bool) {
-    if after_history {
-        lines.push_gap();
-    }
-    push_guttered(lines, text, width, theme::ORANGE);
+/// The warnings collected before the first turn, in a `$warning`-framed box.
+pub(super) fn push_startup_notices(lines: &mut LinkedLines, text: &str, width: u16) {
+    let title = crate::notices::TITLE;
+    lines.append(markdown::framed(
+        text,
+        width,
+        title,
+        theme::warning(),
+        |_| false,
+    ));
 }
 
-/// A markdown banner under a heavy left border: the promo (`$mistral_orange`),
-/// the what's-new body, and the custom-tools deprecation (`$warning`).
-pub(super) fn push_guttered(lines: &mut LinkedLines, text: &str, width: u16, color: Color) {
-    lines.append(markdown::guttered(text, width, color));
+/// A server warning or error after the first turn: a `⚠`/`✗` row in its severity color.
+pub(super) fn push_notice_row(lines: &mut LinkedLines, text: &str, width: u16, error: bool) {
+    let (icon, color) = match error {
+        true => ("✗", theme::error()),
+        false => ("⚠", theme::warning()),
+    };
+    let style = theme::text(color);
+    lines.push_gap();
+    let body_width = width.saturating_sub(4) as usize;
+    for (index, (row, gap)) in fold::wrap_hard(text, body_width).into_iter().enumerate() {
+        let lead = if index == 0 { icon } else { " " };
+        let line = Line::from(vec![
+            Span::styled(format!("{lead} "), style),
+            Span::styled(row, style),
+        ]);
+        lines.push_folded(line, Fold::hung(gap, 2));
+    }
+}
+
+/// The release notes of a fresh session, in a titled frame, versions in `$primary`.
+pub(super) fn push_whats_new(lines: &mut LinkedLines, text: &str, width: u16) {
+    let is_version = |line: &Line| crate::whats_new::is_version_heading(line.to_string().trim());
+    let title = crate::whats_new::TITLE;
+    let border = theme::md_fence_border();
+    lines.append(markdown::framed(text, width, title, border, is_version));
 }

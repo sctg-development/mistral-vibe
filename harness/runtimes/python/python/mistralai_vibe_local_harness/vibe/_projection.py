@@ -20,12 +20,12 @@ from mistralai_vibe_local_harness.protocol import (
     RustInterruptedTurn,
     RustLLMCallAction,
     RustProtocolError,
-    RustProvidedToolCallAction,
+    RustProvidedToolCall,
     RustReasoningPart,
     RustReasoningSummaryContent,
     RustReasoningTextContent,
     RustRunningTurn,
-    RustRuntimeBuiltinToolCallAction,
+    RustRuntimeBuiltinToolCall,
     RustSessionTransition,
     RustTextContentBlock,
     RustToolCallAction,
@@ -55,6 +55,8 @@ from mistralai_vibe_local_harness.session_protocol import (
     TitleSource,
     TokenUsage,
 )
+from mistralai_vibe_local_harness.vibe._fact_recorder import FactRecorder
+from mistralai_vibe_local_harness.vibe._file_images import is_file_image
 from mistralai_vibe_local_harness.vibe._observability import (
     add_uncorrelated_tool_result,
 )
@@ -62,6 +64,7 @@ from mistralai_vibe_local_harness.vibe._runtime_config import CompletionDelta
 from mistralai_vibe_local_harness.vibe._storage import (
     ProjectionDelta,
     ProjectionStateV1,
+    SessionApiFactsV1,
     compute_projection_delta,
 )
 
@@ -75,6 +78,15 @@ APPROVAL_NOTE_META_KEY = "approval_note"
 # approval_source) that the local actions gate records on the tool result;
 # lifted into the effect state for telemetry.
 APPROVAL_META_KEY = "approval"
+
+SMART_APPROVE_META_KEY = "smart_approve"
+
+# _meta keys a pre_agent hook leaves on the user message, so public history shows
+# what the user typed while the model reads the hook's version. A rewritten text
+# block keeps the user's text under the first key; a block the hook added for the
+# model carries the second. The Core strips _meta before the model sees a message.
+HOOK_ORIGINAL_TEXT_META_KEY = "vibe.hookOriginalText"
+HOOK_CONTEXT_META_KEY = "vibe.hookContext"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +104,9 @@ class ProjectionUpdate:
     # persistence retry deciding whether the store already has this advance must
     # compare against this rather than against what the user is looking at.
     journaled_snapshot: PublicSessionState
+    # Session API facts this advance added, journaled with ``delta``. ``None``
+    # when the advance added none or is not journaled.
+    session_api: SessionApiFactsV1 | None = None
 
 
 class SessionProjector:
@@ -106,7 +121,7 @@ class SessionProjector:
     rather than merely leak state. Keep the discipline when adding one.
     """
 
-    def __init__(self, projection: ProjectionStateV1) -> None:
+    def __init__(self, projection: ProjectionStateV1, facts: FactRecorder) -> None:
         self._projection = projection.model_copy(
             update={"snapshot": with_session_preview(projection.snapshot)}
         )
@@ -114,6 +129,11 @@ class SessionProjector:
         # whatever provisional content is live, so deltas are diffed against
         # what the store actually has rather than against the on-screen view.
         self._durable = self._projection.snapshot
+        # Every projector of one Session shares its recorder, so each entry's
+        # Session API position is assigned once.
+        self._facts = facts
+        facts.observe(self._projection.snapshot)
+        self._projection = self._with_facts(self._projection)
 
     @property
     def projection(self) -> ProjectionStateV1:
@@ -128,14 +148,15 @@ class SessionProjector:
         from that fragment alone. Use this wherever the resync is routine
         bookkeeping rather than a decision to abandon the live view.
         """
-        rebased = SessionProjector(projection)
-        live = self._projection.snapshot.history.entries
-        if not any(_is_provisional(entry) for entry in live):
-            return rebased
+        rebased = SessionProjector(projection, self._facts)
         # ``_durable`` stays the store's snapshot; only the live view gains the
         # entries back.
         stored = rebased._projection.snapshot
-        entries = _restore_provisional_entries(stored.history.entries, live)
+        entries = _restore_live_completion_entries(
+            stored.history.entries, self._projection.snapshot.history.entries
+        )
+        if len(entries) == len(stored.history.entries):
+            return rebased
         rebased._projection = rebased._projection.model_copy(
             update={
                 "snapshot": stored.model_copy(
@@ -169,8 +190,13 @@ class SessionProjector:
             )
         else:
             entry = _running_effect_entry(
-                state.session.id, action, observed_at, input_entry_id=input_entry_id
+                state.session.id,
+                entries,
+                action,
+                observed_at,
+                input_entry_id=input_entry_id,
             )
+            self._record_tool_call(entry, action.call_id, action.call.arguments)
         if not _replace_entry(entries, cast(str, entry["id"]), entry):
             entries.append(entry)
         public = state.model_copy(
@@ -181,6 +207,17 @@ class SessionProjector:
         )
         return self._advance(public)
 
+    def _record_tool_call(
+        self, entry: JsonObject, call_id: str, arguments: JsonObject
+    ) -> None:
+        # The public entry holds the action ID, not the model's call ID, and
+        # for some tools only a summary of the arguments. Arguments it
+        # already shows are not stored twice: the projection has a size limit.
+        call: JsonObject = {"toolCallId": call_id}
+        if cast(JsonObject, entry["detail"]).get("input") != arguments:
+            call["arguments"] = cast(JsonValue, arguments)
+        self._facts.record_tool_call(cast(str, entry["id"]), call)
+
     def apply(  # noqa: PLR0912, PLR0914, PLR0915 - one branch per observation
         self, transition: RustSessionTransition, *, observed_at: int
     ) -> ProjectionUpdate:
@@ -190,10 +227,6 @@ class SessionProjector:
         token_usage = state.session.token_usage
         context_usage = state.session.context_usage
         preview = state.session.preview or first_user_message_preview(entries)
-        # The Turn whose latest committed answer was cut off at the output cap.
-        # An answer that ends its Turn is committed in the same transition as
-        # the Turn's completion, so tracking it per transition is enough.
-        truncated_turn_id: str | None = None
         for observation in transition.observations:
             if isinstance(observation, RustTurnStartedObservation):
                 latest_turn = InProgressPublicTurn(
@@ -206,7 +239,9 @@ class SessionProjector:
                 )
                 if content_is_injected(observation.content):
                     continue
-                preview = preview or _content_preview(observation.content)
+                preview = preview or _content_preview(
+                    displayed_user_content(observation.content)
+                )
                 entry = _message_entry(
                     state.session.id,
                     observation.turn_id,
@@ -265,11 +300,6 @@ class SessionProjector:
                     update={"input_entry_id": input_entry_id}
                 )
             elif isinstance(observation, RustAssistantMessageCommittedObservation):
-                truncated_turn_id = (
-                    observation.turn_id
-                    if observation.candidate.finish_reason == "length"
-                    else None
-                )
                 input_entry_id = _active_input_entry_id(
                     latest_turn, observation.turn_id
                 )
@@ -362,6 +392,11 @@ class SessionProjector:
                 )
                 if not _replace_entry(entries, cast(str, entry["id"]), entry):
                     entries.append(entry)
+                    # No start entry kept the call ID (the model's, or Core's ID for a
+                    # call inside a program): Core settled the call without starting it.
+                    self._record_tool_call(
+                        entry, observation.call_id, observation.call.arguments
+                    )
             elif isinstance(observation, RustToolDiscoveryFinishedObservation):
                 entry = _completed_tool_discovery_effect_entry(
                     state.session.id,
@@ -444,6 +479,10 @@ class SessionProjector:
                     else entry
                     for entry in entries
                 ]
+                if observation.stop_reason == "skipped":
+                    entries = _with_skipped_user_message(
+                        entries, observation.turn_id, observed_at
+                    )
                 latest_turn = CompletedPublicTurn(
                     id=observation.turn_id,
                     session_id=state.session.id,
@@ -453,10 +492,9 @@ class SessionProjector:
                     ),
                     started_at=started_at,
                     completed_at=observed_at,
-                    stop_reason=_completed_stop_reason(
-                        observation, truncated=truncated_turn_id == observation.turn_id
-                    ),
+                    stop_reason=_completed_stop_reason(observation),
                     skip_reason=_skip_reason(observation),
+                    reject_reason=_reject_reason(observation),
                 )
             elif isinstance(observation, RustTurnInterruptedObservation):
                 started_at = _started_at(latest_turn, observation.turn_id, observed_at)
@@ -663,8 +701,11 @@ class SessionProjector:
         watermark: int,
         delta: ProjectionDelta | None,
     ) -> ProjectionUpdate:
-        self._projection = self._projection.model_copy(
-            update={"watermark": watermark, "snapshot": public}
+        self._facts.observe(public)
+        self._projection = self._with_facts(
+            self._projection.model_copy(
+                update={"watermark": watermark, "snapshot": public}
+            )
         )
         return ProjectionUpdate(
             projection=self._projection,
@@ -679,7 +720,17 @@ class SessionProjector:
             ),
             delta=delta,
             journaled_snapshot=self._durable,
+            session_api=self._facts.unsaved_facts() if delta is not None else None,
         )
+
+    def _with_facts(self, projection: ProjectionStateV1) -> ProjectionStateV1:
+        """``projection`` holding every recorded fact, so a generation written
+        from it is complete. Without recorded facts, saved ones stay untouched.
+        """
+        facts = self._facts.all_facts()
+        if facts is None:
+            return projection
+        return projection.model_copy(update={"session_api": facts})
 
 
 def _published_state(public: PublicSessionState) -> JsonObject:
@@ -725,6 +776,36 @@ def public_message_entry(
     )
 
 
+def displayed_user_content(content: Sequence[Any]) -> list[Any]:
+    """The user message as the user sent it, before any pre_agent hook changed it.
+
+    A block a hook added is dropped, and a rewritten text block shows the user's
+    text again; a text a hook put where the user typed none shows nothing. A message
+    without hook marks comes back unchanged. What a hook wrote never shows as the
+    user's, even when it is all the message holds.
+    """
+    shown: list[Any] = []
+    for part in content:
+        meta = getattr(part, "meta", None)
+        if not isinstance(meta, dict):
+            shown.append(part)
+            continue
+        if meta.get(HOOK_CONTEXT_META_KEY) is True:
+            continue
+        original = meta.get(HOOK_ORIGINAL_TEXT_META_KEY)
+        if isinstance(part, RustTextContentBlock) and isinstance(original, str):
+            if not original:
+                continue
+            rest = {
+                key: value
+                for key, value in meta.items()
+                if key != HOOK_ORIGINAL_TEXT_META_KEY
+            }
+            part = part.model_copy(update={"text": original, "meta": rest or None})
+        shown.append(part)
+    return shown
+
+
 def content_is_injected(content: Sequence[Any]) -> bool:
     for part in content:
         meta = getattr(part, "meta", None)
@@ -767,13 +848,19 @@ def with_session_preview(state: PublicSessionState) -> PublicSessionState:
 def settle_stalled_projection(
     state: PublicSessionState, *, observed_at: int
 ) -> PublicSessionState:
-    """Present a mid-turn projection with no live owner as settled.
+    """Present a projection with no live owner as settled.
 
     Projects a ``running``/``blocked`` turn as ``interrupted``, settles its open
     effects, and marks the session idle, so clients never render a phantom
-    "working" state. A pure presentation transform: the caller decides the
-    session is actually unowned (e.g. via the lease), not this function.
+    "working" state. Its queue is emptied too: a queue lives only in the
+    process that holds the session, so a saved one never runs. A pure
+    presentation transform: the caller decides the session is actually unowned
+    (e.g. via the lease), not this function.
     """
+    if state.turn_queue.items:
+        state = state.model_copy(
+            update={"turn_queue": state.turn_queue.model_copy(update={"items": []})}
+        )
     status = state.session.status
     if not isinstance(status, (RunningSessionStatus, BlockedSessionStatus)):
         return state
@@ -867,6 +954,8 @@ def _message_entry(
         if role == "user"
         else None
     )
+    if role == "user":
+        content = displayed_user_content(content)
     return cast(
         JsonObject,
         {
@@ -907,23 +996,46 @@ def _is_provisional(entry: JsonObject) -> bool:
     )
 
 
-def _restore_provisional_entries(
+def _restore_live_completion_entries(
     stored: Sequence[JsonObject], live: Sequence[JsonObject]
 ) -> list[JsonObject]:
-    """Re-insert ``live``'s provisional entries into ``stored`` where they sat.
+    """Re-insert ``live``'s completion entries the store lacks where they sat.
 
-    Each one goes back after the durable entry it followed in the live view.
+    These are streamed entries still in progress, and streamed entries an
+    earlier rebase settled that the store has not journaled yet. Each one goes
+    back after the durable entry it followed in the live view.
     Appending them all at the tail instead would drop a streaming answer below
     whatever was journalled while it streamed -- a steering message, say --
     since the live view holds those after the provisional entry, not before.
+
+    The store may already hold the settled outcome of a streamed completion. A
+    live entry whose id the store holds is not restored, since an id must name
+    one entry. One the store's outcome left out, such as reasoning a hook
+    dropped, is restored settled the way that outcome settled its siblings, and
+    kept across later rebases until it is journaled: a published entry is never
+    retracted, so dropping it would leave it in progress on the client.
     """
+    stored_ids = {
+        entry_id for entry in stored if isinstance(entry_id := entry.get("id"), str)
+    }
+    settled = _settled_completion_actions(stored)
     trailing: dict[str | None, list[JsonObject]] = {}
     anchor: str | None = None
     for entry in live:
+        entry_id = entry.get("id")
+        action_id = _completion_action_id(entry)
+        settlement = settled.get(action_id) if action_id is not None else None
         if _is_provisional(entry):
+            if entry_id in stored_ids:
+                continue
+            if settlement is not None:
+                settled_at, cause = settlement
+                entry = _settled_provisional_entry(entry, settled_at, cause=cause)
             trailing.setdefault(anchor, []).append(entry)
             continue
-        entry_id = entry.get("id")
+        if settlement is not None and entry_id not in stored_ids:
+            trailing.setdefault(anchor, []).append(entry)
+            continue
         if isinstance(entry_id, str):
             anchor = entry_id
     restored = list(trailing.pop(None, []))
@@ -938,13 +1050,42 @@ def _restore_provisional_entries(
     return restored
 
 
-def _belongs_to_action(entry: JsonObject, action_id: str) -> bool:
+def _settled_completion_actions(
+    entries: Sequence[JsonObject],
+) -> dict[str, tuple[int, PublicDiscardCause]]:
+    """When and why each settled completion's left-out entries are discarded.
+
+    A committed completion discards what it did not keep as ``failure``, as
+    the commit does; a discarded one passes on its own cause.
+    """
+    settled: dict[str, tuple[int, PublicDiscardCause]] = {}
+    for entry in entries:
+        action_id = _completion_action_id(entry)
+        outcome = entry.get("outcome")
+        if action_id is None or _is_provisional(entry) or not isinstance(outcome, dict):
+            continue
+        cause = outcome.get("cause") if outcome.get("type") == "discarded" else None
+        settled[action_id] = (
+            cast(int, entry["updatedAt"]),
+            cast(PublicDiscardCause, cause) if isinstance(cause, str) else "failure",
+        )
+    return settled
+
+
+def _completion_action_id(entry: JsonObject) -> str | None:
+    """The completion action an assistant or reasoning entry was produced by."""
     entry_id = entry.get("id")
     if not isinstance(entry_id, str):
-        return False
-    return entry_id == f"assistant-{action_id}" or entry_id.startswith(
-        f"reasoning-{action_id}-"
-    )
+        return None
+    if entry_id.startswith("assistant-"):
+        return entry_id.removeprefix("assistant-")
+    if entry_id.startswith("reasoning-"):
+        return entry_id.removeprefix("reasoning-").rpartition("-")[0] or None
+    return None
+
+
+def _belongs_to_action(entry: JsonObject, action_id: str) -> bool:
+    return _completion_action_id(entry) == action_id
 
 
 def _merge_provisional_entry(
@@ -1240,15 +1381,21 @@ def _text_preview(parts: Sequence[str]) -> str:
 
 def _public_content_block(part: Any) -> JsonValue:
     serialized = part.model_dump(mode="json", by_alias=True, exclude_none=True)
-    if isinstance(part, RustImageContentBlock):
+    # An image kept with its file shows as the image it was sent as.
+    if isinstance(part, RustImageContentBlock) or is_file_image(part):
+        data, mime_type = (
+            (part.data, part.mime_type)
+            if isinstance(part, RustImageContentBlock)
+            else (part.resource.blob, part.resource.mime_type)
+        )
         return cast(
             JsonValue,
             {
                 "type": "image",
                 "attachment": {
-                    "source": {"kind": "inline", "data": part.data},
+                    "source": {"kind": "inline", "data": data},
                     "alias": "image",
-                    "mimeType": part.mime_type,
+                    "mimeType": mime_type,
                 },
             },
         )
@@ -1311,17 +1458,18 @@ def _public_content_block(part: Any) -> JsonValue:
 
 def _running_effect_entry(
     session_id: str,
+    entries: Sequence[JsonObject],
     action: RustToolCallAction,
     observed_at: int,
     *,
     input_entry_id: str | None,
 ) -> JsonObject:
-    tool_name, detail = _effect_detail(action)
+    tool_name, detail = _effect_detail(action.call)
     return cast(
         JsonObject,
         {
             "type": "effect",
-            "id": f"effect-{action.action_id}",
+            "id": effect_entry_id(entries, action.action_id, action.turn_id),
             "sessionId": session_id,
             "turnId": action.turn_id,
             "createdAt": observed_at,
@@ -1566,15 +1714,13 @@ def _completed_effect_entry(  # noqa: PLR0914 - one cohesive effect entry
     *,
     input_entry_id: str | None,
 ) -> JsonObject:
-    entry_id = f"effect-{observation.action_id}"
+    entry_id = effect_entry_id(entries, observation.action_id, observation.turn_id)
     existing = _find_entry(entries, entry_id)
     result = observation.result
     output_text = "\n".join(
         part.text for part in result.content if isinstance(part, RustTextContentBlock)
     )
-    serialized = cast(
-        JsonValue, result.model_dump(mode="json", by_alias=True, exclude_none=True)
-    )
+    serialized = _effect_output(result)
     approval = _approval_meta(result)
     if (
         isinstance(result, RustToolFailureResult)
@@ -1600,7 +1746,7 @@ def _completed_effect_entry(  # noqa: PLR0914 - one cohesive effect entry
             "display": {"success": False, "message": message},
         }
     else:
-        title = _entry_title(existing) or "tool"
+        title = _entry_title(existing) or _tool_effect_detail(observation.call)[0]
         message = _settled_message(existing) or f"{title} completed"
         output = serialized
         display: JsonObject = {"success": True, "message": message}
@@ -1627,9 +1773,22 @@ def _completed_effect_entry(  # noqa: PLR0914 - one cohesive effect entry
             "state": effect_state,
         })
         return cast(JsonObject, updated)
-    add_uncorrelated_tool_result()
-    tool_name = "tool"
-    message = _effect_result_message(effect_state)
+    # Every started tool Action has an entry, so a failure without one is a call Core settled
+    # without starting it (denied, skipped, rejected arguments, stopped program). Core settles
+    # calls only with failures: a success without an entry means its start entry is missing.
+    if isinstance(result, RustToolSuccessResult):
+        add_uncorrelated_tool_result()
+        tool_name, detail = _effect_detail(observation.call)
+    else:
+        # A plain tool entry even for agents.spawn: no subagent started, and the call keeps
+        # the arguments Core settled.
+        tool_name, detail = _tool_effect_detail(observation.call)
+    display = dict(cast(JsonObject, detail["display"]))
+    if isinstance(result, RustToolFailureResult):
+        # The header names the call without a verb: the call did not run, and the body
+        # shows the error.
+        display["settledVerb"] = ""
+        display["settledMessage"] = display["message"]
     return cast(
         JsonObject,
         {
@@ -1643,18 +1802,30 @@ def _completed_effect_entry(  # noqa: PLR0914 - one cohesive effect entry
             "relatedEntryId": None,
             "inputEntryId": input_entry_id,
             "title": tool_name,
-            "detail": {
-                "kind": "tool",
-                "toolName": tool_name,
-                "input": None,
-                "display": {
-                    "summary": tool_name,
-                    "statusText": f"Running {tool_name}",
-                    "settledMessage": message,
-                },
-            },
+            "detail": {**detail, "display": display},
             "state": effect_state,
         },
+    )
+
+
+def _effect_output(result: RustToolSuccessResult | RustToolFailureResult) -> JsonValue:
+    """The tool result an effect entry keeps, without the bytes of its images.
+
+    The Core history keeps the images the model reads. The entry is what
+    clients render, and a client draws no image from it, so a copy of the
+    bytes here would only double what the session stores.
+    """
+    content = [
+        part.model_copy(update={"data": ""})
+        if isinstance(part, RustImageContentBlock)
+        else part
+        for part in result.content
+    ]
+    return cast(
+        JsonValue,
+        result.model_copy(update={"content": content}).model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        ),
     )
 
 
@@ -1786,6 +1957,31 @@ def _is_open_effect(entry: JsonObject, turn_id: str) -> bool:
 
 type PublicDiscardCause = Literal["failure", "steer", "interrupt", "retry"]
 
+# The outcome of a user message whose Turn a pre_agent hook skipped: the Core keeps
+# no trace of it, so rewind and fork place it from the public history.
+SKIPPED_USER_MESSAGE_OUTCOME: JsonObject = {"type": "discarded", "cause": "skipped"}
+
+
+def _with_skipped_user_message(
+    entries: list[JsonObject], turn_id: str, observed_at: int
+) -> list[JsonObject]:
+    return [
+        cast(
+            JsonObject,
+            {
+                **entry,
+                "updatedAt": observed_at,
+                "outcome": dict(SKIPPED_USER_MESSAGE_OUTCOME),
+            },
+        )
+        if entry.get("type") == "message"
+        and entry.get("role") == "user"
+        and entry.get("turnId") == turn_id
+        and entry.get("source") == "turn_start"
+        else entry
+        for entry in entries
+    ]
+
 
 def _settled_provisional_entry(
     entry: JsonObject, observed_at: int, *, cause: PublicDiscardCause
@@ -1845,13 +2041,13 @@ def _settled_open_effect_entry(
     return cast(JsonObject, updated)
 
 
-def _effect_detail(action: RustToolCallAction) -> tuple[str, JsonObject]:
-    if isinstance(action, RustRuntimeBuiltinToolCallAction):
-        tool_name = action.call.name
+def _effect_detail(
+    call: RustRuntimeBuiltinToolCall | RustProvidedToolCall,
+) -> tuple[str, JsonObject]:
+    if isinstance(call, RustRuntimeBuiltinToolCall):
+        tool_name = call.name
         if tool_name == "agents.spawn":
-            arguments = (
-                action.call.arguments if isinstance(action.call.arguments, dict) else {}
-            )
+            arguments = call.arguments if isinstance(call.arguments, dict) else {}
             agent_name = (
                 _str_argument(cast(JsonObject, arguments), "name") or "subagent"
             )
@@ -1877,16 +2073,23 @@ def _effect_detail(action: RustToolCallAction) -> tuple[str, JsonObject]:
                     },
                 },
             )
-    elif isinstance(action, RustProvidedToolCallAction):
-        tool_name = f"{action.call.group_name}.{action.call.tool_name}"
+    return _tool_effect_detail(call)
+
+
+def _tool_effect_detail(
+    call: RustRuntimeBuiltinToolCall | RustProvidedToolCall,
+) -> tuple[str, JsonObject]:
+    """A plain tool effect: the call's own name and arguments, with the generic display."""
+    if isinstance(call, RustRuntimeBuiltinToolCall):
+        tool_name = call.name
     else:
-        raise TypeError(f"Unsupported tool action: {type(action).__name__}")
+        tool_name = f"{call.group_name}.{call.tool_name}"
     return (
         tool_name,
         {
             "kind": "tool",
             "toolName": tool_name,
-            "input": action.call.arguments,
+            "input": call.arguments,
             "display": _generic_display(tool_name, tool_name),
         },
     )
@@ -1930,6 +2133,35 @@ def _completed_effect_detail(
     return cast(JsonObject, completed)
 
 
+def effect_entry_id(entries: Sequence[JsonObject], action_id: str, turn_id: str) -> str:
+    """The public history ID of the effect entry for a tool Action.
+
+    Core names a tool Action after the model's call ID, which a provider can
+    reuse, in a later reply of the same turn or in a later turn. The entry is
+    ``effect-{action_id}`` while that ID is free or names the Action's own entry
+    still in progress; once an earlier run has settled under it, a new run
+    takes the first free ``effect-{action_id}-{n}``, so neither overwrites the
+    other. Only an entry still in progress can be this Action's own, so
+    starting, approving and completing it all resolve to the same ID.
+    """
+    entry_id = f"effect-{action_id}"
+    owners: dict[str, JsonObject] = {}
+    for entry in entries:
+        found = entry.get("id")
+        if isinstance(found, str) and found.startswith(entry_id):
+            owners.setdefault(found, entry)
+    occurrence = 0
+    while True:
+        candidate = entry_id if occurrence == 0 else f"{entry_id}-{occurrence}"
+        owner = owners.get(candidate)
+        if owner is None or (
+            owner.get("generationStatus") == "in_progress"
+            and owner.get("turnId") == turn_id
+        ):
+            return candidate
+        occurrence += 1
+
+
 def _find_entry(entries: Sequence[JsonObject], entry_id: str) -> JsonObject | None:
     for entry in entries:
         if entry.get("id") == entry_id:
@@ -1967,29 +2199,34 @@ def _settled_message(entry: JsonObject | None) -> str | None:
     return message if isinstance(message, str) else None
 
 
-def _effect_result_message(effect_state: JsonObject) -> str:
-    display = effect_state.get("display")
-    if not isinstance(display, dict):
-        return "tool completed"
-    message = display.get("message")
-    return message if isinstance(message, str) else "tool completed"
-
-
 def _completed_stop_reason(
-    observation: RustTurnCompletedObservation, *, truncated: bool
+    observation: RustTurnCompletedObservation,
 ) -> Literal["limit", "length"] | None:
     if observation.stop_reason == "iteration_limit":
         return "limit"
-    if truncated:
+    if observation.stop_reason == "output_limit":
         return "length"
     return None
 
 
 def _skip_reason(observation: RustTurnCompletedObservation) -> str | None:
-    # A skipped Turn commits no assistant entry, so its output, the hook's
-    # reason, is the only record of why it produced no answer.
+    # A skipped Turn has no answer: its output, the hook's reason, is the only
+    # record of why. Assistant entries from model calls before a skipped
+    # ``pre_llm_call`` are not the answer.
     if observation.stop_reason != "skipped":
         return None
+    return _output_text(observation)
+
+
+def _reject_reason(observation: RustTurnCompletedObservation) -> str | None:
+    # A rejected Turn has no answer either: the hook discarded it, and assistant
+    # entries from earlier model calls are not the answer.
+    if observation.stop_reason != "rejected":
+        return None
+    return _output_text(observation)
+
+
+def _output_text(observation: RustTurnCompletedObservation) -> str:
     return "".join(
         part.text
         for part in observation.output
@@ -2009,4 +2246,4 @@ def _turn_queue_item_id(latest_turn: object, turn_id: str) -> str | None:
     return None
 
 
-__all__ = ["ProjectionUpdate", "SessionProjector"]
+__all__ = ["ProjectionUpdate", "SessionProjector", "effect_entry_id"]

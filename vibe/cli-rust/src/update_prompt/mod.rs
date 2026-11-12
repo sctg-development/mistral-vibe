@@ -2,24 +2,24 @@
 //! main terminal owns the screen.
 
 mod ansi;
+mod manual;
 mod view;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 
-use crate::event_loop::{emit_idle_marker, HOLD_KEY, RELEASE_KEY};
 use crate::terminal_read;
 use crate::ui::banner::petit_chat::PetitChat;
 use crate::ui::theme;
 use crate::update_notifier::gateway::UpdateSource;
 use crate::update_notifier::update;
-use crate::utils::is_replaying;
 
 pub use ansi::color_span;
+pub use manual::{manual_update_command, manual_update_lines};
 pub use view::draw;
 pub use view::option_span;
 
@@ -45,6 +45,8 @@ pub enum UpdatePromptResult {
     Continue,
     Updated(Vec<update::UpdateCommandOutcome>),
     UpdateFailed(Vec<update::UpdateCommandOutcome>),
+    /// The user must close Vibe and run the upgrade from a shell.
+    ManualUpdate,
     Quit,
 }
 
@@ -86,6 +88,8 @@ pub struct UpdatePromptState {
     pub source: UpdateSource,
     pub selected: UpdateChoice,
     pub updating: bool,
+    /// Windows cannot replace files a running Vibe holds, so the upgrade is left to the user.
+    pub manual_update: bool,
 }
 
 impl UpdatePromptState {
@@ -103,6 +107,7 @@ impl UpdatePromptState {
             // Start on "Update now".
             selected: UpdateChoice::Update,
             updating: false,
+            manual_update: cfg!(windows),
         }
     }
 
@@ -161,6 +166,7 @@ pub async fn show_update_prompt(
             None
         }
         UpdatePromptResult::Quit => Some(0),
+        UpdatePromptResult::ManualUpdate => manual::print_manual_update(state),
         UpdatePromptResult::Updated(outcomes) => {
             // The manager's own answer can differ from the advertised latest
             // (a lagging brew formula, a re-resolved uv constraint); its
@@ -246,6 +252,7 @@ pub fn apply_key(
         }
         KeyCode::Enter if !state.updating => match state.selected {
             UpdateChoice::Continue => Some(UpdatePromptResult::Continue),
+            UpdateChoice::Update if state.manual_update => Some(UpdatePromptResult::ManualUpdate),
             UpdateChoice::Update => {
                 state.updating = true;
                 None
@@ -261,46 +268,29 @@ async fn dialog_loop(
 ) -> UpdatePromptResult {
     let mut state = state.clone();
     let mut chat = PetitChat::default();
-    let replaying = is_replaying();
-    let mut marker_held = false;
     loop {
         view::draw(terminal, &state, &mut chat);
-        if replaying && !marker_held {
-            emit_idle_marker();
-        }
+        // The dialog runs no work, so its drawn frame is final; a closing key's fence is acked by the next surface.
+        crate::replay_fence::ack_if(|| true);
         let event = match terminal_read::read() {
             Ok(event) => event,
             // Fall back to Continue when the dialog cannot run.
-            Err(_) => return finish_step(replaying, UpdatePromptResult::Continue),
+            Err(_) => return UpdatePromptResult::Continue,
         };
+        if crate::replay_fence::observe(&event) {
+            continue;
+        }
         let Event::Key(key) = event else {
             continue;
         };
-        if replaying && key.kind == KeyEventKind::Press {
-            match key.code {
-                KeyCode::F(HOLD_KEY) => {
-                    marker_held = true;
-                    continue;
-                }
-                KeyCode::F(RELEASE_KEY) => {
-                    marker_held = false;
-                    continue;
-                }
-                _ => {}
-            }
-        }
         if let Some(result) = apply_key(&mut state, key) {
-            return finish_step(replaying, result);
+            return result;
         }
         if state.updating {
             // Swap the options for the spinner, then run the upgrade,
             // cancellable by the quit keys.
             view::draw(terminal, &state, &mut chat);
-            if replaying {
-                emit_idle_marker();
-            }
-            let result = run_update(terminal, &state, &mut chat).await;
-            return finish_step(replaying, result);
+            return run_update(terminal, &state, &mut chat).await;
         }
     }
 }
@@ -320,14 +310,18 @@ async fn run_update(
 ) -> UpdatePromptResult {
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);
+    // A reader that lives as long as the dialog never holds the client busy.
+    #[allow(clippy::disallowed_methods)]
     let mut quit_keys = tokio::task::spawn_blocking(move || quit_key_reader(&reader_stop));
     let (terminate_update, update_terminated) = tokio::sync::watch::channel(false);
     let update = update::do_update(&update_terminated);
     tokio::pin!(update);
-    let mut frame = tokio::time::interval(crate::ui::banner::petit_chat::FRAME_INTERVAL);
-    frame.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The cat runs on UI time; the machine frame draws and acks the fences the key reader counts.
+    let mut cat = crate::clock::interval(crate::ui::banner::petit_chat::FRAME_INTERVAL);
+    let mut frame = crate::clock::interval_real(crate::ui::banner::petit_chat::FRAME_INTERVAL);
     loop {
         tokio::select! {
+            biased;
             outcomes = &mut update => {
                 stop.store(true, Ordering::Relaxed);
                 // Join the reader before the result travels: a startup
@@ -347,9 +341,13 @@ async fn run_update(
                 let _ = terminate_update.send(true);
                 break;
             }
+            _ = cat.tick() => {
+                chat.tick(crate::clock::now());
+            }
             _ = frame.tick() => {
-                chat.tick(Instant::now());
                 view::draw(terminal, state, chat);
+                // Only the cat moves; the reader advances UI time before counting the next fence, so no stale cat is acked.
+                crate::replay_fence::ack_if(|| !cat.is_due());
             }
         }
     }
@@ -378,39 +376,14 @@ pub fn quit_key_reader(stop: &AtomicBool) -> bool {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press && is_quit_key(&key) => {
                     return true
                 }
-                Ok(_) => {}
+                // Other events are dropped, but a replay fence still counts.
+                Ok(event) => {
+                    crate::replay_fence::observe(&event);
+                }
                 Err(_) => return false,
             },
             Ok(false) => {}
             Err(_) => return false,
-        }
-    }
-}
-
-/// Close a replay step cleanly: swallow the trailing release of the batch that
-/// answered the prompt, so the main TUI never reads the dialog's leftover
-/// marker keys. No marker is emitted here on purpose: the step settles on the
-/// next surface's own first marker (the TUI's Ready redraw); an exit into a
-/// surface that owes none would hang the harness instead.
-fn finish_step(replaying: bool, result: UpdatePromptResult) -> UpdatePromptResult {
-    if replaying {
-        drain_replay_release();
-    }
-    result
-}
-
-/// Consume the pending F24, if it lands within the short window the harness's
-/// single-write batches make available.
-fn drain_replay_release() {
-    let deadline = Instant::now() + Duration::from_millis(50);
-    while Instant::now() < deadline {
-        if !crossterm::event::poll(Duration::from_millis(5)).unwrap_or(false) {
-            return;
-        }
-        match terminal_read::read() {
-            Ok(Event::Key(key)) if key.code == KeyCode::F(RELEASE_KEY) => return,
-            Ok(_) => continue,
-            Err(_) => return,
         }
     }
 }

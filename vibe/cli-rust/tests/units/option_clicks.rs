@@ -1,8 +1,6 @@
 //! Lists with per-option actions confirm on a click on the highlight; the others on one click.
 
-use std::sync::Arc;
-
-use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use serde_json::json;
 use vibe_rs::app::{App, ModelOption};
@@ -10,15 +8,12 @@ use vibe_rs::mouse::{self, MouseTarget};
 use vibe_rs::server::{PublicChildSession, SessionStatus};
 use vibe_rs::{config, config_edit, config_fields, log_level_picker, resume_picker, subagents};
 
+use crate::support::{mouse, send_mouse};
+
 const AREA: Rect = Rect::new(0, 0, 80, 20);
 
 fn event(kind: MouseEventKind, row: u16) -> MouseEvent {
-    MouseEvent {
-        kind,
-        column: 4,
-        row,
-        modifiers: KeyModifiers::NONE,
-    }
+    mouse(kind, 4, row)
 }
 
 /// Press then release on `row` through the central mouse router.
@@ -28,8 +23,6 @@ fn click(app: &mut App, row: u16) {
 
 /// Press then release on a cell through the central mouse router.
 fn click_at(app: &mut App, column: u16, row: u16) {
-    let client = Arc::new(vibe_rs::server::Client::stub());
-    let (config_tx, _rx) = tokio::sync::mpsc::channel(1);
     for kind in [
         MouseEventKind::Down(MouseButton::Left),
         MouseEventKind::Up(MouseButton::Left),
@@ -38,7 +31,7 @@ fn click_at(app: &mut App, column: u16, row: u16) {
             column,
             ..event(kind, row)
         };
-        mouse::handle(app, &client, &config_tx, event);
+        send_mouse(app, event);
     }
 }
 
@@ -194,7 +187,7 @@ fn a_log_level_row_highlights_and_its_badge_toggles_on_one_click() {
 async fn a_saved_session_resumes_on_the_second_click() {
     let mut app = app_on(MouseTarget::ResumePicker);
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    app.resume_picker.tx = Some(tx);
+    app.events = Some(tx);
     app.resume_picker.open = true;
     app.resume_picker.sessions = ["a", "b"]
         .map(|id| resume_picker::Session {
@@ -210,31 +203,4 @@ async fn a_saved_session_resumes_on_the_second_click() {
 
     click(&mut app, 1);
     assert!(app.resume_picker.resuming);
-}
-
-#[test]
-fn a_remote_project_click_on_the_highlight_while_searching_confirms_it() {
-    let mut app = app_on(MouseTarget::RemoteProject);
-    let state = &mut app.vibe_code_project;
-    state.view = Some(
-        serde_json::from_value(json!({
-            "context": {"repoUrl": "https://github.com/org/repo.git", "repoName": "repo"},
-            "state": {"nextCursor": null, "projects": []},
-            "git": {"defaultBranch": "main", "branch": "feature"}
-        }))
-        .unwrap(),
-    );
-    state.show_picker();
-    state.query.text = "missing".into();
-    state.refresh(None);
-    let lines: Vec<_> = (0..state.items.len())
-        .map(|index| state.items[index].selectable().then_some(index))
-        .collect();
-    state.list.layout(&lines, AREA);
-    let row = state.list.selected() as u16;
-    state.search_focused = true;
-
-    click(&mut app, row);
-    assert!(!app.vibe_code_project.search_focused);
-    assert!(app.vibe_code_project.create.is_some());
 }

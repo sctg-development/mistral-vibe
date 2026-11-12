@@ -60,35 +60,30 @@ pub fn shape(app: &App) -> Shape {
         return Shape::Default;
     };
     if target == crate::mouse::MouseTarget::Composer {
-        return if selection::in_input(app, at) {
+        return if crate::ui::composer_title::model_at(app, at) {
+            Shape::Pointer
+        } else if selection::in_input(app, at) {
             Shape::Text
         } else {
             Shape::Default
         };
     }
-    if target == crate::mouse::MouseTarget::Toast {
-        return Shape::Text;
+    if matches!(
+        target,
+        crate::mouse::MouseTarget::JumpToBottom | crate::mouse::MouseTarget::StickyPrompt
+    ) {
+        return Shape::Pointer;
+    }
+    if target == crate::mouse::MouseTarget::BottomBar {
+        return if crate::ui::bottom_bar::clickable_at(app, at) {
+            Shape::Pointer
+        } else {
+            Shape::Default
+        };
     }
     if target == crate::mouse::MouseTarget::Trust {
         let at = crate::trust_folders::selection_position(app, at);
         return if app.view.selection_region.contains(at) {
-            Shape::Text
-        } else {
-            Shape::Default
-        };
-    }
-    if target == crate::mouse::MouseTarget::RemoteProject {
-        if crate::mouse::scrollbar_at(app, at) {
-            return Shape::Default;
-        }
-        let project = &app.vibe_code_project;
-        let position = at.into();
-        if project.search_area.contains(position) || project.branch_area.contains(position) {
-            return Shape::Text;
-        }
-        return if project.list.index_at(at).is_some() {
-            Shape::Pointer
-        } else if app.view.bottom_app_selection_region.contains(at) {
             Shape::Text
         } else {
             Shape::Default

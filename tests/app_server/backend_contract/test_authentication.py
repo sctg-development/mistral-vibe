@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from pathlib import Path
+import tomllib
 
 import httpx
 import pytest
 import pytest_asyncio
 import respx
+import tomli_w
 
 from tests.app_server.backend_contract.conftest import (
     BackendContractConnection,
@@ -20,6 +22,7 @@ from tests.stubs.fake_account_gateway import FakeAccountGateway
 from tests.stubs.fake_identity_gateway import FakeIdentityGateway
 from vibe.app_server._account import AccountGateway, WhoAmIResult
 from vibe.app_server._identity import IdentityGateway
+from vibe.app_server._process_services import ProcessServices
 from vibe.app_server.client import AppServerClient
 from vibe.app_server.models import (
     AccountActionKind,
@@ -38,37 +41,12 @@ from vibe.app_server.protocol import (
 )
 from vibe.app_server.session import AppServerSession, AppServerTurnError
 from vibe.core.identity import IdentityResult
-from vibe.core.llm.exceptions import BackendError, PayloadSummary
 from vibe.utils.api_keys import ApiKeyOrigin, ApiKeySource
 
 
-# The sentence the legacy backend produces for a rejected credential. Derived
-# from ``BackendError`` rather than typed out, so a reworded message fails here
-# instead of leaving the two backends saying different things. The Harness
-# holds its own copy of the string, pinned to the origin-less form by
-# ``tests/app_server/test_provider_credentials.py``.
 def _invalid_api_key_message(api_key_origin: ApiKeyOrigin | None = None) -> str:
-    return str(
-        BackendError(
-            provider="mistral",
-            endpoint="/chat/completions",
-            status=401,
-            reason="Unauthorized",
-            headers={},
-            body_text="",
-            parsed_error=None,
-            model="mistral-vibe-cli-latest",
-            payload_summary=PayloadSummary(
-                model="mistral-vibe-cli-latest",
-                message_count=1,
-                approx_chars=0,
-                temperature=0.0,
-                has_tools=False,
-                tool_choice=None,
-            ),
-            api_key_origin=api_key_origin,
-        )
-    )
+    origin = f" (from {api_key_origin.describe()})" if api_key_origin else ""
+    return f"Invalid API key{origin}. Please check your API key and try again."
 
 
 def _whoami(plan_name: str) -> WhoAmIResult:
@@ -94,12 +72,14 @@ async def _connected(
     *,
     account_gateway: AccountGateway | None = None,
     identity_gateway: IdentityGateway | None = None,
+    process_services: ProcessServices,
 ) -> AsyncIterator[BackendContractConnection]:
     connection = await connect_backend_contract_host(
         session_options=SessionOptions(),
         capabilities=ClientCapabilities(),
         account_gateway=account_gateway,
         identity_gateway=identity_gateway,
+        process_services=process_services,
     )
     try:
         yield connection
@@ -109,12 +89,14 @@ async def _connected(
 
 @pytest_asyncio.fixture
 async def unauthenticated_client(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, process_services: ProcessServices
 ) -> AsyncIterator[AppServerClient]:
     """A connected client for a user with no resolvable Mistral key."""
     monkeypatch.delenv("VIBE_API_KEY")
     client = await connect_backend_contract_client(
-        session_options=SessionOptions(), capabilities=ClientCapabilities()
+        session_options=SessionOptions(),
+        capabilities=ClientCapabilities(),
+        process_services=process_services,
     )
     try:
         yield client
@@ -190,6 +172,7 @@ async def test_account_read_walks_the_status_ladder(
     backend_contract_mistral_api: respx.Route,
     build_gateway: Callable[[], FakeAccountGateway],
     expected: AccountStatus,
+    process_services: ProcessServices,
 ) -> None:
     """*Prepare*: A session over a fake account gateway in a given state.
     *Do*: Read the account.
@@ -197,7 +180,9 @@ async def test_account_read_walks_the_status_ladder(
     """
     # Prepare
     gateway = build_gateway()
-    async with _connected(account_gateway=gateway) as connection:
+    async with _connected(
+        account_gateway=gateway, process_services=process_services
+    ) as connection:
         session = await connection.host.open_session()
         try:
             # Do
@@ -212,18 +197,22 @@ async def test_account_read_walks_the_status_ladder(
 
 @pytest.mark.asyncio
 async def test_account_read_reports_a_missing_key_after_the_key_disappears(
-    backend_contract_mistral_api: respx.Route, monkeypatch: pytest.MonkeyPatch
+    backend_contract_mistral_api: respx.Route,
+    monkeypatch: pytest.MonkeyPatch,
+    process_services: ProcessServices,
 ) -> None:
     """*Prepare*: An open session whose key is then removed.
     *Do*: Read the account.
-    *Assert*: ``MISSING_KEY``, with the upgrade action still offered.
+    *Assert*: ``MISSING_KEY``.
 
     The credential is resolved per read rather than frozen at session open, so
     revoking it downgrades the banner without reopening the session.
     """
     # Prepare
     gateway = FakeAccountGateway(_whoami("TEAM"))
-    async with _connected(account_gateway=gateway) as connection:
+    async with _connected(
+        account_gateway=gateway, process_services=process_services
+    ) as connection:
         session = await connection.host.open_session()
         try:
             monkeypatch.delenv("VIBE_API_KEY")
@@ -235,33 +224,28 @@ async def test_account_read_reports_a_missing_key_after_the_key_disappears(
 
     # Assert
     assert account.status is AccountStatus.MISSING_KEY
-    assert account.teleport_action is not None
     assert not gateway.calls, "a missing key must not be sent to the gateway"
 
 
 @pytest.mark.parametrize(
-    ("plan_name", "title", "teleport_eligible"),
-    [("TEAM", "[Subscription] Pro", True), ("FREE", "Free", True)],
+    ("plan_name", "title"), [("TEAM", "Team"), ("INDIVIDUAL", "Pro"), ("FREE", "Free")]
 )
 @pytest.mark.asyncio
-async def test_account_read_projects_the_plan_and_teleport_eligibility(
+async def test_account_read_projects_the_plan(
     backend_contract_mistral_api: respx.Route,
     plan_name: str,
     title: str,
-    teleport_eligible: bool,
+    process_services: ProcessServices,
 ) -> None:
     """*Prepare*: A session over an account gateway reporting a chat plan.
     *Do*: Read the account.
-    *Assert*: The plan view, the upgrade offer, and teleport eligibility.
-
-    ``teleport_eligible`` and ``teleport_action`` are the two fields
-    ``VibeCodeController._require_teleport_available`` reads before it starts a
-    teleport, so a paying customer on the Unified backend has to see the same
-    pair the legacy one produces.
+    *Assert*: The plan view.
     """
     # Prepare
     gateway = FakeAccountGateway(_whoami(plan_name))
-    async with _connected(account_gateway=gateway) as connection:
+    async with _connected(
+        account_gateway=gateway, process_services=process_services
+    ) as connection:
         session = await connection.host.open_session()
         try:
             # Do
@@ -275,12 +259,6 @@ async def test_account_read_projects_the_plan_and_teleport_eligibility(
     assert account.plan.kind is AccountPlanKind.CHAT
     assert account.plan.name == plan_name
     assert account.plan.title == title
-    assert account.teleport_eligible is teleport_eligible
-    # An eligible plan offers no way out of a state it is not in.
-    assert (account.teleport_action is None) is teleport_eligible
-    if not teleport_eligible:
-        assert account.plan_offer is not None
-        assert account.plan_offer.kind is AccountActionKind.UPGRADE_TO_PRO
 
 
 _PLANS_PAGE = (
@@ -289,13 +267,23 @@ _PLANS_PAGE = (
 )
 
 
+def _set_mistral_api_base(config_dir: Path, api_base: str) -> None:
+    config_file = config_dir / "config.toml"
+    config = tomllib.loads(config_file.read_text(encoding="utf-8"))
+    for provider in config["providers"]:
+        if provider["name"] == "mistral":
+            provider["api_base"] = api_base
+    config_file.write_text(tomli_w.dumps(config), encoding="utf-8")
+
+
 @pytest.mark.parametrize(
-    ("build_gateway", "vibe_base_url", "plan_offer_url", "key_page"),
+    ("build_gateway", "vibe_base_url", "api_base", "plan_offer_url", "key_page"),
     [
         pytest.param(
             lambda: FakeAccountGateway(
                 WhoAmIResult(plan_type=AccountPlanKind.API, plan_name="FREE")
             ),
+            None,
             None,
             _PLANS_PAGE,
             "https://chat.mistral.ai/code/extensions?focus=key",
@@ -303,6 +291,7 @@ _PLANS_PAGE = (
         ),
         pytest.param(
             lambda: FakeAccountGateway(unauthorized=True),
+            None,
             None,
             _PLANS_PAGE,
             "https://chat.mistral.ai/code/extensions?focus=key",
@@ -313,9 +302,20 @@ _PLANS_PAGE = (
                 WhoAmIResult(plan_type=AccountPlanKind.API, plan_name="FREE")
             ),
             "https://vibe.tenant.example/",
+            None,
             "https://vibe.tenant.example/code/extensions?focus=key",
             "https://vibe.tenant.example/code/extensions?focus=key",
             id="tenant",
+        ),
+        pytest.param(
+            lambda: FakeAccountGateway(
+                WhoAmIResult(plan_type=AccountPlanKind.API, plan_name="FREE")
+            ),
+            None,
+            "https://api.tenant.example/v1",
+            "https://chat.tenant.example/code/extensions?focus=key",
+            "https://chat.tenant.example/code/extensions?focus=key",
+            id="tenant-from-api-base",
         ),
     ],
 )
@@ -325,11 +325,14 @@ async def test_the_upgrade_offer_opens_the_plans_page_on_mistral_vibe_only(
     monkeypatch: pytest.MonkeyPatch,
     build_gateway: Callable[[], FakeAccountGateway],
     vibe_base_url: str | None,
+    api_base: str | None,
     plan_offer_url: str,
     key_page: str,
+    process_services: ProcessServices,
+    config_dir: Path,
 ) -> None:
     """*Prepare*: A session whose account offers an upgrade, on Mistral's Vibe
-    or on a tenant's.
+    or on a tenant's, named directly or through the tenant's API host.
     *Do*: Read the account.
     *Assert*: The plan offer opens the plans page on Mistral's Vibe only; the
     rate-limit action keeps the key page.
@@ -337,7 +340,11 @@ async def test_the_upgrade_offer_opens_the_plans_page_on_mistral_vibe_only(
     # Prepare
     if vibe_base_url is not None:
         monkeypatch.setenv("VIBE_VIBE_BASE_URL", vibe_base_url)
-    async with _connected(account_gateway=build_gateway()) as connection:
+    if api_base is not None:
+        _set_mistral_api_base(config_dir, api_base)
+    async with _connected(
+        account_gateway=build_gateway(), process_services=process_services
+    ) as connection:
         session = await connection.host.open_session()
         try:
             # Do
@@ -353,56 +360,9 @@ async def test_the_upgrade_offer_opens_the_plans_page_on_mistral_vibe_only(
     assert account.rate_limit_action.url == key_page
 
 
-@pytest.mark.parametrize("plan_name", ["F", "E"])
-@pytest.mark.parametrize("prompt_switching_to_pro_plan", [False, True])
-@pytest.mark.asyncio
-async def test_codestral_teleport_is_rejected_with_switch_key_guidance(
-    backend_contract_mistral_api: respx.Route,
-    plan_name: str,
-    prompt_switching_to_pro_plan: bool,
-    telemetry_events: list[dict[str, Any]],
-) -> None:
-    gateway = FakeAccountGateway(
-        WhoAmIResult(
-            plan_type=AccountPlanKind.MISTRAL_CODE,
-            plan_name=plan_name,
-            prompt_switching_to_pro_plan=prompt_switching_to_pro_plan,
-        )
-    )
-    async with _connected(account_gateway=gateway) as connection:
-        session = await connection.host.open_session()
-        try:
-            account = await session.resources.account.read()
-            assert not account.teleport_eligible
-            assert account.teleport_action is not None
-            assert account.teleport_action.kind is AccountActionKind.SWITCH_API_KEY
-
-            with pytest.raises(AppServerResponseError) as exc_info:
-                await session.resources.vibe_code.open_projects(
-                    for_teleport=True, prompt="Continue this task"
-                )
-        finally:
-            await session.close()
-
-    assert exc_info.value.error.code is ProtocolErrorCode.FORBIDDEN
-    assert str(exc_info.value) == (
-        "Teleport does not support Codestral API keys. "
-        "Switch to a Vibe or workspace API key: "
-        f"{account.teleport_action.url}"
-    )
-    failures = [
-        event
-        for event in telemetry_events
-        if event.get("event_name") == "vibe.teleport_failed"
-    ]
-    assert len(failures) == 1
-    assert failures[0]["properties"]["stage"] == "ineligible"
-    assert failures[0]["properties"]["error_class"] == "TeleportIneligibleError"
-
-
 @pytest.mark.asyncio
 async def test_identity_read_projects_a_fetched_identity(
-    backend_contract_mistral_api: respx.Route,
+    backend_contract_mistral_api: respx.Route, process_services: ProcessServices
 ) -> None:
     """*Prepare*: A session over an identity gateway holding a signed-in user.
     *Do*: Read the identity.
@@ -410,7 +370,9 @@ async def test_identity_read_projects_a_fetched_identity(
     """
     # Prepare
     gateway = FakeIdentityGateway(_identity())
-    async with _connected(identity_gateway=gateway) as connection:
+    async with _connected(
+        identity_gateway=gateway, process_services=process_services
+    ) as connection:
         session = await connection.host.open_session()
         try:
             # Do
@@ -431,27 +393,32 @@ async def test_identity_read_projects_a_fetched_identity(
 
 
 @pytest.mark.asyncio
-async def test_identity_read_is_silent_when_the_key_is_rejected(
-    backend_contract_mistral_api: respx.Route,
+async def test_identity_read_retries_a_key_rejected_by_an_earlier_read(
+    backend_contract_mistral_api: respx.Route, process_services: ProcessServices
 ) -> None:
     """*Prepare*: A session over an identity gateway that rejects the key.
-    *Do*: Read the identity.
-    *Assert*: Nothing — ``/whoami`` reports no identity rather than failing.
+    *Do*: Read the identity twice.
+    *Assert*: Both reads fail open, and the later explicit read retries the key.
     """
     # Prepare
-    gateway = FakeIdentityGateway(unauthorized=True)
-    async with _connected(identity_gateway=gateway) as connection:
+    gateway = FakeIdentityGateway(unauthorized=True, reject_credentials=True)
+    async with _connected(
+        identity_gateway=gateway, process_services=process_services
+    ) as connection:
         session = await connection.host.open_session()
         try:
             # Do
             identity = await session.resources.identity.read()
+            repeated = await session.resources.identity.read()
         finally:
             await session.close()
 
     # Assert
-    assert identity is None
+    assert identity is repeated is None
+    assert gateway.calls == ["https://api.mistral.ai/v1"] * 2
 
 
+@pytest.mark.both_paths
 @pytest.mark.asyncio
 async def test_a_provider_401_mid_turn_yields_the_legacy_message(
     backend_contract_mistral_api: respx.Route,

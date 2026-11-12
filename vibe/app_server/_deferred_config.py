@@ -19,7 +19,10 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 import contextlib
 
-from mistralai_vibe_local_harness.vibe import HarnessTurnConflictError
+from mistralai_vibe_local_harness.vibe import (
+    HarnessConfigurationRejectedError,
+    HarnessTurnConflictError,
+)
 
 
 class DeferredConfiguration[DerivationT]:
@@ -92,6 +95,12 @@ class DeferredConfiguration[DerivationT]:
         except HarnessTurnConflictError:
             self._parked = True
             return False
+        except HarnessConfigurationRejectedError:
+            # Dropped, not parked: Core refuses the same configuration until
+            # the context changes, so a parked one fails every boundary after
+            # this and no queued turn ever starts. Core keeps what it runs, and
+            # the caller hears why.
+            raise
         except BaseException:
             # Parked until it is actually running. One caller is the event pump,
             # whose task is cancelled when the session's stream ends, and a
@@ -101,6 +110,44 @@ class DeferredConfiguration[DerivationT]:
             raise
         self._adopt(derivation)
         return True
+
+    async def commit(
+        self,
+        build: Callable[[], Awaitable[DerivationT]],
+        *,
+        install: Callable[[], Awaitable[bool]],
+        push: Callable[[DerivationT], Awaitable[None]] | None = None,
+        check_turn: bool = True,
+    ) -> bool:
+        """Build a derivation from a config not installed yet, push it, and only
+        then ``install`` that config; all under the lock applies take.
+        ``install`` answers whether it installed.
+
+        Answers whether the session runs it: a turn that owns the settings
+        displaces it before anything is pushed or installed. What ``build`` or
+        Core refuses raises, with nothing installed. Once it lands it carries
+        everything parked, since it was built over the same config.
+        """
+        async with self._applying:
+            if check_turn and self._turn_running():
+                return False
+            derivation = await build()
+            # Building awaits: a turn can start meanwhile.
+            if check_turn and self._turn_running():
+                return False
+            try:
+                await (push or self._push)(derivation)
+            except HarnessTurnConflictError:
+                return False
+            # Core runs it either way; a config not installed stays parked so
+            # the next boundary pushes what the session's config holds.
+            try:
+                self._parked = not await install()
+            except BaseException:
+                self._parked = True
+                raise
+            self._adopt(derivation)
+            return True
 
     async def apply_when_idle(self) -> bool:
         """Push between turns; park during one."""

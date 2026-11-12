@@ -8,25 +8,15 @@ from pathlib import Path
 import sys
 from typing import TYPE_CHECKING
 
-from vibe._experimental_harness import ExperimentalHarnessUnavailableError
-from vibe.app_server._runtime import HarnessProcess, create_harness_server
-from vibe.app_server.multiplex import ChannelOpen, ChannelServer, serve_multiplexed
-from vibe.app_server.transport import (
-    BinaryLineReader,
-    BinaryLineWriter,
-    JsonRpcTransport,
-    StdioJsonRpcTransport,
-)
-from vibe.core.config.harness_files import (
-    HarnessFilesManager,
-    init_harness_files_manager,
-)
-from vibe.core.paths import LOG_FILE, bootstrap_vibe_home
-from vibe.core.trusted_folders import trusted_folders_manager
-from vibe.observability.logging import init_file_logging
-
 if TYPE_CHECKING:
     from vibe.app_server._agent_socket import AgentSocketMount
+    from vibe.app_server._process_services import ProcessServices
+    from vibe.app_server.multiplex import ChannelOpen, ChannelServer
+    from vibe.app_server.transport import (
+        BinaryLineReader,
+        BinaryLineWriter,
+        JsonRpcTransport,
+    )
 
 
 async def serve_stdio(
@@ -41,6 +31,8 @@ async def serve_stdio(
     """``end_on_sigterm``: SIGTERM ends the input as its end does; the process
     exits once serving has wound down. For the process's own server only.
     """
+    from vibe.app_server.transport import StdioJsonRpcTransport
+
     transport: JsonRpcTransport = (
         StdioJsonRpcTransport.from_standard_streams()
         if reader is None or writer is None
@@ -66,6 +58,38 @@ async def _serve(
     additional_builtin_plugin_roots: Sequence[Path],
     agent_socket: AgentSocketMount | None,
 ) -> None:
+    from vibe.app_server._process_services import ProcessServices
+    from vibe.app_server._worktree_housekeeping import has_managed_worktrees
+
+    services = ProcessServices.create()
+    try:
+        # Finish reaps left by earlier processes, in the background.
+        if await asyncio.to_thread(has_managed_worktrees):
+            services.worktrees.sweep()
+        await _serve_with(
+            transport,
+            services,
+            multiplex=multiplex,
+            additional_builtin_plugin_roots=additional_builtin_plugin_roots,
+            agent_socket=agent_socket,
+        )
+    finally:
+        await services.close()
+
+
+async def _serve_with(
+    transport: JsonRpcTransport,
+    services: ProcessServices,
+    *,
+    multiplex: bool,
+    additional_builtin_plugin_roots: Sequence[Path],
+    agent_socket: AgentSocketMount | None,
+) -> None:
+    from vibe.app_server._runtime import HarnessProcess, create_harness_server
+    from vibe.app_server.multiplex import serve_multiplexed
+    from vibe.core.config.harness_files import HarnessFilesManager
+    from vibe.core.trusted_folders import trusted_folders_manager
+
     if multiplex:
 
         async def create_channel(
@@ -77,34 +101,40 @@ async def _serve(
                 return RunChannelServer(
                     channel,
                     options,
+                    services=services,
                     additional_builtin_plugin_roots=additional_builtin_plugin_roots,
                 )
             harness_files = HarnessFilesManager(
                 sources=("user", "project"),
                 trust_store=trusted_folders_manager.for_session(),
             )
+            process = HarnessProcess(
+                harness_files,
+                services=services,
+                additional_builtin_plugin_roots=additional_builtin_plugin_roots,
+            )
+            process.start_connector_warm_up()
             return await create_harness_server(
-                channel,
-                transport_kind="stdio",
-                process=HarnessProcess(
-                    harness_files,
-                    additional_builtin_plugin_roots=additional_builtin_plugin_roots,
-                ),
+                channel, transport_kind="stdio", process=process
             )
 
         await serve_multiplexed(transport, create_channel)
         return
     if agent_socket is None:
-        harness = await create_harness_server(
-            transport,
-            transport_kind="stdio",
+        process = HarnessProcess(
+            services=services,
             additional_builtin_plugin_roots=additional_builtin_plugin_roots,
+        )
+        process.start_connector_warm_up()
+        harness = await create_harness_server(
+            transport, transport_kind="stdio", process=process
         )
     else:
         harness = await create_harness_server(
             transport,
             transport_kind="stdio",
             process=HarnessProcess(
+                services=services,
                 additional_builtin_plugin_roots=additional_builtin_plugin_roots,
                 agent_socket=agent_socket,
             ),
@@ -112,7 +142,7 @@ async def _serve(
     await harness.serve()
 
 
-def parse_arguments() -> argparse.Namespace:
+def parse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Mistral Vibe app server")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -137,7 +167,7 @@ def parse_arguments() -> argparse.Namespace:
             "ones shipped inside the package. May be given more than once."
         ),
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 _PROCESS_TITLE = "vibe-app-server"
@@ -154,8 +184,20 @@ def _set_process_title() -> None:
         pass
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_arguments(argv)
+    from vibe.core.paths import bootstrap_vibe_home
+
+    # Run the private-home gate before loading the normal runtime dependencies.
+    bootstrap_vibe_home()
+    from vibe._experimental_harness import ExperimentalHarnessUnavailableError
+    from vibe.core.config.harness_files import init_harness_files_manager
+    from vibe.core.paths import LOG_FILE
+    from vibe.observability.logging import init_file_logging
+    from vibe.observability.sentry import claim_cli_crash_report_dsn
+
     _set_process_title()
+    claim_cli_crash_report_dsn()
     from vibe.core.config import load_dotenv_values
     from vibe.core.utils.windows_asyncio import (
         silence_proactor_transport_teardown_warnings,
@@ -165,8 +207,6 @@ def main() -> None:
     # The gate must run before the harness files manager and file logging:
     # their mkdir(parents=True) calls are otherwise the first to materialize
     # ~/.vibe, at permissive modes.
-    bootstrap_vibe_home()
-    args = parse_arguments()
     init_file_logging(LOG_FILE.path)
     load_dotenv_values()
     agent_socket = (
@@ -178,10 +218,6 @@ def main() -> None:
         # The project lives in the sandbox: its files on this host's disk at
         # the same path are not the project's.
         init_harness_files_manager("user")
-    # Finish reaps left by earlier processes, in the background.
-    from vibe.app_server import _worktree_cleanup
-
-    _worktree_cleanup.worktree_cleanup().sweep()
     # The Unified Harness is the required default runtime: a missing,
     # incompatible, or failed Runtime must abort startup with an actionable
     # error instead of serving on the legacy fallback. Stdout stays clean for

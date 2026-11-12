@@ -10,10 +10,9 @@ use super::simple::{
     DATA_RETENTION_MESSAGE,
 };
 use super::stress;
-use super::submission::{clear_and_remember, new_message_id, NOTICE_TIMEOUT_SECS};
-use crate::app::App;
+use super::submission::clear_and_remember;
+use crate::app::{App, Severity};
 use crate::server::Client;
-use crate::transcript::local;
 use crate::{
     config, log_level_picker, mcp, model_picker, paste_image, resume_picker, rewind, theme_picker,
     ui,
@@ -28,34 +27,28 @@ pub(super) fn run_command(
 ) -> bool {
     clear_and_remember(app, value);
     crate::telemetry::slash_command_used(app, command, "builtin");
-    if !matches!(command, "/resume" | "/continue") {
-        let echo_id = new_message_id();
-        local::add_message(&mut app.view.transcript, &echo_id, "command", value);
-        if command == "/retry" {
-            super::retry::begin(app, echo_id);
-        }
-    }
     match command {
         "/exit" => return true,
         "/config" => config::open(app, client, config_tx),
+        "/release-notes" | "/whatsnew" => crate::release_notes::open(app),
         "/voice" => crate::voice_app::open(app),
         "/proxy-setup" => crate::proxy_setup::open(app, client),
         "/theme" => theme_picker::open(app),
         "/model" => model_picker::open(app),
         "/thinking" => crate::thinking_picker::open(app),
-        "/remote-project" => crate::vibe_code_project::open(app, client),
-        "/teleport" => crate::teleport::command(app, client),
         "/log-level" => log_level_picker::open(app),
         "/debug" => crate::debug_console::toggle(app, client),
         "/resume" | "/continue" => resume_picker::open(app, client),
-        "/rewind" => rewind::start(app, client),
-        "/branch" => super::branch::branch_session(app, client),
+        "/rewind" => rewind::command(app, client),
+        "/branch" | "/fork" => super::branch::branch_session(app, client),
         "/mcp" | "/connectors" => mcp::show(app, client, value),
         "/plugins" => crate::plugins::show(app, client),
+        "/context" => crate::context_app::open(app, client),
         "/reload-plugins" => crate::plugins::reload(app, client),
+        "/skills" => crate::skills_browser::show(app, client),
         "/leanstall" => super::leanstall::install_lean(app, client),
         "/unleanstall" => super::leanstall::uninstall_lean(app, client),
-        "/help" => add_text(app, &help_text()),
+        "/help" => add_text(app, &help_text(app)),
         "/clear" | "/new" | "/clean" => clear_history(app, client, value),
         "/compact" => super::compact::start_compact(app, client, value),
         "/copy" => copy_last_agent_message(app),
@@ -63,6 +56,12 @@ pub(super) fn run_command(
         "/status" => super::provider_auth::status(app, client),
         "/log" => read_log(app, client),
         "/rename" => rename_session(app, client, value),
+        "/pr" if app.artifacts_modal.enabled => crate::artifacts_modal::show(app, client),
+        "/pr" => ui::notice::show_sticky(
+            app,
+            Severity::Warning,
+            "Turn on enable_pr_monitoring to use /pr",
+        ),
         "/reload" => reload_config(app, client),
         "/retry" => {
             let args = command_args(value);
@@ -74,10 +73,10 @@ pub(super) fn run_command(
             let args = command_args(value);
             stress::toggle(app, client, args);
         }
-        _ => ui::notice::show(
+        _ => ui::notice::show_sticky(
             app,
+            Severity::Warning,
             &format!("Command {command} is not implemented"),
-            NOTICE_TIMEOUT_SECS,
         ),
     }
     false

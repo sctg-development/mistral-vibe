@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from vibe.app_server._config_paths import ACTIVE_MODEL_PATH, model_thinking_path
 from vibe.app_server._config_write import config_write_ops_to_patches
 from vibe.app_server.protocol import ConfigWriteOpWire
+from vibe.core.config.layer import RawConfig
 from vibe.core.config.layers.admin import AdminConfigLayer
 from vibe.core.config.layers.agent_profile import AgentProfileLayer
 from vibe.core.config.layers.overrides import OverridesLayer
@@ -63,6 +64,7 @@ async def set_session_active_model_override(
     active_model: str,
     *,
     reason: str,
+    preflight: Callable[[VibeConfigSchema], Awaitable[None]] | None = None,
 ) -> list[BaseException]:
     if override_active_model(orchestrator) == active_model:
         return []
@@ -75,6 +77,7 @@ async def set_session_active_model_override(
             )
         ],
         reason=reason,
+        preflight=preflight,
     )
 
 
@@ -93,21 +96,12 @@ async def clear_session_active_model_override(
     )
 
 
-def _sets_thinking(data: object, alias: str) -> bool:
-    models = getattr(data, "models", None)
-    if isinstance(models, Mapping):
-        entry = models.get(alias)
-    elif isinstance(models, Sequence) and not isinstance(models, str | bytes):
-        entry = next(
-            (
-                candidate
-                for candidate in models
-                if isinstance(candidate, Mapping) and candidate.get("alias") == alias
-            ),
-            None,
-        )
-    else:
+def _sets_thinking(
+    config: VibeConfigSchema, data: RawConfig | None, alias: str
+) -> bool:
+    if data is None:
         return False
+    entry = config.layer_models(data.model_dump()).get(alias)
     return isinstance(entry, Mapping) and isinstance(entry.get("thinking"), str)
 
 
@@ -129,7 +123,7 @@ def model_thinking_is_session_writable(
     """
     return not any(
         layer.name in _LAYERS_OUTRANKING_THE_SESSION
-        and _sets_thinking(layer.cached_data, alias)
+        and _sets_thinking(orchestrator.config, layer.cached_data, alias)
         for layer in orchestrator.layers
     )
 

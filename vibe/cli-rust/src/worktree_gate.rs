@@ -72,7 +72,7 @@ pub fn settle_worktree(params: &Value) -> Option<crate::worktree::WorktreeInfo> 
             continue;
         }
         let worktree: crate::server::PublicSessionWorktree =
-            serde_json::from_value(value.clone()).ok()?;
+            serde::Deserialize::deserialize(value).ok()?;
         return Some(crate::worktree::WorktreeInfo {
             name: worktree.name,
             branch: worktree.branch,
@@ -145,7 +145,7 @@ pub async fn absorb_until_settled(
                 }
                 None => return Ok((Settled::default(), waited)),
             },
-            _ = tokio::time::sleep_until(deadline) => return Ok((Settled::default(), waited)),
+            _ = crate::clock::sleep_until_real(Some(deadline.into_std())) => return Ok((Settled::default(), waited)),
         }
     }
 }
@@ -196,7 +196,7 @@ pub async fn early_start(
     let (client, child, notifications, crash_rx) = match Client::spawn(launch).await {
         Ok(spawned) => spawned,
         Err(error) => {
-            tracing::error!(vibe_boundary = "startup", fatal = true, "{error:#}");
+            crate::startup::failure::log_spawn(&error);
             return Err(error.context("spawn app-server"));
         }
     };
@@ -207,7 +207,7 @@ pub async fn early_start(
     let (trust_tx, trust_rx) = mpsc::channel::<String>(1);
     // The bridge carries the notifications the event loop still reads.
     let (bridge_tx, bridge_rx) = mpsc::channel::<Notification>(256);
-    tokio::spawn(handshake(
+    crate::work::spawn_daemon(handshake(
         client.clone(),
         ready_tx,
         trust_rx,

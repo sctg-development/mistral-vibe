@@ -79,7 +79,8 @@ pub(super) async fn run_session(
     // Worktree settle wait.
     let mut settled: Vec<Notification> = Vec::new();
     if options.worktree.is_some() {
-        let deadline = Instant::now() + crate::worktree_gate::SETTLE_WAIT;
+        let deadline =
+            Instant::from_std(crate::clock::real_now()) + crate::worktree_gate::SETTLE_WAIT;
         let settled_cwd =
             match crate::worktree_gate::absorb_until_settled(&mut notifications, deadline).await {
                 Ok((settle, waited)) => {
@@ -107,11 +108,12 @@ pub(super) async fn run_session(
         }
     }
 
-    // Wait for session ready.
+    // Wait for session ready, and for its connectors and MCP servers: a run
+    // sends one message, so tools found after it starts would never reach it.
     if let Err(error) = client
         .request(
             method::SESSION_READY_WAIT,
-            json!({ "sessionId": session_id }),
+            json!({ "sessionId": session_id, "integrations": true }),
         )
         .await
     {
@@ -133,6 +135,8 @@ pub(super) async fn run_session(
         Ok(None) => {}
         Err(failure) => return failure,
     }
+    let config_warnings = pre_turn::config_warnings(&client, &options, &session_id).await;
+    state.lock().unwrap().warnings.extend(config_warnings);
 
     // Read effective config for the export, as the session is ready and
     // before the turn spends anything.
@@ -151,6 +155,10 @@ pub(super) async fn run_session(
     if let Some(failure) = pre_turn::pending_abort(&mut notifications, &mut settled, &stop) {
         return failure;
     }
+    let unavailable = pre_turn::integrations_unavailable(&options.output, &settled);
+    state.lock().unwrap().warnings.extend(unavailable);
+    // Taken once: the turn loop replays `settled` and must not report them again.
+    settled.retain(|notification| !pre_turn::is_integrations_unavailable(notification));
 
     // Run the turn.
     let mut output = Output::new(options.output.clone());
@@ -166,7 +174,7 @@ pub(super) async fn run_session(
                 settled,
                 &stop,
                 &turn_id,
-                &usage_baseline,
+                &state,
             )
             .await;
             WorkEnd::Turn(end)

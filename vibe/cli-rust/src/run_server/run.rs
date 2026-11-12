@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use super::protocol::{invalid_params, Failure, RunEnded, RunStartParams};
 use crate::cli::{HeadlessOptions, HeadlessSession, OutputFormat};
 use crate::headless::drive;
-use crate::headless_run::{iso_now, HeadlessRun, StopRequests};
+use crate::headless_run::{iso_now, price_limit_issue, HeadlessRun, StopRequests};
 use crate::run_export::{RunError, RunLimits, RunOutcome, RunReport, RunResult};
 use crate::server::{ChannelCloser, Connect, Connected};
 
@@ -43,13 +43,14 @@ impl RunSpec {
         let positive = |value: Option<f64>| value.is_none_or(|v| v.is_finite() && v > 0.0);
         for (field, ok) in [
             ("maxTurns", params.max_turns != Some(0)),
-            ("maxTokens", params.max_tokens != Some(0)),
-            ("maxPrice", positive(params.max_price)),
             ("timeLimit", positive(params.time_limit)),
         ] {
             if !ok {
                 issues.push((field.to_owned(), "must be greater than 0".to_owned()));
             }
+        }
+        if let Some(issue) = price_limit_issue(params.max_price) {
+            issues.push(("maxPrice".to_owned(), issue.to_owned()));
         }
         if !issues.is_empty() {
             return Err(invalid_params(issues));
@@ -67,6 +68,8 @@ impl RunSpec {
             max_tokens: params.max_tokens,
             time_limit: params.time_limit,
             output_dir: params.output_dir.as_deref().map(resolve),
+            system_prompt: None,
+            model: None,
             agent: params.agent,
             auto_approve: params.auto_approve,
             enabled_tools: params.enabled_tools.unwrap_or_default(),
@@ -105,7 +108,7 @@ impl LiveRun {
         self.hard_stop.send_if_modified(|at| {
             let first = at.is_none();
             let hard_stop = crate::utils::timeout_or_env("VIBE_TEST_HARD_STOP_MS", HARD_STOP);
-            at.get_or_insert_with(|| Instant::now() + hard_stop);
+            at.get_or_insert_with(|| Instant::from_std(crate::clock::real_now()) + hard_stop);
             first
         });
     }
@@ -169,7 +172,7 @@ async fn hard_stopped(hard_stop: &mut watch::Receiver<Option<Instant>>) {
     loop {
         let at = *hard_stop.borrow_and_update();
         match at {
-            Some(at) => return tokio::time::sleep_until(at).await,
+            Some(at) => return crate::clock::sleep_until_real(Some(at.into_std())).await,
             None if hard_stop.changed().await.is_err() => std::future::pending().await,
             None => {}
         }
@@ -183,14 +186,14 @@ async fn export(
     mut hard_stop: watch::Receiver<Option<Instant>>,
 ) -> (Option<PathBuf>, Option<String>, Option<&'static str>) {
     let report = report.clone();
-    let mut writing = tokio::task::spawn_blocking(move || headless.export(&report));
+    let mut writing = crate::work::spawn_blocking(move || headless.export(&report));
     let mut watching = true;
     loop {
-        let deadline =
-            (*hard_stop.borrow_and_update()).map(|at| at.max(Instant::now()) + EXPORT_GRACE);
+        let deadline = (*hard_stop.borrow_and_update())
+            .map(|at| at.max(Instant::from_std(crate::clock::real_now())) + EXPORT_GRACE);
         let bounded = async {
             match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                Some(deadline) => crate::clock::sleep_until_real(Some(deadline.into_std())).await,
                 None => std::future::pending().await,
             }
         };

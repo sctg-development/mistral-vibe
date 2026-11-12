@@ -14,8 +14,7 @@ stays on this side of the seam, exactly as it does for plugins.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
-import json
+from dataclasses import dataclass, replace
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,11 +22,10 @@ from typing import TYPE_CHECKING
 from pydantic import ValidationError
 
 from vibe.app_server.models import ConfigIssue
-from vibe.core.paths import VIBE_HOME
-from vibe.core.skills.manager import SkillManager
-from vibe.core.skills.models import DISABLE_MODEL_INVOCATION_FIELD, SkillInfo
+from vibe.core.skills.manager import ShadowedSkill, SkillManager
+from vibe.core.skills.models import InstalledSkill, SkillInfo
+from vibe.core.skills.registry import mark_versions_used
 from vibe.core.tools.builtins.skill import render_skill_result, sample_skill_files
-from vibe.core.utils import name_matches
 
 if TYPE_CHECKING:
     from mistralai_vibe_local_harness.protocol import (
@@ -42,6 +40,8 @@ if TYPE_CHECKING:
     from vibe.core.config.harness_files import HarnessFilesManager
 
 logger = logging.getLogger(__name__)
+
+type RegistryVersions = Mapping[str, tuple[str, int]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +65,66 @@ class SkillProjection:
     model_payloads: Mapping[str, str]
     plugin_contexts: tuple[RustPluginContextDefinition, ...]
     catalogue: tuple[SkillInfo, ...]
+    registry_versions: RegistryVersions
+    shadowed: tuple[ShadowedSkill, ...] = ()
+
+
+def resolve_session_skills(
+    config: Callable[[], VibeConfigSchema],
+    *,
+    harness_files: HarnessFilesManager,
+    sandbox: SandboxSessionSkills | None = None,
+) -> SkillManager:
+    """With ``sandbox``, the project's own skills are those read in the sandbox, ranked
+    where the host ranks its project's files.
+    """
+    return SkillManager(
+        config,
+        harness_files=harness_files,
+        project_skills=None if sandbox is None else sandbox.project_skills,
+    )
+
+
+def host_skills(
+    config: Callable[[], VibeConfigSchema], *, harness_files: HarnessFilesManager
+) -> Mapping[str, SkillInfo]:
+    return resolve_session_skills(config, harness_files=harness_files).available_skills
+
+
+def installed_session_skills(
+    config: Callable[[], VibeConfigSchema],
+    *,
+    harness_files: HarnessFilesManager,
+    sandbox: SandboxSessionSkills | None = None,
+) -> list[InstalledSkill]:
+    """In a sandbox, an active one is listed in the version the session runs."""
+    installed = resolve_session_skills(
+        config, harness_files=harness_files, sandbox=sandbox
+    ).installed_skills()
+    return installed if sandbox is None else sandbox.installed(installed)
+
+
+def registry_versions_of(skills: Iterable[SkillInfo]) -> RegistryVersions:
+    return {
+        skill.name: (skill.registry.skill_id, skill.registry.version)
+        for skill in skills
+        if skill.registry is not None
+    }
+
+
+def resolved_registry_versions(
+    config: Callable[[], VibeConfigSchema],
+    *,
+    harness_files: HarnessFilesManager,
+    sandbox: SandboxSessionSkills | None = None,
+) -> RegistryVersions:
+    """As derivations resolve them, before a sandbox keeps an older copy for a version
+    it holds no copy of.
+    """
+    manager = resolve_session_skills(
+        config, harness_files=harness_files, sandbox=sandbox
+    )
+    return registry_versions_of(manager.available_skills.values())
 
 
 def discover_session_skills(
@@ -79,25 +139,30 @@ def discover_session_skills(
     """Project the session's skills.
 
     With ``sandbox``, the model reads skills in the sandbox: each one is
-    pointed at its copy there, and the project's own skills are those read
-    from the sandbox.
+    pointed at its copy there, the project's own skills are those read from
+    the sandbox and rank as the host ranks its own, and a registry skill that
+    tracks an alias and whose version has no copy keeps an older version the
+    sandbox holds.
+
+    The registry versions the session loads are marked used as they are read,
+    so a cleanup keeps them until the session's lease holds them. One that a
+    cleanup took as it was read makes a session on the host resolve again,
+    so it never runs a version that is gone; a sandboxed session runs the
+    copies in its sandbox.
     """
-    # The Python builtins reach a unified session as skills of the shipped
-    # `vibe` plugin, so loading them here too would offer each one twice under
-    # two names.
-    manager = SkillManager(config, harness_files=harness_files, include_builtins=False)
+    manager, root_skills = _root_skills(config, harness_files, sandbox)
+    marked = mark_versions_used(registry_versions_of(root_skills.values()).values())
+    if not marked and sandbox is None:
+        manager, root_skills = _root_skills(config, harness_files, sandbox)
+        mark_versions_used(registry_versions_of(root_skills.values()).values())
     issues = [
         ConfigIssue(file=str(issue.file), message=issue.message)
         for issue in sorted(
             manager.config_issues, key=lambda item: (str(item.file), item.message)
         )
     ]
-    root_skills = manager.available_skills
     if sandbox is not None:
         issues.extend(sandbox.issues)
-        root_skills = _with_project_skills(
-            root_skills, sandbox.project_skills, config()
-        )
     contexts = tuple(plugin_contexts)
     projection = project_core_skills(
         root_skills,
@@ -105,6 +170,7 @@ def discover_session_skills(
         plugin_contexts=contexts,
         locate=None if sandbox is None else sandbox.locate,
     )
+    projection = replace(projection, shadowed=manager.shadowed)
     if skill_tool_available:
         return issues, projection
     return (
@@ -115,40 +181,29 @@ def discover_session_skills(
             model_payloads={},
             plugin_contexts=tuple(_without_skills(context) for context in contexts),
             catalogue=projection.catalogue,
+            registry_versions=projection.registry_versions,
+            shadowed=projection.shadowed,
         ),
     )
 
 
-def _with_project_skills(
-    root_skills: Mapping[str, SkillInfo],
-    project_skills: Mapping[str, SkillInfo],
-    config: VibeConfigSchema,
-) -> Mapping[str, SkillInfo]:
-    """Rank a sandbox's project skills as the host ranks its own.
-
-    A skill from ``skill_paths`` wins over the project's, which wins over the
-    user's; the configured filters apply to all of them.
+def _root_skills(
+    config: Callable[[], VibeConfigSchema],
+    harness_files: HarnessFilesManager,
+    sandbox: SandboxSessionSkills | None,
+) -> tuple[SkillManager, Mapping[str, SkillInfo]]:
+    """In a sandbox, an alias pin whose version has no copy loads the older version kept
+    for it.
     """
-    configured = {path.resolve() for path in config.skill_paths if path.is_dir()}
-
-    def is_configured(skill: SkillInfo) -> bool:
-        return skill.skill_path is not None and skill.skill_path.parent.parent in (
-            configured
-        )
-
-    merged = {
-        name: skill for name, skill in root_skills.items() if is_configured(skill)
+    manager = resolve_session_skills(
+        config, harness_files=harness_files, sandbox=sandbox
+    )
+    if sandbox is None:
+        return manager, manager.available_skills
+    return manager, {
+        name: sandbox.copied_version(skill)
+        for name, skill in manager.available_skills.items()
     }
-    for name, skill in project_skills.items():
-        if config.enabled_skills:
-            if not name_matches(name, config.enabled_skills):
-                continue
-        elif name_matches(name, config.disabled_skills):
-            continue
-        merged.setdefault(name, skill)
-    for name, skill in root_skills.items():
-        merged.setdefault(name, skill)
-    return merged
 
 
 def _without_skills(
@@ -259,11 +314,11 @@ def project_core_skills(  # noqa: PLR0912, PLR0915 - host and sandbox halves of 
             path: str = location.path
             resolved = location.path
         else:
-            host_path = skill.skill_path or _materialize_builtin_skill(skill)
-            if host_path is None:
+            if skill.skill_path is None:
+                logger.warning("Dropped root skill %r: it has no path", name)
                 continue
-            path = str(host_path)
-            resolved = str(_resolved(host_path))
+            path = str(skill.skill_path)
+            resolved = str(_resolved(skill.skill_path))
         if resolved in claimed:
             logger.debug(
                 "Skipping root skill %r at %s: the path is already configured by a plugin",
@@ -288,46 +343,8 @@ def project_core_skills(  # noqa: PLR0912, PLR0915 - host and sandbox halves of 
         model_payloads=model_payloads,
         plugin_contexts=contexts,
         catalogue=tuple(catalogue),
+        registry_versions=registry_versions_of(root_skills.values()),
     )
-
-
-def builtin_skills_dir() -> Path:
-    return VIBE_HOME.path / "builtin-skills"
-
-
-def _materialize_builtin_skill(skill: SkillInfo) -> Path | None:
-    path = builtin_skills_dir() / skill.name / "SKILL.md"
-    content = _render_builtin_skill(skill)
-    try:
-        if path.is_file() and path.read_text(encoding="utf-8") == content:
-            return path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    except OSError as error:
-        logger.warning(
-            "Dropped builtin skill %r: failed to materialize %s: %s",
-            skill.name,
-            path,
-            error,
-        )
-        return None
-    return path
-
-
-def _render_builtin_skill(skill: SkillInfo) -> str:
-    lines = [
-        "---",
-        f"name: {json.dumps(skill.name)}",
-        f"description: {json.dumps(skill.description)}",
-    ]
-    if skill.allowed_tools:
-        lines.append("allowed-tools: " + json.dumps(list(skill.allowed_tools)))
-    if not skill.user_invocable:
-        lines.append("user-invocable: false")
-    if not skill.model_invocable:
-        lines.append(f"{DISABLE_MODEL_INVOCATION_FIELD}: true")
-    lines.extend(["---", "", skill.prompt, ""])
-    return "\n".join(lines)
 
 
 def _accept_skill(
@@ -350,9 +367,14 @@ def _resolved(path: Path) -> Path:
 
 
 __all__ = [
+    "RegistryVersions",
     "SkillProjection",
-    "builtin_skills_dir",
     "discover_session_skills",
+    "host_skills",
+    "installed_session_skills",
     "project_core_skills",
     "project_model_invocable_plugin_contexts",
+    "registry_versions_of",
+    "resolve_session_skills",
+    "resolved_registry_versions",
 ]

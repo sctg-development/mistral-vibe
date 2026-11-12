@@ -1,6 +1,18 @@
 use super::*;
 use crate::input_modes::InputMode;
 
+/// Every message role in the transcript, in order.
+fn roles(app: &App) -> Vec<String> {
+    app.view
+        .transcript
+        .lines()
+        .filter_map(|line| match line.entry {
+            crate::server::HistoryEntry::Message(message) => Some(message.role.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn selected(app: &mut App, has_file_changes: bool) {
     apply_event(
         app,
@@ -49,12 +61,27 @@ fn a_new_selection_reopens_on_the_action_step() {
     assert_eq!(app.view.scroll_to_entry, Some(0));
 }
 
+fn notice_text(app: &App) -> Option<&str> {
+    app.overlays.notice.as_ref().map(|n| n.text.as_str())
+}
+
+#[test]
+fn a_failure_with_the_panel_still_open_shows_only_a_notice() {
+    let mut app = App::default();
+    selected(&mut app, false);
+    apply_event(&mut app, Event::Failed("boom".into()));
+    assert!(app.rewind.open);
+    assert!(roles(&app).is_empty());
+    assert_eq!(notice_text(&app), Some("boom"));
+}
+
 #[test]
 fn a_failed_read_leaves_rewind_mode_when_nothing_is_highlighted() {
     let mut app = App::default();
     apply_event(&mut app, Event::Failed("boom".into()));
     assert!(!app.rewind.open);
-    assert!(!app.overlays.toasts.is_empty());
+    assert!(roles(&app).is_empty());
+    assert_eq!(notice_text(&app), Some("boom"));
 }
 
 #[test]
@@ -80,9 +107,9 @@ fn a_done_rewind_restores_the_message_into_the_composer() {
     assert_eq!(app.chat_input.input, "fix the parser");
     assert_eq!(app.chat_input.cursor, "fix the parser".len());
     assert_eq!(app.session.session_id.as_deref(), Some("new-session-id"));
-    assert!(!app.overlays.toasts.is_empty());
-    // The fork notice is the only entry left after the history was replaced.
-    assert_eq!(app.view.transcript.lines().count(), 1);
+    // The fork notice and the restore warning are the only entries left after the rebuild.
+    assert_eq!(app.view.transcript.lines().count(), 2);
+    assert_eq!(roles(&app), ["command_warning"]);
 }
 
 fn done(app: &mut App, message: &str) {
@@ -103,7 +130,7 @@ fn done(app: &mut App, message: &str) {
 #[test]
 fn a_done_rewind_to_a_skill_reloads_it_in_slash_mode_with_it_selected() {
     let mut app = App::default();
-    app.completion.skills = vec![("code-review".into(), "Review.".into())];
+    app.completion.skills = vec![crate::skill::Skill::new("code-review", "Review.")];
     done(&mut app, "/code-review");
     assert_eq!(app.chat_input.mode, InputMode::Slash);
     assert_eq!(app.chat_input.cursor, "code-review".len());
@@ -124,7 +151,7 @@ fn a_done_rewind_to_a_literal_slash_message_reloads_it_as_a_prompt() {
 #[test]
 fn a_done_rewind_ending_on_a_mention_keeps_completions_closed() {
     let mut app = App::default();
-    app.completion.skills = vec![("code-review".into(), "Review.".into())];
+    app.completion.skills = vec![crate::skill::Skill::new("code-review", "Review.")];
     done(&mut app, "please run /code-review");
     assert_eq!(app.chat_input.cursor, "please run /code-review".len());
     assert!(app.completion.entries.is_empty());

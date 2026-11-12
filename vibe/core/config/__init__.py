@@ -7,7 +7,6 @@ if TYPE_CHECKING:
         AUTO_THEME,
         DEFAULT_API_RETRY_MAX_ELAPSED_TIME,
         DEFAULT_API_TIMEOUT,
-        DEFAULT_AUTO_COMPACT_THRESHOLD,
         DEFAULT_CONSOLE_BASE_URL,
         DEFAULT_MISTRAL_API_ENV_KEY,
         DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
@@ -15,7 +14,6 @@ if TYPE_CHECKING:
         DEFAULT_MISTRAL_SERVER_URL,
         DEFAULT_THEME,
         DEFAULT_VIBE_BASE_URL,
-        FALLBACK_THEME,
     )
     from vibe.core.config.default_orchestrator import (
         build_default_orchestrator,
@@ -117,7 +115,6 @@ __all__ = [
     "DEFAULT_ACTIVE_MODEL_CONFIG",
     "DEFAULT_API_RETRY_MAX_ELAPSED_TIME",
     "DEFAULT_API_TIMEOUT",
-    "DEFAULT_AUTO_COMPACT_THRESHOLD",
     "DEFAULT_CONSOLE_BASE_URL",
     "DEFAULT_MISTRAL_API_ENV_KEY",
     "DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL",
@@ -131,7 +128,6 @@ __all__ = [
     "DEFAULT_TTS_MODELS",
     "DEFAULT_TTS_PROVIDERS",
     "DEFAULT_VIBE_BASE_URL",
-    "FALLBACK_THEME",
     "MISSING_BACKING_STORE_DATA_FINGERPRINT",
     "THINKING_LEVELS",
     "AddOperationPatch",
@@ -213,10 +209,6 @@ _MAPPING: dict[str, tuple[str, str]] = {
         "DEFAULT_API_RETRY_MAX_ELAPSED_TIME",
     ),
     "DEFAULT_API_TIMEOUT": ("vibe.core.config._defaults", "DEFAULT_API_TIMEOUT"),
-    "DEFAULT_AUTO_COMPACT_THRESHOLD": (
-        "vibe.core.config._defaults",
-        "DEFAULT_AUTO_COMPACT_THRESHOLD",
-    ),
     "DEFAULT_CONSOLE_BASE_URL": (
         "vibe.core.config._defaults",
         "DEFAULT_CONSOLE_BASE_URL",
@@ -239,7 +231,6 @@ _MAPPING: dict[str, tuple[str, str]] = {
     ),
     "DEFAULT_THEME": ("vibe.core.config._defaults", "DEFAULT_THEME"),
     "DEFAULT_VIBE_BASE_URL": ("vibe.core.config._defaults", "DEFAULT_VIBE_BASE_URL"),
-    "FALLBACK_THEME": ("vibe.core.config._defaults", "FALLBACK_THEME"),
     "build_default_orchestrator": (
         "vibe.core.config.default_orchestrator",
         "build_default_orchestrator",

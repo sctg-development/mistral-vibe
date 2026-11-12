@@ -43,11 +43,28 @@ impl Mode {
             idle_message_starts: IdleMessageStarts::DirectChildren,
         }
     }
+    pub(crate) fn with_conversation_forking(mut self, enabled: bool) -> Self {
+        if let Self::Enabled {
+            conversation_forking,
+            ..
+        } = &mut self
+        {
+            *conversation_forking = enabled;
+        }
+        self
+    }
     pub(crate) fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled { .. })
     }
     pub(crate) fn supports(&self, operation: ToolName) -> bool {
         matches!(self, Self::Enabled { operations, .. } if operations.contains(&operation))
+    }
+    /// Whether the agent can create children, so its guidance may name child operations.
+    pub(crate) fn can_spawn(&self) -> bool {
+        self.supports(ToolName::Spawn)
+    }
+    pub(crate) fn can_list_configs(&self) -> bool {
+        self.supports(ToolName::ListConfigs)
     }
     pub(crate) fn supports_conversation_forking(&self) -> bool {
         matches!(

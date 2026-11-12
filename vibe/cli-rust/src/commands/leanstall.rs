@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::submission::new_message_id;
 use super::CommandEvent;
+use crate::agents;
 use crate::app::App;
 use crate::input::deliver;
 use crate::server::request_error::describe;
@@ -39,7 +40,7 @@ pub fn short_circuit(app: &App, installed: bool) -> Option<&'static str> {
 
 fn set_installed(app: &mut App, client: &Arc<Client>, installed: bool) {
     if let Some(notice) = short_circuit(app, installed) {
-        local::add_command_result(&mut app.view.transcript, &new_message_id(), notice);
+        local::add_command_status(&mut app.view.transcript, &new_message_id(), notice);
         return;
     }
     // Replayed at ready, a deferred command can race the Shift+Tab switch sent just before it.
@@ -51,13 +52,12 @@ fn set_installed(app: &mut App, client: &Arc<Client>, installed: bool) {
         return;
     };
     let tx = app.command_tx.clone();
-    let pending = app.commit_started();
     let client = client.clone();
     app.agents.installing = true;
-    tokio::spawn(async move {
+    crate::work::spawn(async move {
         let result = request(&client, session_id, installed).await;
         let event = Event { installed, result };
-        deliver(tx, CommandEvent::Leanstall(Box::new(event)), &pending).await;
+        deliver(tx, CommandEvent::Leanstall(Box::new(event))).await;
     });
 }
 
@@ -94,11 +94,11 @@ pub fn apply_event(app: &mut App, event: Event) {
         }
     };
     app.agents.all = response.agents;
-    app.agents.active = response.active;
+    agents::set_active(app, response.active);
     let notice = if event.installed {
         "Lean agent installed."
     } else {
         "Lean agent uninstalled."
     };
-    local::add_command_result(&mut app.view.transcript, &id, notice);
+    local::add_command_status(&mut app.view.transcript, &id, notice);
 }

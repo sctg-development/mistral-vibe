@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
@@ -7,6 +9,7 @@ import logging
 from pathlib import Path
 import threading
 from threading import Event
+import time
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,7 +30,6 @@ from vibe.app_server._session_backend_port import (
     SessionBackendError,
     SessionConnectorSourceState,
     SessionConnectorState,
-    SessionConnectorToolDescriptor,
 )
 import vibe.app_server.connector_catalog as connector_catalog
 from vibe.app_server.connector_catalog import (
@@ -35,6 +37,7 @@ from vibe.app_server.connector_catalog import (
     ConnectorCatalogService,
     ConnectorCatalogUnavailableError,
     ConnectorCatalogValidationError,
+    SharedConnectorCatalog,
     connector_cache_fingerprint,
     connector_source_enabled,
     connector_tool_enabled,
@@ -42,16 +45,56 @@ from vibe.app_server.connector_catalog import (
 )
 from vibe.app_server.models import AccountPlanKind
 from vibe.app_server.protocol import ConnectorAuthRequiredParams, ProtocolErrorCode
-from vibe.core.config import ConnectorConfig, VibeConfigSchema
+from vibe.core.config import (
+    ConnectorConfig,
+    VibeConfigSchema,
+    build_default_orchestrator,
+)
+from vibe.core.config.layers.growthbook import GrowthbookLayer
+from vibe.core.experiments.active import ExperimentName
 from vibe.core.identity import IdentityResult
+from vibe.core.platform_auth import (
+    ApiKeyPlatformCredentialProvider,
+    PlatformCredentialProvider,
+    PlatformCredentialSnapshot,
+    PlatformCredentialTarget,
+)
+from vibe.core.platform_auth._api_key import api_key_principal
 from vibe.setup.auth.whoami import WhoAmIResult, store_cached_whoami
+
+
+def _service(
+    *,
+    implicit_source_enabled: bool = False,
+    cache_path: Path | None = None,
+    fetch_bootstrap: connector_catalog.BootstrapFetcher | None = None,
+    clock: Callable[[], float] | None = None,
+) -> ConnectorCatalogService:
+    """A channel's service over a process catalog of its own."""
+    shared = SharedConnectorCatalog(
+        cache_path=cache_path, fetch_bootstrap=fetch_bootstrap, clock=clock or time.time
+    )
+    return ConnectorCatalogService(
+        shared, implicit_source_enabled=implicit_source_enabled
+    )
+
+
+def _key(api_key: str) -> ApiKeyPlatformCredentialProvider:
+    return ApiKeyPlatformCredentialProvider.from_api_key(api_key)
+
+
+async def _sent_api_key(credentials: PlatformCredentialProvider, base_url: str) -> str:
+    """The API key a fetch with ``credentials`` sends."""
+    snapshot = await credentials.resolve(PlatformCredentialTarget(base_url))
+    assert isinstance(snapshot, PlatformCredentialSnapshot)
+    return snapshot.headers["Authorization"].removeprefix("Bearer ")
 
 
 @pytest.mark.asyncio
 async def test_manage_connectors_url_builds_console_share_link(monkeypatch) -> None:
     config = build_test_vibe_config(enable_connectors=True)
     provider = connector_catalog._ConnectorProvider(
-        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+        fingerprint="fp", base_url="https://api.mistral.ai", credentials=_key("k")
     )
     identity = IdentityResult.model_validate({
         "id": "user-1",
@@ -59,7 +102,9 @@ async def test_manage_connectors_url_builds_console_share_link(monkeypatch) -> N
         "workspace": {"id": "ws-1", "name": "Workspace"},
     })
     monkeypatch.setattr(
-        connector_catalog, "_resolve_provider", lambda _config: provider
+        connector_catalog,
+        "_resolve_provider",
+        lambda _config, _credentials=None: provider,
     )
     resolve = AsyncMock(return_value=identity)
     monkeypatch.setattr(connector_catalog._IDENTITY_CACHE, "resolve", resolve)
@@ -89,7 +134,9 @@ async def test_manage_connectors_url_builds_console_share_link(monkeypatch) -> N
 @pytest.mark.asyncio
 async def test_manage_connectors_url_none_without_mistral_provider(monkeypatch) -> None:
     config = build_test_vibe_config(enable_connectors=True)
-    monkeypatch.setattr(connector_catalog, "_resolve_provider", lambda _config: None)
+    monkeypatch.setattr(
+        connector_catalog, "_resolve_provider", lambda _config, _credentials=None: None
+    )
 
     assert await connector_catalog._manage_connectors_url(config) is None
 
@@ -98,14 +145,16 @@ async def test_manage_connectors_url_none_without_mistral_provider(monkeypatch) 
 async def test_manage_connectors_url_none_when_identity_incomplete(monkeypatch) -> None:
     config = build_test_vibe_config(enable_connectors=True)
     provider = connector_catalog._ConnectorProvider(
-        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+        fingerprint="fp", base_url="https://api.mistral.ai", credentials=_key("k")
     )
     identity = IdentityResult.model_validate({
         "id": "user-1",
         "organization": {"id": "org-1", "name": "Org"},
     })
     monkeypatch.setattr(
-        connector_catalog, "_resolve_provider", lambda _config: provider
+        connector_catalog,
+        "_resolve_provider",
+        lambda _config, _credentials=None: provider,
     )
     monkeypatch.setattr(
         connector_catalog._IDENTITY_CACHE, "resolve", AsyncMock(return_value=identity)
@@ -116,21 +165,25 @@ async def test_manage_connectors_url_none_when_identity_incomplete(monkeypatch) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("scope", "expected"),
-    [("shared_only", True), ("personal_and_shared", False), (None, False)],
+    ("can_access_private_resources", "expected"),
+    [(False, True), (True, False), (None, False)],
 )
-async def test_private_connectors_hidden_only_for_shared_only_keys(
-    monkeypatch, scope: str | None, expected: bool
+async def test_private_connectors_hidden_from_account_context(
+    monkeypatch, can_access_private_resources: bool | None, expected: bool
 ) -> None:
     config = build_test_vibe_config(enable_connectors=True)
     provider = connector_catalog._ConnectorProvider(
-        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+        fingerprint="fp", base_url="https://api.mistral.ai", credentials=_key("k")
     )
     monkeypatch.setattr(
-        connector_catalog, "_resolve_provider", lambda _config: provider
+        connector_catalog,
+        "_resolve_provider",
+        lambda _config, _credentials=None: provider,
     )
     whoami = WhoAmIResult(
-        plan_type=AccountPlanKind.API, plan_name="FREE", primitive_access_scope=scope
+        plan_type=AccountPlanKind.CHAT,
+        plan_name="FREE",
+        can_access_private_resources=can_access_private_resources,
     )
     resolve = AsyncMock(return_value=whoami)
     monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
@@ -148,10 +201,12 @@ async def test_private_connectors_hidden_retries_whoami_only_after_cooldown(
 ) -> None:
     config = build_test_vibe_config(enable_connectors=True)
     provider = connector_catalog._ConnectorProvider(
-        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+        fingerprint="fp", base_url="https://api.mistral.ai", credentials=_key("k")
     )
     monkeypatch.setattr(
-        connector_catalog, "_resolve_provider", lambda _config: provider
+        connector_catalog,
+        "_resolve_provider",
+        lambda _config, _credentials=None: provider,
     )
     resolve = AsyncMock(return_value=None)
     monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
@@ -162,12 +217,14 @@ async def test_private_connectors_hidden_retries_whoami_only_after_cooldown(
     assert await connector_catalog._private_connectors_hidden(config) is False
     assert resolve.await_count == 1
 
-    key = (config.console_base_url, "k")
+    # Keyed by the account's cache identity, never by the key itself.
+    key = (config.console_base_url, "fp")
+    assert "k" not in {part for entry in failed_at for part in entry}
     failed_at[key] -= connector_catalog._WHOAMI_RETRY_SECONDS + 1
     resolve.return_value = WhoAmIResult(
         plan_type=AccountPlanKind.API,
         plan_name="FREE",
-        primitive_access_scope="shared_only",
+        can_access_private_resources=False,
     )
 
     assert await connector_catalog._private_connectors_hidden(config) is True
@@ -181,10 +238,12 @@ async def test_private_connectors_hidden_reads_disk_cache_during_cooldown(
 ) -> None:
     config = build_test_vibe_config(enable_connectors=True)
     provider = connector_catalog._ConnectorProvider(
-        fingerprint="fp", base_url="https://api.mistral.ai", api_key="k"
+        fingerprint="fp", base_url="https://api.mistral.ai", credentials=_key("k")
     )
     monkeypatch.setattr(
-        connector_catalog, "_resolve_provider", lambda _config: provider
+        connector_catalog,
+        "_resolve_provider",
+        lambda _config, _credentials=None: provider,
     )
     resolve = AsyncMock(return_value=None)
     monkeypatch.setattr(connector_catalog._WHOAMI_CACHE, "resolve", resolve)
@@ -193,11 +252,11 @@ async def test_private_connectors_hidden_reads_disk_cache_during_cooldown(
 
     assert await connector_catalog._private_connectors_hidden(config) is False
     store_cached_whoami(
-        "k",
+        api_key_principal("k"),
         WhoAmIResult(
             plan_type=AccountPlanKind.API,
             plan_name="FREE",
-            primitive_access_scope="shared_only",
+            can_access_private_resources=False,
         ),
     )
 
@@ -211,7 +270,9 @@ async def test_private_connectors_hidden_false_without_mistral_provider(
     monkeypatch,
 ) -> None:
     config = build_test_vibe_config(enable_connectors=True)
-    monkeypatch.setattr(connector_catalog, "_resolve_provider", lambda _config: None)
+    monkeypatch.setattr(
+        connector_catalog, "_resolve_provider", lambda _config, _credentials=None: None
+    )
 
     assert await connector_catalog._private_connectors_hidden(config) is False
 
@@ -235,6 +296,43 @@ def test_resolve_provider_gates_document_library_connector(monkeypatch) -> None:
     # The gated builtins must fold into the cache key so the two states never
     # collide on disk.
     assert disabled.fingerprint != enabled.fingerprint
+
+
+def test_resolve_provider_gates_mistral_mcp_connector(monkeypatch) -> None:
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+
+    disabled = connector_catalog._resolve_provider(
+        build_test_vibe_config(enable_connectors=True)
+    )
+    assert disabled is not None
+    assert disabled.builtins == ("web_search",)
+
+    enabled = connector_catalog._resolve_provider(
+        build_test_vibe_config(
+            enable_connectors=True, experimental_enable_mistral_mcp_connector=True
+        )
+    )
+    assert enabled is not None
+    assert enabled.builtins == ("web_search", "mistral_mcp")
+    assert disabled.fingerprint != enabled.fingerprint
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("connectors_enabled")
+async def test_growthbook_variant_adds_mistral_mcp_to_resolved_builtins(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    orchestrator = await build_default_orchestrator()
+    layer = orchestrator.get_layer(GrowthbookLayer.NAME)
+    assert isinstance(layer, GrowthbookLayer)
+    layer.set_variants({ExperimentName.MISTRAL_MCP_CONNECTOR.value: True})
+
+    await orchestrator.reload()
+
+    provider = connector_catalog._resolve_provider(orchestrator.config)
+    assert provider is not None
+    assert provider.builtins == ("web_search", "mistral_mcp")
 
 
 def _connector(
@@ -326,7 +424,7 @@ async def test_connector_bootstrap_processing_runs_off_the_event_loop(
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
-    client.get = AsyncMock(return_value=response)
+    client.request = AsyncMock(return_value=response)
 
     def build_client() -> MagicMock:
         construction_threads.append(threading.get_ident())
@@ -336,13 +434,15 @@ async def test_connector_bootstrap_processing_runs_off_the_event_loop(
 
     # Do
     payload = await connector_catalog._fetch_bootstrap(
-        "https://api.example.test", "secret"
+        "https://api.example.test", _key("secret")
     )
 
     # Assert
     assert payload == {"connectors": []}
-    client.get.assert_awaited_once_with(
+    client.request.assert_awaited_once_with(
+        "GET",
         "https://api.example.test/v1/connectors/bootstrap",
+        follow_redirects=True,
         headers={"Authorization": "Bearer secret"},
         params={
             # Default omits the gated document_library connector.
@@ -362,7 +462,7 @@ async def test_connector_catalog_trusts_server_capability_filter(
     monkeypatch.setenv("VIBE_API_KEY", "test-key")
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         return {
             "connectors": [
@@ -373,7 +473,7 @@ async def test_connector_catalog_trusts_server_capability_filter(
             ]
         }
 
-    catalog = await ConnectorCatalogService(
+    catalog = await _service(
         implicit_source_enabled=False,
         cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
@@ -400,7 +500,7 @@ async def test_connector_catalog_resolution_runs_off_the_event_loop(
     resolve_catalog = connector_catalog._resolve_catalog
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         return {"connectors": [_connector()]}
 
@@ -411,7 +511,7 @@ async def test_connector_catalog_resolution_runs_off_the_event_loop(
         return resolve_catalog(payload, provider_fingerprint)
 
     monkeypatch.setattr(connector_catalog, "_resolve_catalog", record_resolution)
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
         cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
@@ -437,23 +537,25 @@ async def test_connector_catalog_async_read_keeps_keyring_and_disk_off_event_loo
     cache_threads: list[int] = []
     resolve_provider = connector_catalog._resolve_provider
 
-    def record_provider(config: VibeConfigSchema):
+    def record_provider(config: VibeConfigSchema, credentials=None):
         provider_threads.append(threading.get_ident())
-        return resolve_provider(config)
+        return resolve_provider(config, credentials)
 
     def read_cache(_fingerprint: str, *, now: int):
         del now
         cache_threads.append(threading.get_ident())
         return None
 
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False, cache_path=tmp_path / "connectors.json"
     )
     monkeypatch.setattr(connector_catalog, "_resolve_provider", record_provider)
-    monkeypatch.setattr(service._cache, "read", read_cache)
+    monkeypatch.setattr(
+        ConnectorCatalogCache, "read", lambda _self, *a, **k: read_cache(*a, **k)
+    )
 
     # Do
-    result = await service._read_catalog_async(_orchestrator())
+    result = await service.read_catalog(_orchestrator())
 
     # Assert
     assert result.catalog is None
@@ -545,6 +647,7 @@ class _BusyConnectorControl:
     ) -> None:
         self.connector_config_orchestrator = orchestrator
         self.state = state
+        self.catalog: ResolvedConnectorCatalog | None = None
         self.busy = True
         self.attempts: list[
             tuple[ResolvedConnectorCatalog, ResolvedConnectorSelection, bool]
@@ -552,6 +655,9 @@ class _BusyConnectorControl:
 
     async def read_connectors(self) -> SessionConnectorState:
         return self.state
+
+    def accepted_connector_catalog(self) -> ResolvedConnectorCatalog | None:
+        return self.catalog
 
     async def reconfigure_connectors(
         self,
@@ -563,6 +669,7 @@ class _BusyConnectorControl:
         self.attempts.append((catalog, selection, force))
         if self.busy:
             raise SessionBackendError(ProtocolErrorCode.CONFLICT, "busy")
+        self.catalog = catalog
         self.state = replace(
             self.state,
             accepted_catalog_revision=catalog.revision,
@@ -591,59 +698,277 @@ class _BusyConnectorControl:
 
 
 @pytest.mark.asyncio
-async def test_connector_cache_ttl_never_slides(
+async def test_opening_reads_an_expired_catalog_without_fetching(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """*Prepare*: A catalog fetched at a fixed time and later service instances sharing its cache.
-    *Do*: Read the cache repeatedly before and at the ten-minute boundary.
-    *Assert*: Reads do not extend the original stored-at expiry.
+    """*Prepare*: A catalog cached an hour ago and a service that cannot fetch.
+    *Do*: Read the cached catalog for opening a session, and with nothing cached.
+    *Assert*: The expired catalog is returned without a fetch, and an empty
+      cache answers None: opening never waits on the connector service.
     """
     # Prepare
     monkeypatch.setenv("VIBE_API_KEY", "test-key")
     cache_path = tmp_path / "connectors.json"
-    now = [1_000]
-    fetch_count = 0
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
-        nonlocal fetch_count
-        fetch_count += 1
+        return {"connectors": [_connector()]}
+
+    async def unreachable(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        raise AssertionError("opening a session must not fetch")
+
+    orchestrator = _orchestrator()
+    await _service(
+        implicit_source_enabled=False,
+        cache_path=cache_path,
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    ).resolve_catalog(orchestrator)
+
+    def service(path: Path) -> ConnectorCatalogService:
+        return _service(
+            implicit_source_enabled=False,
+            cache_path=path,
+            fetch_bootstrap=unreachable,
+            clock=lambda: 1_000 + 3_600,
+        )
+
+    # Do
+    expired = await service(cache_path).read_cached_catalog(orchestrator)
+    empty = await service(tmp_path / "empty.json").read_cached_catalog(orchestrator)
+
+    # Assert
+    assert expired is not None
+    assert [connector.alias for connector in expired.connectors] == ["wiki"]
+    assert empty is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_bootstrap_answers_the_next_callers_until_it_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A connector backend that fails, with no cached catalog.
+    *Do*: Resolve the catalog again inside the retry window, then after it.
+    *Assert*: Callers inside the window fail at once without another fetch; the
+    first one after it fetches again and recovers. Each caller would otherwise
+    wait out its own bootstrap timeout against a backend that just failed.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    now = [1_000]
+    fetches = 0
+    backend_up = False
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        if not backend_up:
+            raise TimeoutError("connectors backend is down")
         return {"connectors": [_connector()]}
 
     orchestrator = _orchestrator()
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
-        cache_path=cache_path,
+        cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
         clock=lambda: now[0],
     )
-    await service.resolve_catalog(orchestrator)
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
 
     # Do
-    now[0] = 1_100
-    first_reader = ConnectorCatalogService(
-        implicit_source_enabled=False,
-        cache_path=cache_path,
-        fetch_bootstrap=fetch,
-        clock=lambda: now[0],
-    )
-    first = first_reader.read_catalog(orchestrator)
-    now[0] = 1_599
-    second = first_reader.read_catalog(orchestrator)
-    now[0] = 1_600
-    expired = first_reader.read_catalog(orchestrator)
+    now[0] = 1_059
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
+    fetches_in_window = fetches
+    backend_up = True
+    now[0] = 1_060
+    recovered = await service.resolve_catalog(orchestrator)
 
     # Assert
-    assert first.disposition == "fresh_cache"
-    assert first.catalog is not None
-    assert second.disposition == "memory"
-    assert expired.disposition == "not_loaded"
-    assert expired.catalog is None
-    assert fetch_count == 1
+    assert fetches_in_window == 1
+    assert recovered is not None
+    assert fetches == 2
 
 
-def test_connector_cache_reads_safe_legacy_record_without_rewrite(
+@pytest.mark.parametrize(("status", "fails"), [(404, False), (503, True)])
+@pytest.mark.asyncio
+async def test_a_server_without_a_connector_service_has_no_connectors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int, fails: bool
+) -> None:
+    """*Prepare*: A server answering the bootstrap with 404, as one without the
+      connector service does (self-hosted, Private Cloud, a proxy), or 503.
+    *Do*: Resolve the catalog.
+    *Assert*: A 404 is an empty catalog, not a failure to warn about; a 503
+      still fails.
+    """
+    import httpx2
+
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+
+    async def fetch(
+        base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        request = httpx2.Request("GET", f"{base_url}/v1/connectors/bootstrap")
+        response = httpx2.Response(status, request=request)
+        raise httpx2.HTTPStatusError("bootstrap", request=request, response=response)
+
+    service = _service(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+
+    # Do
+    try:
+        catalog = await service.resolve_catalog(_orchestrator())
+        error = None
+    except ConnectorCatalogUnavailableError as exc:
+        catalog, error = None, exc
+
+    # Assert
+    if fails:
+        assert error is not None
+        assert "HTTP 503" in str(error)
+    else:
+        assert error is None
+        assert catalog is not None
+        assert catalog.connectors == ()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_bootstrap_answers_another_service_in_the_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: One catalog service whose bootstrap just failed.
+    *Do*: Resolve the same provider's catalog through a second service.
+    *Assert*: The second fails at once without fetching: every channel of a
+    multiplexed process builds its own service over the one process catalog,
+    so each would otherwise wait out the same dead backend again.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    fetches = 0
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        raise TimeoutError("connectors backend is down")
+
+    orchestrator = _orchestrator()
+    shared = SharedConnectorCatalog(
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+
+    def service() -> ConnectorCatalogService:
+        return ConnectorCatalogService(shared, implicit_source_enabled=False)
+
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service().resolve_catalog(orchestrator)
+
+    # Do
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service().resolve_catalog(orchestrator)
+
+    # Assert
+    assert fetches == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_fetches_share_one_bootstrap_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: Two channels' catalog services over one process catalog, no
+      cached catalog, and a slow backend.
+    *Do*: Resolve the same provider's catalog through both at once.
+    *Assert*: One request answers both. Two sessions opening together in a
+    shared process would otherwise each wait out the same slow request.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    fetches = 0
+    release = asyncio.Event()
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        await release.wait()
+        return {"connectors": [_connector()]}
+
+    orchestrator = _orchestrator()
+
+    shared = SharedConnectorCatalog(
+        cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch
+    )
+
+    def service(_name: str) -> ConnectorCatalogService:
+        return ConnectorCatalogService(shared, implicit_source_enabled=False)
+
+    # Do
+    first = asyncio.create_task(service("first").resolve_catalog(orchestrator))
+    second = asyncio.create_task(service("second").resolve_catalog(orchestrator))
+    await asyncio.sleep(0)
+    release.set()
+    catalogs = await asyncio.gather(first, second)
+
+    # Assert
+    assert fetches == 1
+    assert all(catalog is not None for catalog in catalogs)
+
+
+@pytest.mark.asyncio
+async def test_a_forced_refresh_retries_a_failed_bootstrap_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A bootstrap that just failed and a backend that is back.
+    *Do*: Force a refresh inside the retry window.
+    *Assert*: It fetches and recovers. A user asking to refresh connectors
+    must not be answered from the remembered failure.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    backend_up = False
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        if not backend_up:
+            raise TimeoutError("connectors backend is down")
+        return {"connectors": [_connector()]}
+
+    orchestrator = _orchestrator()
+    service = _service(
+        implicit_source_enabled=False,
+        cache_path=tmp_path / "connectors.json",
+        fetch_bootstrap=fetch,
+        clock=lambda: 1_000,
+    )
+    with pytest.raises(ConnectorCatalogUnavailableError):
+        await service.resolve_catalog(orchestrator)
+    backend_up = True
+
+    # Do
+    refreshed = await service.resolve_catalog(orchestrator, force_refresh=True)
+
+    # Assert
+    assert refreshed is not None
+
+
+@pytest.mark.asyncio
+async def test_connector_cache_reads_safe_legacy_record_without_rewrite(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """*Prepare*: A fresh unversioned cache record written by the legacy registry.
@@ -655,7 +980,7 @@ def test_connector_cache_reads_safe_legacy_record_without_rewrite(
     # Default config keeps the experimental document_library connector off, so
     # the resolved builtins — and thus the cache key — are web_search only.
     fingerprint = connector_cache_fingerprint(
-        "test-key", "https://api.mistral.ai", ("web_search",)
+        api_key_principal("test-key"), "https://api.mistral.ai", ("web_search",)
     )
     cache_path = tmp_path / "connectors.json"
     cache_path.write_text(
@@ -675,12 +1000,12 @@ def test_connector_cache_reads_safe_legacy_record_without_rewrite(
         encoding="utf-8",
     )
     before = cache_path.read_bytes()
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False, cache_path=cache_path, clock=lambda: 1_100
     )
 
     # Do
-    result = service.read_catalog(_orchestrator())
+    result = await service.read_catalog(_orchestrator())
 
     # Assert
     assert result.disposition == "fresh_cache"
@@ -699,7 +1024,7 @@ async def test_connector_cache_round_trip_preserves_diagnostics_and_revision(
     cache_path = tmp_path / "connectors.json"
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         return {
             "connectors": [
@@ -710,18 +1035,18 @@ async def test_connector_cache_round_trip_preserves_diagnostics_and_revision(
             ]
         }
 
-    writer = ConnectorCatalogService(
+    writer = _service(
         implicit_source_enabled=False,
         cache_path=cache_path,
         fetch_bootstrap=fetch,
         clock=lambda: 1_000,
     )
     live = await writer.resolve_catalog(_orchestrator())
-    reader = ConnectorCatalogService(
+    reader = _service(
         implicit_source_enabled=False, cache_path=cache_path, clock=lambda: 1_001
     )
 
-    cached = reader.read_catalog(_orchestrator()).catalog
+    cached = (await reader.read_catalog(_orchestrator())).catalog
 
     assert live is not None
     assert cached is not None
@@ -731,6 +1056,17 @@ async def test_connector_cache_round_trip_preserves_diagnostics_and_revision(
         == live.connectors[0].diagnostics
         == ("Connector bootstrap issue: oauth_failed",)
     )
+
+
+def test_non_utf8_connector_cache_is_ignored_and_overwritten(tmp_path: Path) -> None:
+    cache_path = tmp_path / "connectors.json"
+    cache_path.write_bytes(b'{"k": "\xff"}')
+    cache = ConnectorCatalogCache(cache_path)
+
+    assert cache.read("first", now=1_000) is None
+
+    cache.write(_cache_catalog("first", "first"), stored_at=1_000)
+    assert cache.read("first", now=1_000) is not None
 
 
 def test_concurrent_connector_cache_writers_preserve_account_entries(
@@ -778,7 +1114,7 @@ def test_concurrent_connector_cache_writers_preserve_account_entries(
     [
         _v2_entry({"connectors": []}, stored_at=1_101),
         _v2_entry({"connectors": "not-a-list"}),
-        _v2_entry({"connectors": [_connector()]}, stored_at=500),
+        _v2_entry({"connectors": [_connector()]}, stored_at=1_100 - 7 * 24 * 3600),
     ],
     ids=["future", "malformed", "expired"],
 )
@@ -841,7 +1177,7 @@ async def test_successful_bootstrap_writes_redacted_bounded_v2(
     cache_path = tmp_path / "connectors.json"
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         return {
             "connectors": [
@@ -866,7 +1202,7 @@ async def test_successful_bootstrap_writes_redacted_bounded_v2(
             ]
         }
 
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
         cache_path=cache_path,
         fetch_bootstrap=fetch,
@@ -899,6 +1235,96 @@ async def test_successful_bootstrap_writes_redacted_bounded_v2(
     }
 
 
+def _bulky_bootstrap(
+    count: int, schema_bytes: int, *, tools: int = 1
+) -> dict[str, object]:
+    connectors = []
+    for index in range(count):
+        connector = _connector(connector_id=f"c-{index:03d}", name=f"conn{index:03d}")
+        connector["tools"] = [
+            {
+                "name": f"tool_{tool}",
+                "description": "Search",
+                "inputSchema": {"type": "object", "pad": "x" * schema_bytes},
+            }
+            for tool in range(tools)
+        ]
+        connectors.append(connector)
+    return {"connectors": connectors}
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_over_two_mib_loads_and_is_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    cache_path = tmp_path / "connectors.json"
+    payload = _bulky_bootstrap(60, 50 * 1024)
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return payload
+
+    service = _service(
+        cache_path=cache_path, fetch_bootstrap=fetch, clock=lambda: 1_000
+    )
+
+    catalog = await service.resolve_catalog(_orchestrator())
+
+    async def offline(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        raise TimeoutError("offline")
+
+    restarted = _service(
+        cache_path=cache_path, fetch_bootstrap=offline, clock=lambda: 1_000
+    )
+    cached = await restarted.resolve_catalog(_orchestrator())
+
+    assert catalog is not None
+    assert len(catalog.connectors) == 60
+    assert cached is not None
+    assert len(cached.connectors) == 60
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_over_the_cache_cap_loads_and_drops_the_older_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    cache_path = tmp_path / "connectors.json"
+    # 260 schemas just under the 64 KiB tool cap add up to more than 16 MiB.
+    payloads = [
+        {"connectors": [_connector()]},
+        _bulky_bootstrap(130, 64 * 1024 - 100, tools=2),
+    ]
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return payloads.pop(0)
+
+    service = _service(
+        cache_path=cache_path, fetch_bootstrap=fetch, clock=lambda: 1_000
+    )
+    await service.resolve_catalog(_orchestrator())
+
+    with caplog.at_level(logging.WARNING, logger="vibe"):
+        catalog = await service.resolve_catalog(_orchestrator(), force_refresh=True)
+
+    assert catalog is not None
+    assert len(catalog.connectors) == 130
+    assert json.loads(cache_path.read_text(encoding="utf-8")) == {}
+    rejected = [
+        record
+        for record in caplog.records
+        if getattr(record, "connector_operation", None) == "cache_write"
+        and getattr(record, "connector_outcome", None) == "rejected"
+    ]
+    assert len(rejected) == 1
+
+
 @pytest.mark.asyncio
 async def test_failed_forced_refresh_preserves_last_catalog(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -913,13 +1339,13 @@ async def test_failed_forced_refresh_preserves_last_catalog(
     should_fail = False
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         if should_fail:
             raise RuntimeError("raw private provider response")
         return {"connectors": [_connector()]}
 
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
         cache_path=cache_path,
         fetch_bootstrap=fetch,
@@ -933,7 +1359,7 @@ async def test_failed_forced_refresh_preserves_last_catalog(
     # Do
     with pytest.raises(ConnectorCatalogUnavailableError) as exc_info:
         await service.resolve_catalog(orchestrator, force_refresh=True)
-    retained = service.read_catalog(orchestrator)
+    retained = await service.read_catalog(orchestrator)
 
     # Assert
     assert "raw private provider response" not in str(exc_info.value)
@@ -942,7 +1368,8 @@ async def test_failed_forced_refresh_preserves_last_catalog(
     assert cache_path.read_bytes() == before
 
 
-def test_connector_aliases_are_collision_safe_and_missing_ids_are_ignored(
+@pytest.mark.asyncio
+async def test_connector_aliases_are_collision_safe_and_missing_ids_are_ignored(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """*Prepare*: A cache with colliding display names and one connector without an ID.
@@ -954,7 +1381,7 @@ def test_connector_aliases_are_collision_safe_and_missing_ids_are_ignored(
     # Default config keeps the experimental document_library connector off, so
     # the resolved builtins — and thus the cache key — are web_search only.
     fingerprint = connector_cache_fingerprint(
-        "test-key", "https://api.mistral.ai", ("web_search",)
+        api_key_principal("test-key"), "https://api.mistral.ai", ("web_search",)
     )
     cache_path = tmp_path / "connectors.json"
     cache_path.write_text(
@@ -972,12 +1399,12 @@ def test_connector_aliases_are_collision_safe_and_missing_ids_are_ignored(
         }),
         encoding="utf-8",
     )
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False, cache_path=cache_path, clock=lambda: 1_100
     )
 
     # Do
-    result = service.read_catalog(_orchestrator())
+    result = await service.read_catalog(_orchestrator())
 
     # Assert
     assert result.catalog is not None
@@ -997,11 +1424,11 @@ async def test_connector_aliases_and_revision_are_independent_of_payload_order(
     payloads = iter(({"connectors": [second, first]}, {"connectors": [first, second]}))
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         return next(payloads)
 
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
         cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
@@ -1027,7 +1454,7 @@ async def test_connector_collision_suffix_stays_within_public_name_limit(
     long_name = "x" * 256
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         return {
             "connectors": [
@@ -1036,7 +1463,7 @@ async def test_connector_collision_suffix_stays_within_public_name_limit(
             ]
         }
 
-    catalog = await ConnectorCatalogService(
+    catalog = await _service(
         implicit_source_enabled=False,
         cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
@@ -1400,164 +1827,60 @@ def test_selection_revision_changes_for_effective_source_and_tool_decisions() ->
 
 
 @pytest.mark.asyncio
-async def test_busy_convergence_retains_candidate_across_later_config_change(
+async def test_toggling_a_connector_to_its_current_state_succeeds(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("VIBE_API_KEY", "test-key")
-    fetch_count = 0
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
-        nonlocal fetch_count
-        fetch_count += 1
         return {"connectors": [_connector()]}
 
     orchestrator = _orchestrator()
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
         cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
     )
     catalog = await service.resolve_catalog(orchestrator)
     assert catalog is not None
-    initial_selection = service.resolve_selection(orchestrator, catalog)
     root = _BusyConnectorControl(
         orchestrator,
         SessionConnectorState(
             accepted_catalog_revision=catalog.revision,
-            accepted_selection_revision=initial_selection.selection_revision,
+            accepted_selection_revision=service.resolve_selection(
+                orchestrator, catalog
+            ).selection_revision,
             route_revision="routes:1",
             sources=(
                 SessionConnectorSourceState(
                     raw_id="connector-1",
                     alias="wiki",
                     display_name="wiki",
-                    status="disabled",
-                    tools=(
-                        SessionConnectorToolDescriptor(
-                            raw_name="search",
-                            description="Search docs",
-                            enabled=False,
-                            display_name="connector_wiki_search",
-                        ),
-                    ),
+                    status="connected",
                 ),
             ),
             discovery_errors={},
         ),
     )
+    root.catalog = catalog
+    root.busy = False
 
     async def notify(*_args: object) -> None:
         return None
 
-    with pytest.raises(SessionBackendError) as exc_info:
+    for _ in range(2):
         await service.dispatch(
             "connector_catalog/toggle",
-            {"sessionId": root.session_id, "alias": "wiki", "disabled": False},
-            root=cast(SessionBackend, root),
-            notify=notify,
-        )
-    assert exc_info.value.code is ProtocolErrorCode.CONFLICT
-    assert len(root.attempts) == 1
-    queued_catalog, queued_selection, queued_force = root.attempts[0]
-
-    await orchestrator.set_field("/connectors", [{"name": "wiki", "disabled": True}])
-    root.busy = False
-    assert (
-        await service.converge_pending_connector_candidate(
-            root.session_id, cast(SessionBackend, root)
-        )
-        is None
-    )
-
-    assert len(root.attempts) == 2
-    retried_catalog, retried_selection, retried_force = root.attempts[1]
-    assert retried_catalog is queued_catalog
-    assert retried_selection is queued_selection
-    assert retried_force is queued_force is False
-    assert orchestrator.config.connectors[0].disabled is True
-    assert retried_selection.connector_settings[0].disabled is False
-    assert root.state.accepted_selection_revision == queued_selection.selection_revision
-    assert fetch_count == 1
-
-
-@pytest.mark.asyncio
-async def test_successful_accept_discards_stale_pending_candidate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("VIBE_API_KEY", "test-key")
-
-    async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
-    ) -> object:
-        return {"connectors": [_connector()]}
-
-    orchestrator = _orchestrator()
-    service = ConnectorCatalogService(
-        implicit_source_enabled=False,
-        cache_path=tmp_path / "connectors.json",
-        fetch_bootstrap=fetch,
-    )
-    catalog = await service.resolve_catalog(orchestrator)
-    assert catalog is not None
-    initial_selection = service.resolve_selection(orchestrator, catalog)
-    root = _BusyConnectorControl(
-        orchestrator,
-        SessionConnectorState(
-            accepted_catalog_revision=catalog.revision,
-            accepted_selection_revision=initial_selection.selection_revision,
-            route_revision="routes:1",
-            sources=(
-                SessionConnectorSourceState(
-                    raw_id="connector-1",
-                    alias="wiki",
-                    display_name="wiki",
-                    status="disabled",
-                    tools=(
-                        SessionConnectorToolDescriptor(
-                            raw_name="search",
-                            description="Search docs",
-                            enabled=False,
-                            display_name="connector_wiki_search",
-                        ),
-                    ),
-                ),
-            ),
-            discovery_errors={},
-        ),
-    )
-
-    async def notify(*_args: object) -> None:
-        return None
-
-    with pytest.raises(SessionBackendError):
-        await service.dispatch(
-            "connector_catalog/toggle",
-            {"sessionId": root.session_id, "alias": "wiki", "disabled": False},
+            {"sessionId": root.session_id, "alias": "wiki", "disabled": True},
             root=cast(SessionBackend, root),
             notify=notify,
         )
 
-    root.busy = False
-    await service.dispatch(
-        "connector_catalog/toggle",
-        {"sessionId": root.session_id, "alias": "wiki", "disabled": True},
-        root=cast(SessionBackend, root),
-        notify=notify,
-    )
-    accepted_selection = root.attempts[1][1]
-
-    assert (
-        await service.converge_pending_connector_candidate(
-            root.session_id, cast(SessionBackend, root)
-        )
-        is None
-    )
-    assert len(root.attempts) == 2
-    assert root.state.accepted_selection_revision == (
-        accepted_selection.selection_revision
-    )
+    assert [connector.disabled for connector in orchestrator.config.connectors] == [
+        True
+    ]
 
 
 @pytest.mark.asyncio
@@ -1568,12 +1891,12 @@ async def test_toggle_applies_to_the_accepted_catalog_after_the_cache_expires(
     now = [1_000]
 
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         return {"connectors": [_connector()]}
 
     orchestrator = _orchestrator()
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
         cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
@@ -1600,6 +1923,7 @@ async def test_toggle_applies_to_the_accepted_catalog_after_the_cache_expires(
             discovery_errors={},
         ),
     )
+    root.catalog = catalog
     root.busy = False
     now[0] = 1_000 + 11 * 60
 
@@ -1624,7 +1948,7 @@ async def test_an_auth_event_for_another_session_is_dropped_not_raised() -> None
     *Assert*: It is dropped rather than failing the event loop that forwards it.
     """
     # Prepare
-    service = ConnectorCatalogService(implicit_source_enabled=False)
+    service = _service(implicit_source_enabled=False)
     root = MagicMock(spec=SessionBackend)
     root.session_id = "root-session"
 
@@ -1664,7 +1988,7 @@ async def _connect_fixture(
     tmp_path: Path, connected: list[bool]
 ) -> tuple[ConnectorCatalogService, _BusyConnectorControl]:
     async def fetch(
-        _base_url: str, _api_key: str, _builtins: tuple[str, ...] = ()
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
     ) -> object:
         if connected[0]:
             return {"connectors": [_connector()]}
@@ -1675,7 +1999,7 @@ async def _connect_fixture(
         return {"connectors": [no_auth]}
 
     orchestrator = _orchestrator()
-    service = ConnectorCatalogService(
+    service = _service(
         implicit_source_enabled=False,
         cache_path=tmp_path / "connectors.json",
         fetch_bootstrap=fetch,
@@ -1699,6 +2023,7 @@ async def _connect_fixture(
             discovery_errors={},
         ),
     )
+    root.catalog = catalog
     root.busy = False
     return service, root
 
@@ -1801,13 +2126,13 @@ async def test_connect_http_failure_reads_as_a_sentence_without_the_body(
     *Assert*: The message explains the status and never echoes the response body.
     """
     # Prepare
-    respx.post(
+    respx.patch(
         "https://api.example.test/v1/connectors/connector-1/user/credentials"
     ).respond(status, json={"detail": "internal trace id abc123"})
     provider = connector_catalog._ConnectorProvider(
         fingerprint="fingerprint",
         base_url="https://api.example.test",
-        api_key="test-key",
+        credentials=_key("test-key"),
         builtins=(),
     )
 
@@ -1830,13 +2155,13 @@ async def test_connect_without_credentials_creates_the_default_user_connection()
     *Assert*: It posts an empty default user connection, as the dashboard does.
     """
     # Prepare
-    route = respx.post(
+    route = respx.patch(
         "https://api.example.test/v1/connectors/connector-1/user/credentials"
     ).respond(json={"message": "ok"})
     provider = connector_catalog._ConnectorProvider(
         fingerprint="fingerprint",
         base_url="https://api.example.test",
-        api_key="test-key",
+        credentials=_key("test-key"),
         builtins=(),
     )
 
@@ -1849,3 +2174,609 @@ async def test_connect_without_credentials_creates_the_default_user_connection()
         "is_default": True,
         "credentials": {"headers": {}},
     }
+
+
+class _UserToken:
+    """A signed-in user's ID token with its tenant, as Desktop or the CLI
+    session resolves it.
+    """
+
+    async def resolve(self, target: PlatformCredentialTarget) -> object:
+        del target
+        return PlatformCredentialSnapshot(
+            kind="oidc_id_token",
+            headers={
+                "Authorization": "Bearer user-id-token",
+                "x-external-organization-id": "org",
+            },
+            cache_namespace="oidc_id_token:test",
+            revision="revision",
+            principal="oidc:v1:user",
+        )
+
+    async def reject(self, target: object, **_: object) -> object:
+        raise AssertionError("no request was refused")
+
+
+def _sending(
+    credentials: PlatformCredentialProvider,
+) -> connector_catalog._ConnectorProvider:
+    return connector_catalog._ConnectorProvider(
+        fingerprint="fingerprint",
+        base_url="https://api.example.test",
+        credentials=credentials,
+        builtins=(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("credentials", "expected"),
+    [
+        (_key("test-key"), {"authorization": "Bearer test-key"}),
+        (
+            _UserToken(),
+            {
+                "authorization": "Bearer user-id-token",
+                "x-external-organization-id": "org",
+            },
+        ),
+    ],
+    ids=["api_key", "user_token"],
+)
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_connector_sign_in_link_is_asked_with_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    credentials: PlatformCredentialProvider,
+    expected: dict[str, str],
+) -> None:
+    """*Prepare*: An auth URL endpoint, and an unrelated key in the environment.
+    *Do*: Ask for a connector's sign-in link.
+    *Assert*: The server receives the connection's credential, not an empty
+      bearer from the SDK nor the environment's key.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "environment-key")
+    route = respx.get(
+        "https://api.example.test/v1/connectors/connector-1/auth_url"
+    ).respond(json={"auth_url": "https://auth.example.test/start", "ttl": 60})
+
+    # Do
+    url = await connector_catalog._connector_auth_url(
+        _sending(credentials), "connector-1"
+    )
+
+    # Assert
+    assert url == "https://auth.example.test/start"
+    sent = route.calls.last.request.headers
+    assert {name: sent.get(name) for name in expected} == expected
+
+
+@pytest.mark.parametrize(
+    ("credentials", "expected"),
+    [(_key("test-key"), "Bearer test-key"), (_UserToken(), "Bearer user-id-token")],
+    ids=["api_key", "user_token"],
+)
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_no_auth_connector_is_connected_with_the_credential(
+    credentials: PlatformCredentialProvider, expected: str
+) -> None:
+    """*Prepare*: The connector credentials endpoint accepts the request.
+    *Do*: Connect a no-auth connector.
+    *Assert*: The server receives the connection's credential.
+    """
+    # Prepare
+    route = respx.patch(
+        "https://api.example.test/v1/connectors/connector-1/user/credentials"
+    ).respond(json={"message": "ok"})
+
+    # Do
+    await connector_catalog._connect_without_credentials(
+        _sending(credentials), "connector-1"
+    )
+
+    # Assert
+    assert route.calls.last.request.headers["authorization"] == expected
+
+
+def _app_tool(name: str, meta: object) -> dict[str, object]:
+    return {"name": name, "inputSchema": {}, "_meta": meta}
+
+
+def test_resolve_reads_tool_apps_as_the_cloud_runtime_does() -> None:
+    """*Prepare*: Tool `_meta` in each shape the cloud Runtime reads
+      (agents/harness/runtimes/python/.../capabilities/mcp_annotations.py).
+      The bootstrap passes `_meta` through: integrations/.../schemas/api/tool.py.
+    *Do*: Resolve the catalog.
+    *Assert*: Each tool keeps the app it may render, and only app-only tools
+      are hidden from the model.
+    """
+    # Prepare
+    connector = _connector(connector_id="charts/raw", name="charts")
+    connector["tools"] = [
+        _app_tool("camel", {"ui": {"resourceUri": "ui://charts/a"}}),
+        _app_tool("snake", {"ui": {"resource_uri": " ui://charts/b "}}),
+        _app_tool("flat", {"ui/resourceUri": "ui://charts/c"}),
+        _app_tool(
+            "app_only", {"ui": {"resourceUri": "ui://charts/a", "visibility": ["app"]}}
+        ),
+        _app_tool(
+            "model_only",
+            {"ui": {"resourceUri": "ui://charts/a", "visibility": ["model"]}},
+        ),
+        # An unknown visibility reads as none declared: both may call it.
+        _app_tool(
+            "unknown",
+            {"ui": {"resourceUri": "ui://charts/a", "visibility": ["app", "x"]}},
+        ),
+        _app_tool(
+            "malformed", {"ui": {"resourceUri": "ui://charts/a", "visibility": [{}]}}
+        ),
+        _app_tool("not_ui", {"ui": {"resourceUri": "https://charts/a"}}),
+        _app_tool("empty", {"ui": {"resourceUri": "ui://"}}),
+    ]
+
+    # Do
+    catalog = connector_catalog._resolve_catalog(
+        {"connectors": [connector]}, "fingerprint"
+    )
+
+    # Assert
+    assert {
+        tool.raw_name: tool.ui_resource_uri for tool in catalog.connectors[0].tools
+    } == {
+        "camel": "ui://charts/a",
+        "snake": "ui://charts/b",
+        "flat": "ui://charts/c",
+        "model_only": None,
+        "unknown": "ui://charts/a",
+        "malformed": "ui://charts/a",
+        "not_ui": None,
+        "empty": None,
+    }
+
+
+def test_tool_apps_survive_the_cache() -> None:
+    connector = _connector(connector_id="charts/raw", name="charts")
+    connector["tools"] = [_app_tool("show", {"ui": {"resourceUri": "ui://charts/a"}})]
+    live = connector_catalog._resolve_catalog(
+        {"connectors": [connector]}, "fingerprint"
+    )
+
+    hit = connector_catalog._parse_cache_entry(
+        "fingerprint", connector_catalog._cache_entry(live, stored_at=1_000), now=1_000
+    )
+
+    assert hit is not None
+    assert hit.catalog == live
+
+
+def test_a_catalog_without_apps_keeps_its_revision() -> None:
+    """A session that accepted a catalog before tool apps keeps it accepted."""
+    catalog = connector_catalog._resolve_catalog(
+        {"connectors": [_connector()]}, "fingerprint"
+    )
+
+    # The revision this catalog had before tools could carry an app.
+    assert catalog.revision == (
+        "e0d14aaca4602eedef506f4a9db7064aacb38f13eba6dd4125b49f65e6f4fa50"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_from_one_channel_reaches_every_session_following_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: Two channels of one process, a session following the catalog
+      on the second, and a connector the user connects meanwhile.
+    *Do*: Refresh from the first channel.
+    *Assert*: One fetch, and the second channel's session sees the new
+      catalog due, without asking for it.
+    """
+    from vibe.app_server._remote_follower import RemoteFollower
+
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    connected = [False]
+    fetches = 0
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        nonlocal fetches
+        fetches += 1
+        return {"connectors": [_connector(ready=connected[0])]}
+
+    shared = SharedConnectorCatalog(
+        cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch
+    )
+    orchestrator = _orchestrator()
+
+    async def sessionless() -> FakeConfigOrchestrator[VibeConfigSchema]:
+        return orchestrator
+
+    first = ConnectorCatalogService(
+        shared, implicit_source_enabled=False, sessionless_catalog_factory=sessionless
+    )
+    second = ConnectorCatalogService(shared, implicit_source_enabled=False)
+    before = await second.resolve_catalog(orchestrator)
+    source = await second.follow(orchestrator)
+    assert source is not None
+    follower = RemoteFollower(source, loaded=before)
+    connected[0] = True
+
+    # Do
+    await first.dispatch("connector_catalog/refresh", {}, root=None, notify=AsyncMock())
+
+    # Assert
+    assert fetches == 2
+    assert follower.due
+    taken = follower.take()
+    assert taken is not None
+    assert [connector.ready for connector in taken.connectors] == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_disconnected_connector_leaves_the_followed_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A session following a catalog with two connectors.
+    *Do*: Disconnect one upstream, then refresh.
+    *Assert*: The catalog due for the session no longer has it.
+    """
+    from vibe.app_server._remote_follower import RemoteFollower
+
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    connectors = [
+        _connector(connector_id="wiki", name="wiki"),
+        _connector(connector_id="linear", name="linear"),
+    ]
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return {"connectors": list(connectors)}
+
+    service = _service(cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch)
+    orchestrator = _orchestrator()
+    loaded = await service.resolve_catalog(orchestrator)
+    source = await service.follow(orchestrator)
+    assert source is not None
+    follower = RemoteFollower(source, loaded=loaded)
+    connectors.pop()
+
+    # Do
+    await service.resolve_catalog(orchestrator, force_refresh=True)
+
+    # Assert
+    taken = follower.take()
+    assert taken is not None
+    assert [connector.alias for connector in taken.connectors] == ["wiki"]
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_that_changes_nothing_leaves_no_catalog_due(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A session following the catalog it runs.
+    *Do*: Refresh with nothing changed upstream.
+    *Assert*: Nothing is due, so the session's tools and prompt cache stay.
+    """
+    from vibe.app_server._remote_follower import RemoteFollower
+
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return {"connectors": [_connector()]}
+
+    service = _service(cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch)
+    orchestrator = _orchestrator()
+    loaded = await service.resolve_catalog(orchestrator)
+    source = await service.follow(orchestrator)
+    assert source is not None
+    follower = RemoteFollower(source, loaded=loaded)
+
+    # Do
+    await service.resolve_catalog(orchestrator, force_refresh=True)
+
+    # Assert
+    assert not follower.due
+
+
+@pytest.mark.asyncio
+async def test_a_sessionless_refresh_fetches_every_account_a_session_follows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: Sessions following two API keys.
+    *Do*: Refresh with no session, as a client reporting a change does.
+    *Assert*: Both accounts are fetched again, once each.
+    """
+    # Prepare
+    keys: list[str] = []
+
+    async def fetch(
+        base_url: str,
+        credentials: PlatformCredentialProvider,
+        _builtins: tuple[str, ...] = (),
+    ) -> object:
+        keys.append(await _sent_api_key(credentials, base_url))
+        return {"connectors": [_connector()]}
+
+    async def sessionless() -> FakeConfigOrchestrator[VibeConfigSchema]:
+        return _orchestrator()
+
+    service = ConnectorCatalogService(
+        SharedConnectorCatalog(
+            cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch
+        ),
+        implicit_source_enabled=False,
+        sessionless_catalog_factory=sessionless,
+    )
+    for key in ("key-a", "key-b"):
+        monkeypatch.setenv("VIBE_API_KEY", key)
+        await service.resolve_catalog(_orchestrator())
+        await service.follow(_orchestrator())
+    keys.clear()
+
+    # Do
+    await service.dispatch(
+        "connector_catalog/refresh", {}, root=None, notify=AsyncMock()
+    )
+
+    # Assert
+    assert sorted(keys) == ["key-a", "key-b"]
+
+
+@pytest.mark.asyncio
+async def test_a_released_account_is_not_refetched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A session that followed an old API key, then let it go.
+    *Do*: Refresh with no session under the new key.
+    *Assert*: Only the new key is fetched: the old one, signed out or rotated,
+      is not used again.
+    """
+    # Prepare
+    keys: list[str] = []
+
+    async def fetch(
+        base_url: str,
+        credentials: PlatformCredentialProvider,
+        _builtins: tuple[str, ...] = (),
+    ) -> object:
+        keys.append(await _sent_api_key(credentials, base_url))
+        return {"connectors": [_connector()]}
+
+    async def sessionless() -> FakeConfigOrchestrator[VibeConfigSchema]:
+        return _orchestrator()
+
+    service = ConnectorCatalogService(
+        SharedConnectorCatalog(
+            cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch
+        ),
+        implicit_source_enabled=False,
+        sessionless_catalog_factory=sessionless,
+    )
+    monkeypatch.setenv("VIBE_API_KEY", "old-key")
+    followed = await service.follow(_orchestrator())
+    assert followed is not None
+    followed.release()
+    monkeypatch.setenv("VIBE_API_KEY", "new-key")
+    keys.clear()
+
+    # Do
+    await service.dispatch(
+        "connector_catalog/refresh", {}, root=None, notify=AsyncMock()
+    )
+
+    # Assert
+    assert keys == ["new-key"]
+
+
+@pytest.mark.asyncio
+async def test_a_kept_refresh_lands_on_the_catalog_held_when_the_turn_ends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A refresh kept for a busy session, then a newer catalog
+      fetched by another refresh before its turn ends.
+    *Do*: End the turn.
+    *Assert*: The session takes the newer catalog, not the one kept earlier.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    payloads = iter([
+        {"connectors": [_connector()]},
+        {"connectors": [_connector(tool_name="kept")]},
+        {"connectors": [_connector(tool_name="newer")]},
+    ])
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return next(payloads)
+
+    service = _service(cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch)
+    orchestrator = _orchestrator()
+    catalog = await service.resolve_catalog(orchestrator)
+    assert catalog is not None
+    root = _BusyConnectorControl(
+        orchestrator,
+        SessionConnectorState(
+            accepted_catalog_revision=catalog.revision,
+            accepted_selection_revision="selection:1",
+            route_revision="routes:1",
+            sources=(),
+            discovery_errors={},
+        ),
+    )
+    root.catalog = catalog
+    with pytest.raises(SessionBackendError):
+        await service.dispatch(
+            "connector_catalog/refresh",
+            {"sessionId": root.session_id},
+            root=cast(SessionBackend, root),
+            notify=AsyncMock(),
+        )
+    newer = await service.resolve_catalog(orchestrator, force_refresh=True)
+    root.busy = False
+
+    # Do
+    await service.converge_pending_connector_candidate(
+        root.session_id, cast(SessionBackend, root)
+    )
+
+    # Assert
+    assert newer is not None
+    assert root.catalog == newer
+
+
+@pytest.mark.asyncio
+async def test_a_kept_refresh_the_turn_boundary_already_applied_is_not_forced_again(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A refresh kept for a busy session, whose turn boundary then
+      moves the session to the refreshed catalog.
+    *Do*: End the turn.
+    *Assert*: The kept refresh is no longer forced, so the session does not
+      push the catalog it already runs to Core a second time.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    payloads = iter([
+        {"connectors": [_connector()]},
+        {"connectors": [_connector(tool_name="refreshed")]},
+    ])
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return next(payloads)
+
+    service = _service(cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch)
+    orchestrator = _orchestrator()
+    catalog = await service.resolve_catalog(orchestrator)
+    assert catalog is not None
+    root = _BusyConnectorControl(
+        orchestrator,
+        SessionConnectorState(
+            accepted_catalog_revision=catalog.revision,
+            accepted_selection_revision="selection:1",
+            route_revision="routes:1",
+            sources=(),
+            discovery_errors={},
+        ),
+    )
+    root.catalog = catalog
+    with pytest.raises(SessionBackendError):
+        await service.dispatch(
+            "connector_catalog/refresh",
+            {"sessionId": root.session_id},
+            root=cast(SessionBackend, root),
+            notify=AsyncMock(),
+        )
+    refreshed, selection, _forced = root.attempts[-1]
+    root.busy = False
+    await root.reconfigure_connectors(refreshed, selection, force=False)
+
+    # Do
+    await service.converge_pending_connector_candidate(
+        root.session_id, cast(SessionBackend, root)
+    )
+
+    # Assert
+    assert root.attempts[-1] == (refreshed, selection, False)
+
+
+@pytest.mark.asyncio
+async def test_a_sessionless_refresh_without_an_api_key_still_fetches_followed_accounts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """*Prepare*: A session following an account, and a process config with no
+      API key of its own.
+    *Do*: Refresh with no session, as a client reporting a change does.
+    *Assert*: The followed account is fetched again.
+    """
+    # Prepare
+    keys: list[str] = []
+
+    async def fetch(
+        base_url: str,
+        credentials: PlatformCredentialProvider,
+        _builtins: tuple[str, ...] = (),
+    ) -> object:
+        keys.append(await _sent_api_key(credentials, base_url))
+        return {"connectors": [_connector()]}
+
+    async def sessionless() -> FakeConfigOrchestrator[VibeConfigSchema]:
+        return _orchestrator()
+
+    service = ConnectorCatalogService(
+        SharedConnectorCatalog(
+            cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch
+        ),
+        implicit_source_enabled=False,
+        sessionless_catalog_factory=sessionless,
+    )
+    monkeypatch.setenv("VIBE_API_KEY", "session-key")
+    await service.follow(_orchestrator())
+    monkeypatch.delenv("VIBE_API_KEY")
+    keys.clear()
+
+    # Do
+    await service.dispatch(
+        "connector_catalog/refresh", {}, root=None, notify=AsyncMock()
+    )
+
+    # Assert
+    assert keys == ["session-key"]
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "rejected"])
+@pytest.mark.asyncio
+async def test_a_fetch_records_how_its_cache_write_went(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """*Prepare*: A cache file that can be written, cannot be, or refuses the entry.
+    *Do*: Fetch the catalog.
+    *Assert*: The cache write is recorded with its outcome, as before the
+      process service.
+    """
+    # Prepare
+    monkeypatch.setenv("VIBE_API_KEY", "test-key")
+    recorded: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        connector_catalog,
+        "record_connector_catalog_operation",
+        lambda _elapsed, *, operation, outcome, backend: recorded.append((
+            operation,
+            outcome,
+        )),
+    )
+    if outcome == "failure":
+
+        def fail(*_: object, **__: object) -> bool:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(connector_catalog.ConnectorCatalogCache, "write", fail)
+    if outcome == "rejected":
+        monkeypatch.setattr(
+            connector_catalog.ConnectorCatalogCache, "write", lambda *_, **__: False
+        )
+
+    async def fetch(
+        _base_url: str, _credentials: object, _builtins: tuple[str, ...] = ()
+    ) -> object:
+        return {"connectors": [_connector()]}
+
+    service = _service(cache_path=tmp_path / "connectors.json", fetch_bootstrap=fetch)
+
+    # Do
+    await service.resolve_catalog(_orchestrator(), force_refresh=True)
+
+    # Assert
+    assert ("cache_write", outcome) in recorded

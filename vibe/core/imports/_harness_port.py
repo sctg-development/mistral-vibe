@@ -22,6 +22,8 @@ class ImportProject:
     name: str
     cwd: Path
     source_cwd: Path | None = None
+    # The folder's saved link or local project, if any.
+    project_id: str | None = None
 
 
 class ImportProjectProvisioner(Protocol):
