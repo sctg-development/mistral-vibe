@@ -49,6 +49,16 @@ else
   ko "the pool is not consulted before the single key (lines: pool=${pooled_line:-none} single=${single_line:-none})"
 fi
 
+# --- Runtime dependencies: httpx is a DEV dependency, the runtime client is httpx2 ----------------------------
+# A stray `import httpx` passes every test (the dev environment has it) and crashes the packaged app at startup.
+# scripts/fork-sync/check-runtime-imports.py is the exact check; this one is the cheap static version of it.
+if grep -rEn '^[[:space:]]*(import httpx$|from httpx )' vibe --include='*.py' >/dev/null 2>&1; then
+  ko "a vibe module imports httpx, a dev-only dependency (use httpx2)"
+else
+  ok "no vibe module imports the dev-only httpx"
+fi
+has_file scripts/fork-sync/check-runtime-imports.py
+
 # --- Rename MISTRAL_API_KEY -> VIBE_API_KEY (only the Vibe sign-in key) --------------------------------------
 has_text vibe/core/config/_defaults.py 'DEFAULT_MISTRAL_API_ENV_KEY = "VIBE_API_KEY"' "Python default env key is VIBE_API_KEY"
 has_text vibe/cli-rust/src/setup/wizard/context.rs 'DEFAULT_MISTRAL_API_ENV_KEY: &str = "VIBE_API_KEY"' "Rust default env key is VIBE_API_KEY"

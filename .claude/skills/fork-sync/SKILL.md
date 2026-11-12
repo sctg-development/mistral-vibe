@@ -75,7 +75,11 @@ The workflow runs a deterministic pre-check first and tells you its result: `beh
 5. Check what is left of the old names in source: `git grep -n MISTRAL_API_KEY -- vibe ':!vibe/cli-rust'`.
 6. `bash scripts/fork-sync/check-fork-invariants.sh`. It must end with `0 failed`. On a failure, read the failing
    line, fix the cause, run it again. After two failed attempts, stop.
-7. `uv sync --all-extras`, then `uv run ruff check .`, `uv run ruff format --check .`.
+7. `uv sync --all-extras`, then `uv run ruff check .`, `uv run ruff format --check .`, then
+   `uv run python scripts/fork-sync/check-runtime-imports.py`. The last one matters: tests run with the dev
+   dependencies, the released app does not have them. Upstream moves packages between runtime and dev groups
+   (it replaced `httpx` by `httpx2` and kept `httpx` for tests only); fork code must follow, e.g. `key_pool.py`
+   uses `httpx2`. A stray import passes every test and crashes the packaged binary at startup.
 8. Rebuild the Rust CLI before any test that starts `vibe`: `cargo build --release --locked --manifest-path
    vibe/cli-rust/Cargo.toml --bin vibe-rs $CARGO_BUILD_FLAGS` (the variable is `--no-default-features`: the runner has no ALSA,
    which the voice feature needs). A stale `vibe-rs` makes the e2e tests report the OLD version
