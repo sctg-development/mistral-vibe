@@ -1206,6 +1206,7 @@ class UnifiedSessionContext:
     account_gateway: AccountGateway | None = None
     identity_gateway: IdentityGateway | None = None
     platform_credentials: PlatformCredentialProviderFactory | None = None
+    account_credentials: PlatformCredentialProviderFactory | None = None
     # The session's credential for a provider by name, as its model calls
     # resolve it: what side calls (narration, image description) send. None
     # outside a process: they read the API key.
@@ -7642,12 +7643,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._account_controller = AccountController(
             _UnifiedAccountHost(context),
             context.account_gateway,
-            credentials=context.platform_credentials,
+            credentials=context.account_credentials or context.platform_credentials,
         )
         self._identity_controller = IdentityController(
             _UnifiedIdentityHost(context),
             context.identity_gateway,
-            context.platform_credentials,
+            context.account_credentials or context.platform_credentials,
         )
         self._skills_controller = SkillsController(
             _UnifiedSkillsHost(
@@ -10818,7 +10819,7 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         self._account_controller = AccountController(
             _UnifiedAccountHost(context),
             context.account_gateway,
-            credentials=context.platform_credentials,
+            credentials=context.account_credentials or context.platform_credentials,
         )
         # Followed again below, from what the new context was built under.
         self._close_org_config()
@@ -10867,12 +10868,12 @@ class UnifiedHarnessBackendAdapter(  # noqa: PLR0904 - implements app-server ses
         account_controller = AccountController(
             _UnifiedAccountHost(context),
             context.account_gateway,
-            credentials=context.platform_credentials,
+            credentials=context.account_credentials or context.platform_credentials,
         )
         identity_controller = IdentityController(
             _UnifiedIdentityHost(context),
             context.identity_gateway,
-            context.platform_credentials,
+            context.account_credentials or context.platform_credentials,
         )
         skills_controller = SkillsController(
             _UnifiedSkillsHost(

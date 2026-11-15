@@ -177,6 +177,14 @@ pub struct Cli {
     #[arg(long = "check-upgrade", action = ArgAction::SetTrue, overrides_with = "check_upgrade")]
     pub check_upgrade: bool,
 
+    /// Keep the configured key pool order instead of shuffling it.
+    #[arg(long = "static-pool", action = ArgAction::SetTrue, overrides_with = "static_pool")]
+    pub static_pool: bool,
+
+    /// Rotate pooled keys on every model call rather than only on rejection.
+    #[arg(long = "agressive-rotation", action = ArgAction::SetTrue, overrides_with = "agressive_rotation")]
+    pub agressive_rotation: bool,
+
     /// Print the pooled Mistral API keys in clear text with the account each belongs to (duplicates are flagged), then exit.
     #[arg(long = "list-keys", action = ArgAction::SetTrue)]
     pub list_keys: bool,

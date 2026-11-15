@@ -3,6 +3,13 @@ use clap::Parser;
 use vibe_rs::cli::{Cli, HeadlessSession, OutputFormat};
 
 #[test]
+fn pool_rotation_flags_parse() {
+    let cli = Cli::parse_from(["vibe-rs", "--static-pool", "--agressive-rotation"]);
+    assert!(cli.static_pool);
+    assert!(cli.agressive_rotation);
+}
+
+#[test]
 fn no_prompt_is_interactive() {
     let cli = Cli::parse_from(["vibe-rs"]);
     assert!(!cli.is_headless());

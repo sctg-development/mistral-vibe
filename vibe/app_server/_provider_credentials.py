@@ -29,10 +29,15 @@ from vibe.core.platform_auth import (
     ApiKeyPlatformCredentialProvider,
     PlatformCredentialFactory,
     PlatformCredentialIdentity,
+    PlatformCredentialProvider,
     PlatformCredentialRequired,
     PlatformCredentialSnapshot,
 )
-from vibe.core.platform_auth._mistral import platform_target, resolve_snapshot
+from vibe.core.platform_auth._mistral import (
+    api_key_credentials,
+    platform_target,
+    resolve_snapshot,
+)
 from vibe.core.types import Backend
 from vibe.observability.logging import logger
 from vibe.utils.api_keys import (
@@ -77,6 +82,7 @@ class ProviderCredentialService:
         select_provider: ProviderSelector | None = None,
         credentials: Mapping[str, str] | None = None,
         platform_credentials: PlatformCredentialFactory | None = None,
+        pools: dict[tuple[str, ...], KeyPool] | None = None,
     ) -> None:
         self._orchestrator = orchestrator
         # The connection's first-party credential, for a Mistral provider only:
@@ -102,10 +108,8 @@ class ProviderCredentialService:
         # asks to update Vibe or sign in again.
         self._refused_after_refresh: set[str] = set()
         self._lock = asyncio.Lock()
-        # Pooled accounts (``VIBE_API_KEYS``): each resolution takes the next
-        # account, and a rejection parks the account that was sent. The lease
-        # is found again by the revision the Harness reports back.
-        self._pools: dict[tuple[str, ...], KeyPool] = {}
+        # A rejection parks the pooled account identified by its revision.
+        self._pools = pools if pools is not None else {}
         self._leases: dict[str, tuple[KeyPool, KeyLease]] = {}
 
     async def resolve(self) -> ProviderCredentialResult:
@@ -235,7 +239,15 @@ class ProviderCredentialService:
             and _first_party(provider)
             and not run_key
         ):
-            return await self._platform_snapshot(provider)
+            platform = self._platform_credentials(provider.api_key_env_var)
+            if (
+                isinstance(platform, ApiKeyPlatformCredentialProvider)
+                and platform.uses_process_key
+            ):
+                pooled = await asyncio.to_thread(self._pooled_snapshot, provider)
+                if pooled is not None:
+                    return pooled
+            return await self._platform_snapshot(provider, platform)
         snapshot = await asyncio.to_thread(self._pooled_snapshot, provider)
         if snapshot is None:
             snapshot = await asyncio.to_thread(
@@ -255,13 +267,11 @@ class ProviderCredentialService:
         )
 
     async def _platform_snapshot(
-        self, provider: ProviderConfig
+        self, provider: ProviderConfig, credentials: PlatformCredentialProvider
     ) -> ProviderCredentialSnapshot | ProviderAuthRequired | None:
         """The connection's credential for the provider's endpoint, never a
         fall back to an API key. ``None`` reads as a missing API key.
         """
-        assert self._platform_credentials is not None
-        credentials = self._platform_credentials(provider.api_key_env_var)
         resolved = await resolve_snapshot(credentials, provider.api_base)
         if isinstance(resolved, PlatformCredentialRequired):
             return _credential_required(
@@ -320,15 +330,13 @@ class ProviderCredentialService:
         )
 
     def _pooled_snapshot(
-        self, provider: ProviderConfig
+        self, provider: ProviderConfig, *, for_account: bool = False
     ) -> ProviderCredentialSnapshot | None:
         """The next pooled account's credential, or ``None`` without a pool.
 
-        Several accounts spread the load: the least recently used one with
-        room goes first (the prompt cache is sacrificed on purpose), and an
-        account that refused its key is skipped while it cools down. Only the
-        refusals the Harness reports (401, 403) park an account; the Unified
-        path's own transport hides rate-limit headers from the pool.
+        An account is retained until rejected, unless aggressive rotation is
+        enabled. The Harness reports only 401 and 403 rejections; its transport
+        hides rate limits and their headers from the pool.
         """
         env_var = provider.api_key_env_var
         if not env_var or provider.uses_vertex:
@@ -343,13 +351,18 @@ class ProviderCredentialService:
             keys.insert(0, primary[0])
         if len(keys) < _MIN_POOL_SIZE:
             return None
-        pool = self._pools.setdefault(tuple(keys), KeyPool(keys))
-        lease = pool.acquire()
+        pool_key = tuple(keys)
+        pool = self._pools.get(pool_key)
+        if pool is None:
+            pool = self._pools.setdefault(pool_key, KeyPool(keys))
+        lease = pool.acquire(rotate=not for_account)
         if lease is None:
             return None
-        pool.report_success(lease)
-        pool.report_headroom(lease, {})
-        note_active_key(lease.key)
+        pool.note_active(lease.key)
+        if not for_account:
+            pool.report_success(lease)
+            pool.report_headroom(lease, {})
+            note_active_key(lease.key)
         origin = _pooled_origin(env_var, lease.key, primary)
         snapshot = _snapshot(
             provider,
@@ -357,10 +370,25 @@ class ProviderCredentialService:
             _headers(provider, lease.key),
             api_key_source=origin.describe(),
         )
-        if len(self._leases) >= _MAX_TRACKED_LEASES:
-            self._leases.pop(next(iter(self._leases)))
-        self._leases[snapshot.revision] = (pool, lease)
+        if not for_account:
+            if len(self._leases) >= _MAX_TRACKED_LEASES:
+                self._leases.pop(next(iter(self._leases)))
+            self._leases[snapshot.revision] = (pool, lease)
         return snapshot
+
+    def account_credentials(self, env_var: str) -> PlatformCredentialProvider:
+        platform = (self._platform_credentials or api_key_credentials)(env_var)
+        provider = self._orchestrator.config.get_mistral_provider()
+        if (
+            provider is not None
+            and provider.api_key_env_var == env_var
+            and isinstance(platform, ApiKeyPlatformCredentialProvider)
+            and platform.uses_process_key
+        ):
+            snapshot = self._pooled_snapshot(provider, for_account=True)
+            if snapshot is not None and snapshot.token:
+                return ApiKeyPlatformCredentialProvider.from_api_key(snapshot.token)
+        return platform
 
     def _provider_name(self) -> str:
         try:

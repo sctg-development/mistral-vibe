@@ -1059,6 +1059,14 @@ Tool, skill, and agent names support three matching modes:
 
 ## CLI Parameters
 
+This fork shuffles pooled API keys at initialization and keeps the selected key
+until rejection. `--static-pool` (or non-empty `VIBE_POOL_STATIC`) preserves
+their order; `--agressive-rotation` (or non-empty
+`VIBE_POOL_AGRESSIVE_ROTATION`) rotates on each model call. Together the flags
+restore the old behavior. `/whoami` reads the selected pooled account without
+rotating it. The Unified harness reports only 401/403 rejections, not 429
+rate limits, to the pool. See `docs/key-pool.md`.
+
 ```
 vibe [PROMPT]                       # Start interactive session with optional prompt
 vibe -p TEXT / --prompt TEXT         # Programmatic mode using `default_agent`, one-shot, exit. Calls needing approval are denied, so an agent's `[tools.bash] allowlist` limits the shell to those commands

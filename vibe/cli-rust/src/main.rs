@@ -46,6 +46,12 @@ async fn run() -> Result<std::process::ExitCode> {
         }
         Err(error) => error.exit(),
     };
+    if cli.static_pool {
+        std::env::set_var("VIBE_POOL_STATIC", "1");
+    }
+    if cli.agressive_rotation {
+        std::env::set_var("VIBE_POOL_AGRESSIVE_ROTATION", "1");
+    }
     let acp_setup = vibe_rs::startup::init_entrypoint(cli.setup);
     let invocation_cwd = std::env::current_dir().ok();
     // Resolve the headless paths right after parse, before --workdir changes

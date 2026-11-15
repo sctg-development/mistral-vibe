@@ -33,6 +33,10 @@ class ApiKeyPlatformCredentialProvider:
         provider._fixed_api_key = api_key
         return provider
 
+    @property
+    def uses_process_key(self) -> bool:
+        return self._fixed_api_key is None
+
     def pinned(self) -> ApiKeyPlatformCredentialProvider:
         """This provider fixed to the key it resolves now: for a caller that
         keys state on the key and must fetch with that same key later, whatever

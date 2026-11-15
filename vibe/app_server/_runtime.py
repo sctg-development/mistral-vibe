@@ -627,6 +627,7 @@ if TYPE_CHECKING:
     from vibe.app_server._unified_import_writer import UnifiedSessionImportWriter
     from vibe.app_server.server import AppServer
     from vibe.core.config import ProviderConfig
+    from vibe.core.llm.key_pool import KeyPool
     from vibe.core.platform_auth import PlatformCredentialFactory
     from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
 
@@ -1745,10 +1746,12 @@ class HarnessProcess:
         # Constructed once per session rather than per derivation: it holds the
         # set of revisions a provider has refused, and a service rebuilt on
         # every derivation would forget them and re-send a rejected key.
+        pools: dict[tuple[str, ...], KeyPool] = {}
         credentials = ProviderCredentialService(
             config_orchestrator,
             credentials=self._credentials,
             platform_credentials=self.credentials,
+            pools=pools,
         )
 
         # A route's endpoint is fixed at derivation, so its key is pinned to the
@@ -1763,6 +1766,7 @@ class HarnessProcess:
                     select_provider=_named_provider(provider_name),
                     credentials=self._credentials,
                     platform_credentials=self.credentials,
+                    pools=pools,
                 )
             return utility_credentials[provider_name]
 
@@ -2383,6 +2387,7 @@ class HarnessProcess:
             connector_base_url=connector_base_url,
             # The gateway resolves the connection's credential per call.
             platform_credentials=self.credentials,
+            account_credentials=credentials.account_credentials,
             provider_credentials=credentials_for,
             preflight=preflight,
             correlation=correlation,

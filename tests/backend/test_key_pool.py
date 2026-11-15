@@ -12,6 +12,12 @@ KEYS = ["key-a", "key-b", "key-c"]
 URL = "https://api.mistral.ai/v1/chat/completions"
 
 
+@pytest.fixture(autouse=True)
+def _legacy_pool_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VIBE_POOL_STATIC", "1")
+    monkeypatch.setenv("VIBE_POOL_AGRESSIVE_ROTATION", "1")
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 1_000_000.0
@@ -70,6 +76,33 @@ def test_pool_needs_two_distinct_keys() -> None:
     pool = KeyPool.from_environment("X", primary="a", environ={"XS": "b,c"})
     assert pool is not None
     assert pool.keys == ("a", "b", "c")
+
+
+@pytest.mark.parametrize("static", ["", "0"])
+def test_pool_shuffles_only_when_static_is_empty(
+    monkeypatch: pytest.MonkeyPatch, static: str
+) -> None:
+    monkeypatch.setenv("VIBE_POOL_STATIC", static)
+    monkeypatch.setattr("vibe.core.llm.key_pool.random.shuffle", list.reverse)
+    pool = KeyPool(["a", "b", "a", "c"])
+    assert pool.keys == (("a", "b", "c") if static else ("c", "b", "a"))
+
+
+@pytest.mark.asyncio
+async def test_default_pool_sticks_until_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("VIBE_POOL_AGRESSIVE_ROTATION")
+    upstream = _Upstream({"key-a": [httpx2.Response(200, headers=_limits(1))]})
+    client, _ = _client(tmp_path, upstream, _Clock())
+
+    await _post(client)
+    await _post(client)
+    upstream.script["key-a"] = [httpx2.Response(429)]
+    await _post(client)
+    await _post(client)
+
+    assert upstream.seen == ["key-a", "key-a", "key-a", "key-b", "key-b"]
 
 
 @pytest.mark.asyncio

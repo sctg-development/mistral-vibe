@@ -10,7 +10,7 @@ Goal: use many Vibe accounts (`mstrl_…` keys from `vibe --setup`, one per
 account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 
 ### Files that are ours alone (no upstream counterpart, no merge conflict)
-- `vibe/core/llm/key_pool.py` — pool (even spread: least-recent account with room, prompt cache sacrificed on purpose), cooldowns, rate-limit headroom
+- `vibe/core/llm/key_pool.py` — pool (shuffled at initialization and sticky until rejection by default; optional aggressive spreading), cooldowns, rate-limit headroom
   (`x-ratelimit-*-minute` headers), in-flight spreading, per-key usage registry.
   State shared across processes in `$VIBE_HOME/key_pool_state.json`.
 - `vibe/cli/list_keys.py` — Python `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` implementation. Since v3.0 `vibe` is the Rust launcher (`vibe/cli/launcher.py`) and `vibe/cli/entrypoint.py` is gone, so only the Rust flags are reachable; this module is currently unwired.
@@ -28,13 +28,17 @@ account) from `vibe` and `vibe-acp`, with automatic failover and spreading.
 | `vibe/utils/api_keys.py` | `pool_env_var`, `pooled_keys`, `stored_pool_keys`, `add_pooled_key`; plural variable then keyring entry as fallback in `resolve_api_key_with_origin`; `uses_cli_oidc_credential` (upstream's OIDC switch) also accepts `VIBE_API_KEY` |
 | `vibe/setup/auth/api_key_persistence.py` | every sign-in is appended to the pool (`add_pooled_key`) |
 | `vibe/_experimental_harness.py`, `vibe/app_server/_runtime.py` | back to upstream: v3.0 removed the legacy harness and `--legacy-harness`, so the pool no longer selects an engine. rotation on the main loop now lives in `ProviderCredentialService` (next row) |
-| `vibe/app_server/_provider_credentials.py`, `_unified_harness_backend_adapter.py` | pool on the Unified path: `ProviderCredentialService._pooled_snapshot` (called from `_current_snapshot`, after the platform-credential branch and never when the CLI OIDC session applies) takes the next account (`KeyPool.acquire`) at every model call, `reject` (401/403) parks the leased account (`report_failure`, found by revision); 429s are not reported by the harness so only spreading, no rate-limit failover. Also per-key usage attribution. Tests: `tests/app_server/test_provider_credentials_pool.py` |
-| `vibe/cli-rust/src/cli.rs` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys` CLI flags |
-| `vibe/cli-rust/src/main.rs` | Key management flag handlers for Rust CLI |
+| `vibe/app_server/_provider_credentials.py`, `_runtime.py`, `_unified_harness_backend_adapter.py` | Pool the connection's ordinary API-key credentials on the Unified path, sharing session selection with account and identity reads; keep Desktop credentials and CLI OIDC independent. `reject` (401/403) parks the leased account (`report_failure`, found by revision); 429s are not reported by the harness, so no rate-limit failover. Also per-key usage attribution. Tests: `tests/app_server/test_provider_credentials_pool.py`, `vibe/cli-rust/tests/key_pool_e2e.rs` |
+| `vibe/cli-rust/src/cli.rs` | `--list-keys`, `--export-keys`, `--export-keys-json`, `--import-keys`, `--static-pool`, `--agressive-rotation` CLI flags |
+| `vibe/cli-rust/src/main.rs` | Key management flag handlers and pool option forwarding to the app server |
+| `vibe/cli-rust/src/commands/simple.rs` | `/whoami` refreshes account and identity instead of displaying a stale pooled account |
 | `vibe/cli-rust/src/session_exit.rs`, `src/server/process.rs`, `tests/session_exit.rs` | Rust TUI exit summary prints per-key usage under the session total. The app-server child runs in another process, so `key_pool.py` mirrors its usage (masked keys) to `$VIBE_KEY_USAGE_FILE`; the client sets that to `<tmp>/vibe-key-usage-<client pid>.json` at spawn and reads/removes it on exit |
 | `vibe/cli-rust/src/credentials/mod.rs` | Added `api_keys` module to credentials; `default_key_present` probes `VIBE_API_KEY` (rename) |
 | `vibe/cli-rust/src/setup/wizard/context.rs` | `DEFAULT_MISTRAL_API_ENV_KEY` = `VIBE_API_KEY` (rename); Rust tests that pin it (`setup_probe`, `onboarding_setup_scenarios`, `onboarding_submit_choices`) follow |
 | `vibe/core/paths/*` | `whoami_cache_multi.json` path |
+
+Pool options are documented in [docs/key-pool.md](docs/key-pool.md).
+The Python `vibe` launcher forwards arguments to the Rust CLI.
 
 ### Rename `MISTRAL_API_KEY(S)` → `VIBE_API_KEY(S)` (commit `01ae2bd2`)
 Touches ~70 files, mostly tests and docs. The one line that matters is

@@ -59,6 +59,20 @@ def test_bundled_binary_execs_with_app_server_bin(
     assert "VIBE_APP_SERVER_CMD" not in env
 
 
+def test_pool_flags_are_forwarded_to_rust_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bundled = tmp_path / "vibe-rs"
+    bundled.touch()
+    monkeypatch.setattr(launcher, "_BUNDLED_BIN", bundled)
+    monkeypatch.setattr("sys.platform", "linux")
+    calls = _capture_execvpe(monkeypatch)
+
+    launcher.exec_rust_cli(["--static-pool", "--agressive-rotation"])
+
+    assert calls[0]["argv"] == [str(bundled), "--static-pool", "--agressive-rotation"]
+
+
 def test_app_server_cmd_runs_the_bundled_binary_against_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

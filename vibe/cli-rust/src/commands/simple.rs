@@ -194,9 +194,7 @@ pub(super) fn reload_config(app: &mut App, client: &Arc<Client>) {
 }
 
 pub(super) fn whoami(app: &mut App, client: &Arc<Client>) {
-    // The post-ready fetch already read identity and account, so only a model
-    // switch (a different credential) re-reads them; the credential source is
-    // always read fresh, like `/status`.
+    // The pooled credential can change without a model switch.
     let model = crate::usage_gauge::account_model(app).to_owned();
     let cached = app.whoami.hit(&model).cloned();
     let Some((session_id, tx)) = dispatch(app) else {
@@ -205,17 +203,14 @@ pub(super) fn whoami(app: &mut App, client: &Arc<Client>) {
         }
         return;
     };
-    if cached.is_none() {
-        app.begin_command_loading();
-        app.whoami.ask(model.clone());
-    }
+    app.begin_command_loading();
+    app.whoami.ask(model.clone());
     let client = client.clone();
     crate::work::spawn(async move {
-        let auth = provider_auth::read(&client, &session_id);
-        let (reads, auth) = match cached {
-            Some(reads) => (Some(reads), auth.await),
-            None => tokio::join!(post_ready::read(&client, &session_id), auth),
-        };
+        let (reads, auth) = tokio::join!(
+            post_ready::read(&client, &session_id),
+            provider_auth::read(&client, &session_id)
+        );
         let _ = tx.try_send(CommandEvent::Whoami { model, reads, auth });
     });
 }

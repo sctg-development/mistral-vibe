@@ -2,10 +2,9 @@
 
 Several accounts can share one provider by listing their keys, comma separated,
 in the plural variant of the provider's key variable (``VIBE_API_KEYS`` next
-to ``VIBE_API_KEY``). The pool wraps the HTTP transport, so failover happens
-below the SDK: a request refused because one account is rate limited, out of
-quota or revoked is replayed on the next account before the SDK or the agent
-loop ever sees an error. The same code serves ``vibe`` and ``vibe-acp``.
+to ``VIBE_API_KEY``). The Unified harness resolves credentials through this
+pool and reports 401/403 rejections. The optional pool transport can also
+replay rate-limited or quota-refused requests on another account.
 
 Accounts that fail are put in cooldown, and the cooldowns are shared between
 processes through a small state file in ``VIBE_HOME``, so a fresh ``vibe-acp``
@@ -24,6 +23,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import random
 import re
 import tempfile
 import time
@@ -242,6 +242,8 @@ class KeyPool:
         clock: Callable[[], float] = time.time,
     ) -> None:
         unique = list(dict.fromkeys(key for key in keys if key))
+        if not os.environ.get("VIBE_POOL_STATIC"):
+            random.shuffle(unique)
         self._keys = unique
         self._fingerprints = [_fingerprint(key) for key in unique]
         self._clock = clock
@@ -249,6 +251,7 @@ class KeyPool:
         self._last_index: int | None = None
         self._active_index: int | None = None
         self._inflight = [0] * len(unique)
+        self._aggressive = bool(os.environ.get("VIBE_POOL_AGRESSIVE_ROTATION"))
 
     def __len__(self) -> int:
         return len(self._keys)
@@ -325,17 +328,14 @@ class KeyPool:
     # -- selection ---------------------------------------------------------
 
     def acquire(
-        self, exclude: Iterable[str] = (), *, cost_tokens: int = 0
+        self, exclude: Iterable[str] = (), *, cost_tokens: int = 0, rotate: bool = True
     ) -> KeyLease | None:
         """The account to use next, skipping ``exclude`` and accounts cooling.
 
-        Spreads usage evenly: among accounts that still have room in their
-        current rate-limit window, the one with the fewest requests in flight
-        goes first, and ties go to the account used least recently (shared
-        between processes through the state file). The prompt cache is not
-        preserved on purpose. When no account has room, the one with the most
-        spare capacity is used; when all are cooling, the one that recovers
-        soonest is returned for a single try.
+        By default, keep the same account until it is excluded or cooling.
+        Aggressive rotation spreads requests using in-flight counts and
+        shared rate-limit headroom. If all accounts are cooling, try the
+        one that recovers soonest.
         """
         excluded = set(exclude)
         path = self._state_path()
@@ -354,6 +354,14 @@ class KeyPool:
                     soonest = (until, index)
                 continue
             ready.append((index, Headroom.from_entry(entry), _used_at(entry)))
+
+        if (not self._aggressive or not rotate) and ready:
+            index = next(
+                (item[0] for item in ready if item[0] == self._active_index),
+                ready[0][0],
+            )
+            self._active_index = index
+            return KeyLease(self._keys[index], index)
 
         roomy = [item for item in ready if item[1].has_room(now, cost_tokens)]
         if roomy:
