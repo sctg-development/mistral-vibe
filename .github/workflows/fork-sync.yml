@@ -9,6 +9,9 @@
 # Setup (once):
 #   - repo or org secret CLAUDE_CODE_OAUTH_TOKEN_CDVL59 (from `claude setup-token`), visible to this repo
 #   - Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests"
+#   - repo secret FORK_SYNC_PUSH_TOKEN: a fine-grained token for THIS repository only, with Contents, Pull requests
+#     and Workflows (read and write), short-lived. Used only by the guarded publish step, only when the branch
+#     changes workflow files; the agent never sees it.
 # Note: a PR opened with the default token does not trigger the pull_request workflows, so this job runs the
 # invariants, ruff and the fork tests itself and comments the result on the PR.
 name: fork-sync
@@ -45,7 +48,9 @@ jobs:
     steps:
       # The runner context is not available in a job-level env, so the result path is set in a step.
       - name: Result path
-        run: echo "FORK_SYNC_RESULT=$RUNNER_TEMP/fork-sync-result.json" >> "$GITHUB_ENV"
+        run: |
+          echo "FORK_SYNC_RESULT=$RUNNER_TEMP/fork-sync-result.json" >> "$GITHUB_ENV"
+          echo "FORK_SYNC_PR_BODY=$RUNNER_TEMP/pr-body.md" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -122,7 +127,7 @@ jobs:
           set -euo pipefail
           READ='Read,Glob,Grep,Write,Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*),Bash(git ls-files:*),Bash(git merge-base:*),Bash(git merge-tree:*),Bash(git rev-list:*),Bash(date:*),Bash(jq:*)'
           # No generic `uv` or `cargo`: only the sub-commands the skill uses, so the agent cannot run arbitrary code.
-          WRITE='Edit,Bash(git fetch:*),Bash(git checkout:*),Bash(git branch:*),Bash(git merge:*),Bash(git add:*),Bash(git rm:*),Bash(git restore:*),Bash(git commit:*),Bash(git push origin sync/upstream-:*),Bash(sed -i:*),Bash(bash scripts/fork-sync/check-fork-invariants.sh:*),Bash(uv sync:*),Bash(uv lock:*),Bash(uv run ruff:*),Bash(uv run pytest:*),Bash(cargo build:*),Bash(gh pr create:*),Bash(gh pr list:*),Bash(gh pr view:*)'
+          WRITE='Edit,Bash(git fetch:*),Bash(git checkout:*),Bash(git branch:*),Bash(git merge:*),Bash(git add:*),Bash(git rm:*),Bash(git restore:*),Bash(git commit:*),Bash(sed -i:*),Bash(bash scripts/fork-sync/check-fork-invariants.sh:*),Bash(uv sync:*),Bash(uv lock:*),Bash(uv run ruff:*),Bash(uv run pytest:*),Bash(cargo build:*),Bash(gh pr list:*),Bash(gh pr view:*)'
           TOOLS="$READ"
           if [ "$MODE" = "sync" ]; then TOOLS="$READ,$WRITE"; fi
 
@@ -131,6 +136,8 @@ jobs:
           MODE=$MODE
           Pre-check facts: behind=$BEHIND ahead=$AHEAD conflicts=$CONFLICTS conflict_files=$CONFLICT_FILES
           Write your result file to $FORK_SYNC_RESULT.
+          Do NOT push and do NOT open the pull request: the workflow publishes the branch after its own checks.
+          Commit on the local branch, and write the pull request description to $FORK_SYNC_PR_BODY.
           Never add Co-Authored-By or any attribution line to a commit or a PR description.
           PROMPT
 
@@ -182,8 +189,35 @@ jobs:
             echo "::error::the sync branch changes the sync agent itself:"; echo "$changed"; exit 1
           fi
 
-      - name: Independent verification of the sync branch
+      # The branch is pushed by this step, not by the agent: pushing upstream's workflow changes needs a token with
+      # the `workflows` permission, which the agent (it reads untrusted upstream content) must never hold. The
+      # script is read from the default branch, so the agent cannot edit it, and it refuses anything but upstream's
+      # verbatim workflow files. See the header of scripts/fork-sync/publish.sh.
+      - name: Publish the sync branch (guarded)
+        id: publish
         if: always() && steps.result.outputs.status == 'synced' && steps.result.outputs.branch != ''
+        env:
+          BRANCH: ${{ steps.result.outputs.branch }}
+          DEFAULT_BRANCH: multi
+          REPO: ${{ github.repository }}
+          UPSTREAM_REPO: mistralai/mistral-vibe
+          UPSTREAM_BRANCH: main
+          DEFAULT_TOKEN: ${{ github.token }}
+          PUSH_TOKEN: ${{ secrets.FORK_SYNC_PUSH_TOKEN }}
+          WORKSPACE: ${{ github.workspace }}
+          PR_BODY_FILE: ${{ env.FORK_SYNC_PR_BODY }}
+        run: |
+          git show "origin/multi:scripts/fork-sync/publish.sh" > "$RUNNER_TEMP/publish.sh"
+          bash "$RUNNER_TEMP/publish.sh"
+
+      - name: Record the pull request in the result
+        if: always() && steps.publish.outputs.pr != ''
+        run: |
+          jq --arg pr "${{ steps.publish.outputs.pr }}" '.pr_url = $pr' "$FORK_SYNC_RESULT" > "$RUNNER_TEMP/result.tmp"
+          mv "$RUNNER_TEMP/result.tmp" "$FORK_SYNC_RESULT"
+
+      - name: Independent verification of the sync branch
+        if: always() && steps.result.outputs.status == 'synced' && steps.result.outputs.branch != '' && steps.publish.outcome == 'success'
         id: verify
         run: |
           set -uo pipefail
@@ -215,13 +249,13 @@ jobs:
               echo ""; echo "**Workflow files changed by this sync. They run with this repository's secrets: review them.**"; echo "$wf"
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY" > "$RUNNER_TEMP/verify.md"
-          if [ -n "${{ steps.result.outputs.pr }}" ]; then
-            GH_TOKEN="${{ github.token }}" gh pr comment "${{ steps.result.outputs.pr }}" --body-file "$RUNNER_TEMP/verify.md" || true
+          if [ -n "${{ steps.publish.outputs.pr }}" ]; then
+            GH_TOKEN="${{ github.token }}" gh pr comment "${{ steps.publish.outputs.pr }}" --body-file "$RUNNER_TEMP/verify.md" || true
           fi
           [ "$inv" = PASS ] && [ "$lint" = PASS ] && [ "$tests" = PASS ] && [ "$rust" = PASS ] && [ "$rtimp" = PASS ]
 
       - name: Fail loudly when a human is needed
-        if: always() && steps.pre.outputs.needs_sync == 'true' && (steps.result.outputs.status == 'needs-human' || steps.result.outputs.status == 'failed')
+        if: always() && steps.pre.outputs.needs_sync == 'true' && (steps.result.outputs.status == 'needs-human' || steps.result.outputs.status == 'failed' || steps.publish.outcome == 'failure')
         run: |
           echo "::error::fork-sync status: ${{ steps.result.outputs.status }}"
           jq -r '.notes // "no notes"' "$FORK_SYNC_RESULT" 2>/dev/null || true
