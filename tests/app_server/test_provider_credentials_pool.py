@@ -140,12 +140,28 @@ async def test_aggressive_resolutions_spread_over_the_pooled_accounts(
     assert (first, second, third) == ("key-a", "key-b", "key-a")
 
 
-@pytest.mark.parametrize("reason", ["http_unauthorized", "http_forbidden"])
+@pytest.mark.asyncio
+async def test_a_forbidden_account_is_not_parked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PRIMARY_KEY", raising=False)
+    monkeypatch.delenv("VIBE_POOL_AGRESSIVE_ROTATION", raising=False)
+    monkeypatch.setenv("PRIMARY_KEYS", "key-a,key-b")
+    service = _service()
+    kept, revision = await _token(service)
+
+    await service.reject(observed_revision=revision, reason="http_forbidden")
+
+    for _ in range(3):
+        token, _ = await _token(service)
+        assert token == kept
+
+
 @pytest.mark.asyncio
 async def test_a_rejected_account_is_skipped_not_fatal(
     monkeypatch: pytest.MonkeyPatch,
-    reason: Literal["http_unauthorized", "http_forbidden"],
 ) -> None:
+    reason: Literal["http_unauthorized"] = "http_unauthorized"
     monkeypatch.delenv("PRIMARY_KEY", raising=False)
     monkeypatch.delenv("VIBE_POOL_AGRESSIVE_ROTATION", raising=False)
     monkeypatch.setenv("PRIMARY_KEYS", "key-a,key-b")
