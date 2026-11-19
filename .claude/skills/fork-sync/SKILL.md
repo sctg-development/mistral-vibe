@@ -121,5 +121,29 @@ Write JSON to `$FORK_SYNC_RESULT`, nothing else on that path:
 }
 ```
 
+Also write these three optional arrays. The report mail is built from them, so a reviewer sees what to check
+before merging; keep every item short and write it in your own words (never copy upstream text into them):
+
+```json
+{
+  "review_points": [
+    { "level": "high | medium | low", "title": "what changed", "why": "why it matters", "check": "how a human verifies it" }
+  ],
+  "unverified": ["every check you did not run, e.g. the full test suite"],
+  "resolutions": [{ "file": "path/of/a/conflicting/file", "how": "how you resolved it" }]
+}
+```
+
+- `review_points`: list every place where the merge changes behaviour for the fork, at most 12. Use `high` for a
+  behaviour change the owner must explicitly accept, a test you changed or removed so that it passes, or anything
+  security-relevant; `medium` for a conflict resolved in fork-specific code, upstream workflow changes, regenerated
+  files and renamed or moved registry entries; `low` for information only. Do not invent points: an empty array
+  is a valid answer for a trivial sync.
+- `unverified`: be exact and complete. A missing entry here makes the reviewer trust something you did not check.
+- `resolutions`: one entry per conflicting file.
+- Never write a score or a confidence value: the reliability score of the mail is computed by the watcher from
+  measured facts, not from the agent.
+- In `dry-run`, fill `review_points` with what you expect to need attention.
+
 `needs-human` means you stopped on purpose and explained why in `notes`. `failed` means something broke. Use
 neither lightly, and never report `synced` unless steps 6, 7 and 9 all passed.
